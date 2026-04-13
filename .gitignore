@@ -1,0 +1,6 @@
+checkpoints*/
+*.log
+*.tsv
+data/
+__pycache__/
+*.pyc
