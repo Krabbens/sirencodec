@@ -24,9 +24,9 @@ build/
 /log.tsv
 /log_*.tsv
 
-# Local training outputs & logs (experiment checkpoints/*.pt: tracked via Git LFS, not ignored)
-checkpoints/
-checkpoints_*/
+# Root-only checkpoint dirs (do not use bare `checkpoints/` — that ignores experiments/**/checkpoints too)
+/checkpoints/
+/checkpoints_*/
 experiments/**/spectrograms/
 experiments/audio_listen_compare/
 *.log
