@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# moj_nowy_etap on 8 GPUs: DDP via torchrun, global batch 80 (10 per GPU), LR scaled vs batch-8 baseline.
+# Same run as run_nl4_fsq4_94fps_long.sh but DDP: torchrun, 8 GPUs, global batch 80, scaled LR.
 # Resume logic matches scripts/run_nl_fsq4_continue_long.sh.
 # Env: OUT STEPS LAMBDA_STFT LAMBDA_MEL_Q RESUME INITIAL_CKPT NPROC (default 8)
 set -euo pipefail
@@ -9,7 +9,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 NPROC="${NPROC:-8}"
-OUT="${OUT:-experiments/moj_nowy_etap}"
+OUT="${OUT:-experiments/nl4_fsq4_94fps_long}"
 INITIAL_CKPT="${INITIAL_CKPT:-}"
 STEPS="${STEPS:-300000}"
 LAMBDA_STFT="${LAMBDA_STFT:-8}"

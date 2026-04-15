@@ -1,0 +1,6 @@
+{
+  "step": 75000,
+  "total_steps": 300000,
+  "checkpoint": "/home/sperm/autoresearch/sirencodec/experiments/nl4_fsq4_94fps_long/checkpoints/codec_step75000.pt",
+  "exp_dir": "/home/sperm/autoresearch/sirencodec/experiments/nl4_fsq4_94fps_long"
+}
