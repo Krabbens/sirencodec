@@ -24,10 +24,9 @@ build/
 /log.tsv
 /log_*.tsv
 
-# Local training outputs & logs (keep experiments/**/log.tsv via explicit add if needed)
+# Local training outputs & logs (experiment checkpoints/*.pt: tracked via Git LFS, not ignored)
 checkpoints/
 checkpoints_*/
-experiments/**/checkpoints/
 experiments/**/spectrograms/
 experiments/audio_listen_compare/
 *.log
