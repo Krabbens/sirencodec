@@ -1,0 +1,35 @@
+# Environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / local
+.cursor/
+.idea/
+*.swp
+
+# Data & large local assets (keep manifests out or use LFS explicitly)
+data/
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Root-level training TSV dumps (results.tsv is tracked)
+/log.tsv
+/log_*.tsv
+
+# Local training outputs & logs (keep experiments/**/log.tsv via explicit add if needed)
+checkpoints/
+checkpoints_*/
+experiments/**/checkpoints/
+*.log
+pca_components.pt
+test_original.wav
+.agents/
+.qwen/

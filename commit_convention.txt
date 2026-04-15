@@ -1,0 +1,5 @@
+Commits tied to training / SYSTEM.md protocol:
+- results.tsv: one commit per cycle row (or batch rows), message cites cycle + verdict + last step from experiments/.../log.tsv when relevant.
+- experiments/<name>/log.tsv + resume_state.json: snapshot after milestones (e.g. every 5k–10k steps or at phase end); message includes step and key metrics from Eval lines.
+- Code / scripts: separate commits from data; use conventional commits (feat/fix/docs).
+- Large binaries: Git LFS (*.pt, spectrograms, *.npy); avoid committing every checkpoint—prefer periodic or final.
