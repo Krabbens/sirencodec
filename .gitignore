@@ -28,8 +28,13 @@ build/
 checkpoints/
 checkpoints_*/
 experiments/**/checkpoints/
+experiments/**/spectrograms/
+experiments/audio_listen_compare/
 *.log
 pca_components.pt
 test_original.wav
 .agents/
 .qwen/
+
+# Bundled upstream clone (nested .git); use submodule or copy separately if needed
+LuxTTS/

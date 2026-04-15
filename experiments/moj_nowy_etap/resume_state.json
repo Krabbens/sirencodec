@@ -1,0 +1,6 @@
+{
+  "step": 75000,
+  "total_steps": 300000,
+  "checkpoint": "/home/sperm/autoresearch/sirencodec/experiments/moj_nowy_etap/checkpoints/codec_step75000.pt",
+  "exp_dir": "/home/sperm/autoresearch/sirencodec/experiments/moj_nowy_etap"
+}
