@@ -10,7 +10,8 @@ Usage:
     python train_pipeline.py --no-eval          # Skip PESQ eval (faster)
     python train_pipeline.py --eval-every 5000  # Eval frequency
 """
-import os, sys, json, math, time, argparse
+import os, re, sys, json, math, time, argparse
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -84,7 +85,9 @@ def make_config(arch, steps, batch_size, segment_length, eval_every,
                 enable_augmentation=True,
                 stage1_steps=50000, skip_stage1=False, codebook_dim=128,
                 warmup_steps=5000, grad_clip=1.0, lambda_mel=None,
-                frame_skip_target=0.35):
+                frame_skip_target=0.35,
+                abr_enabled=False, abr_mode="full", abr_lambda_rate=0.01,
+                abr_depth_entropy_lambda=0.001, abr_gumbel_temp=1.0):
     # HiFi-GAN needs lower LR and slower warmup (it's more sensitive than Vocos)
     lr_gen = 5e-5 if decoder_type == "hifigan" else 1e-4  # Further reduced for stability
     lr_disc = 2.5e-5 if decoder_type == "hifigan" else 1.5e-5  # Reduced for stability
@@ -120,6 +123,11 @@ def make_config(arch, steps, batch_size, segment_length, eval_every,
         stage1_steps=stage1_steps,
         skip_stage1=skip_stage1,
         frame_skip_target=frame_skip_target,
+        abr_enabled=abr_enabled,
+        abr_mode=abr_mode,
+        abr_lambda_rate=abr_lambda_rate,
+        abr_depth_entropy_lambda=abr_depth_entropy_lambda,
+        abr_gumbel_temp=abr_gumbel_temp,
     )
     cfg.use_preprocessed_cache = use_preprocessed_cache
     cfg.preprocessed_dir = preprocessed_dir
@@ -134,12 +142,31 @@ def make_config(arch, steps, batch_size, segment_length, eval_every,
 CHECKPOINT_DIR = Path("checkpoints")
 LATEST_LINK = CHECKPOINT_DIR / "latest.pt"
 
+
+def _codec_checkpoint_paths_by_step():
+    """``codec_step{N}.pt`` paths sorted by numeric N (not lexicographic)."""
+    pairs = []
+    for p in CHECKPOINT_DIR.glob("codec_step*.pt"):
+        m = re.match(r"^codec_step(\d+)\.pt$", p.name)
+        if m:
+            pairs.append((int(m.group(1)), p))
+    pairs.sort(key=lambda x: x[0])
+    return [p for _, p in pairs]
+
+
 def find_latest_checkpoint():
-    """Find the latest checkpoint."""
-    if LATEST_LINK.exists():
-        return LATEST_LINK
-    checkpoints = sorted(CHECKPOINT_DIR.glob("codec_step*.pt"))
-    return checkpoints[-1] if checkpoints else None
+    """Prefer highest-numbered ``codec_step{N}.pt``; else ``latest.pt``."""
+    paths = _codec_checkpoint_paths_by_step()
+    if paths:
+        return paths[-1]
+    return LATEST_LINK if LATEST_LINK.exists() else None
+
+
+def _unwrap_compiled(module):
+    """``torch.compile`` wraps nn.Module; use inner module for ``.parameters()`` and submodules."""
+    if module is None:
+        return None
+    return getattr(module, "_orig_mod", module)
 
 def load_checkpoint(path, codec, mrstft_disc, opt_gen, opt_disc, device):
     """Load checkpoint and return starting step and losses."""
@@ -154,7 +181,9 @@ def load_checkpoint(path, codec, mrstft_disc, opt_gen, opt_disc, device):
     # endregion
     print(f"  Loading checkpoint: {path}")
     ckpt = torch.load(path, weights_only=False, map_location=device)
-    codec.load_state_dict(ckpt['codec'])
+    # Load into the inner nn.Module (not torch.compile's OptimizedModule): checkpoints
+    # save plain ``encoder.*`` keys; OptimizedModule expects ``_orig_mod.encoder.*``.
+    _unwrap_compiled(codec).load_state_dict(ckpt["codec"])
     start_step = ckpt.get('step', 0) + 1
     # region agent log
     _debug_log(
@@ -171,9 +200,9 @@ def load_checkpoint(path, codec, mrstft_disc, opt_gen, opt_disc, device):
     )
     # endregion
 
-    if mrstft_disc and 'mrstft_disc' in ckpt:
+    if mrstft_disc is not None and "mrstft_disc" in ckpt:
         try:
-            mrstft_disc.load_state_dict(ckpt['mrstft_disc'])
+            _unwrap_compiled(mrstft_disc).load_state_dict(ckpt["mrstft_disc"])
         except:
             print("  WARNING: Could not load MRSTFT discriminator state, starting fresh")
 
@@ -214,15 +243,15 @@ def save_checkpoint(step, codec, mrstft_disc, opt_gen, opt_disc,
     CHECKPOINT_DIR.mkdir(exist_ok=True)
 
     ckpt = {
-        'step': step,
-        'codec': codec.state_dict(),
-        'opt_gen': opt_gen.state_dict() if opt_gen else None,
-        'config': cfg,
-        'loss_mel': loss_mel,
-        'loss_commit': loss_commit,
+        "step": step,
+        "codec": _unwrap_compiled(codec).state_dict(),
+        "opt_gen": opt_gen.state_dict() if opt_gen else None,
+        "config": cfg,
+        "loss_mel": loss_mel,
+        "loss_commit": loss_commit,
     }
-    if mrstft_disc:
-        ckpt['mrstft_disc'] = mrstft_disc.state_dict()
+    if mrstft_disc is not None:
+        ckpt["mrstft_disc"] = _unwrap_compiled(mrstft_disc).state_dict()
     if opt_disc:
         ckpt['opt_disc'] = opt_disc.state_dict()
 
@@ -236,8 +265,8 @@ def save_checkpoint(step, codec, mrstft_disc, opt_gen, opt_disc,
     # Update latest link
     torch.save(ckpt, LATEST_LINK)
 
-    # Clean old checkpoints (keep last 5)
-    checkpoints = sorted(CHECKPOINT_DIR.glob("codec_step*.pt"))
+    # Clean old checkpoints (keep last 5 by step number)
+    checkpoints = _codec_checkpoint_paths_by_step()
     if len(checkpoints) > 6:  # 5 + latest.pt
         for old in checkpoints[:-5]:
             old.unlink()
@@ -265,13 +294,24 @@ def run_stage(codec, cfg, device, start_step, end_step,
               mrstft_disc, opt_gen, opt_disc,
               sched_gen, sched_disc,
               train_loader, val_loader, mel_loss_fn, mrstft_loss_fn,
-              use_vq=True, skip_eval=False, freeze_encoder=False):
+              use_vq=True, skip_eval=False, freeze_encoder=False,
+              use_fp16: bool = False):
     """Run one stage of training."""
     codec.train()
-    if mrstft_disc: mrstft_disc.train()
+    if mrstft_disc is not None:
+        mrstft_disc.train()
+
+    use_amp = bool(use_fp16) and device.type in ("cuda", "mps")
+
+    def amp_forward():
+        if not use_amp:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, dtype=torch.float16)
 
     # Get discriminator params for gradient clipping
-    disc_params = list(mrstft_disc.parameters()) if mrstft_disc else []
+    disc_params = (
+        list(_unwrap_compiled(mrstft_disc).parameters()) if mrstft_disc is not None else []
+    )
     def _grad_l2_norm(params):
         total = torch.tensor(0.0, device=device)
         for p in params:
@@ -280,20 +320,21 @@ def run_stage(codec, cfg, device, start_step, end_step,
                 total += (g * g).sum()
         return torch.sqrt(total)
 
+    _codec = _unwrap_compiled(codec)
     if not use_vq:
         print("  VQ bypassed: training encoder → decoder directly")
-        codec.quantizer.eval()
-        for p in codec.quantizer.parameters():
+        _codec.quantizer.eval()
+        for p in _codec.quantizer.parameters():
             p.requires_grad = False
     else:
         print("  VQ enabled: training encoder → VQ → decoder")
         if freeze_encoder:
             # Freeze encoder, only train VQ + decoder
             print("  Encoder frozen: training VQ + decoder only")
-            for p in codec.encoder.parameters():
+            for p in _codec.encoder.parameters():
                 p.requires_grad = False
         # Rebuild optimizer for trainable params only
-        gen_params = [p for p in codec.parameters() if p.requires_grad]
+        gen_params = [p for p in _codec.parameters() if p.requires_grad]
         stage_lr = cfg.lr_gen
         if not math.isfinite(stage_lr) or stage_lr <= 0:
             stage_lr = abs(stage_lr) if stage_lr < 0 else 1e-4
@@ -384,87 +425,95 @@ def run_stage(codec, cfg, device, start_step, end_step,
         else:
             disc_progress = 0
 
-        # Forward pass (AMP disabled - causes NaN gradients with this architecture)
-        kf_frac = 0.0  # default for non-ARCH-C architectures
-        if use_vq:
-            n_cb = get_curriculum_codebooks(step, cfg.curriculum_schedule) if cfg.curriculum_enabled else cfg.n_codebooks
-            if cfg.architecture == "arch-c-v1":
-                x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss, kf_frac = codec(wave, step=step)
+        with amp_forward():
+            # Forward + losses (optional fp16 autocast on CUDA/MPS)
+            kf_frac = 0.0  # default for non-ARCH-C architectures
+            abr_aux = {}
+            if use_vq:
+                n_cb = get_curriculum_codebooks(step, cfg.curriculum_schedule) if cfg.curriculum_enabled else cfg.n_codebooks
+                if cfg.architecture == "arch-c-v1":
+                    x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss, kf_frac = codec(wave, step=step)
+                else:
+                    out = codec(wave, n_codebooks=n_cb)
+                    if len(out) == 7:
+                        x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss, abr_aux = out
+                    else:
+                        x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss = out
             else:
-                x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss = codec(wave, n_codebooks=n_cb)
-        else:
-            # Stage 1: bypass VQ
-            z = codec.encoder(wave)
-            x_hat = codec.decoder(z)
-            x_hat = x_hat[..., :wave.size(-1)]
-            commit_loss = torch.tensor(0.0, device=device)
-            cb_loss = torch.tensor(0.0, device=device)
-            vq_util = 0.0
-            entropy_loss = torch.tensor(0.0, device=device)
-            n_cb = 0
+                # Stage 1: bypass VQ
+                z = codec.encoder(wave)
+                x_hat = codec.decoder(z)
+                x_hat = x_hat[..., :wave.size(-1)]
+                commit_loss = torch.tensor(0.0, device=device)
+                cb_loss = torch.tensor(0.0, device=device)
+                vq_util = 0.0
+                entropy_loss = torch.tensor(0.0, device=device)
+                n_cb = 0
 
-        # Mel loss
-        if mel_loss_fn:
-            loss_mel = mel_loss_fn(x_hat.squeeze(1), wave.squeeze(1))
-        else:
-            assert mel_fb is not None
-            mel_pred = mel_fb(x_hat.squeeze(1))
-            mel_tgt = mel_fb(wave.squeeze(1))
-            loss_mel = F.l1_loss(mel_pred.log().clamp(min=-10), mel_tgt.log().clamp(min=-10))
-
-        # MRSTFT recon loss — only Stage 2 uses it in loss_gen; Stage 1 skipped (was dead compute).
-        mr_pred_mags = mr_tgt_mags = None
-        if mrstft_loss_fn and use_vq:
-            mr_pred_mags, mr_tgt_mags = mrstft_loss_fn.compute_mags_pair(x_hat, wave)
-            loss_mrstft = mrstft_loss_fn.loss_from_mags(mr_pred_mags, mr_tgt_mags)
-        else:
-            loss_mrstft = 0.0
-
-        # Adversarial + feature matching (Cycle 25: MRSTFT discriminator)
-        # Cycle 32: Enable adversarial in Stage 1 for Mamba/Zipformer decoders
-        # (they need adversarial signal to learn realistic audio generation)
-        loss_adv = 0.0
-        loss_feat = 0.0
-        disc_loss = torch.tensor(0.0, device=device)
-        disc_grad_before = torch.tensor(0.0, device=device)
-        disc_grad_after = torch.tensor(0.0, device=device)
-        disc_grad_ratio = torch.tensor(0.0, device=device)
-        adv_start = int(getattr(cfg, "adv_start_step", cfg.warmup_steps))
-        adv_every = max(1, int(getattr(cfg, "adv_every", 1)))
-        adv_ok = step > adv_start and (step % adv_every == 0)
-        # Stage 1 (no VQ): optional mel-only AE — skip MRSTFT disc (huge speedup on MPS/CUDA).
-        stage_allows_adv = use_vq or not getattr(cfg, "no_adv_stage1", False)
-        use_adv = cfg.use_mrstft and mrstft_disc and adv_ok and stage_allows_adv
-
-        if use_adv:
-            if mr_pred_mags is not None and mr_tgt_mags is not None:
-                pred_mags_b1ft = [m.unsqueeze(1) for m in mr_pred_mags]
-                tgt_mags_b1ft = [m.unsqueeze(1) for m in mr_tgt_mags]
-                real_out, real_feats = mrstft_disc.forward_from_mags(tgt_mags_b1ft)
-                fake_out, fake_feats = mrstft_disc.forward_from_mags(pred_mags_b1ft)
+            # Mel loss
+            if mel_loss_fn:
+                loss_mel = mel_loss_fn(x_hat.squeeze(1), wave.squeeze(1))
             else:
-                real_out, real_feats = mrstft_disc(wave)
-                fake_out, fake_feats = mrstft_disc(x_hat)
-            loss_adv = adversarial_g_loss(fake_out)
-            loss_feat = feature_matching_loss(real_feats, fake_feats)
+                assert mel_fb is not None
+                mel_pred = mel_fb(x_hat.squeeze(1))
+                mel_tgt = mel_fb(wave.squeeze(1))
+                loss_mel = F.l1_loss(mel_pred.log().clamp(min=-10), mel_tgt.log().clamp(min=-10))
 
-        # Generator loss
-        if use_vq:
-            loss_gen = (cfg.lambda_mel * loss_mel
-                        + cfg.lambda_adv * loss_adv
-                        + cfg.lambda_feat * loss_feat
-                        + cfg.lambda_commit * commit_loss
-                        + cfg.lambda_codebook * cb_loss
-                        + 0.1 * entropy_loss)
+            # MRSTFT recon loss — both stages when use_mrstft
+            mr_pred_mags = mr_tgt_mags = None
             if mrstft_loss_fn:
-                loss_gen += 1.0 * loss_mrstft  # Cycle 26: was lambda_mel * 0.5 → dominated
-        else:
-            # Stage 1 (autoencoder): include adversarial loss for Mamba/Zipformer decoders
-            loss_gen = cfg.lambda_mel * loss_mel + cfg.lambda_adv * loss_adv + cfg.lambda_feat * loss_feat
+                mr_pred_mags, mr_tgt_mags = mrstft_loss_fn.compute_mags_pair(x_hat, wave)
+                loss_mrstft = mrstft_loss_fn.loss_from_mags(mr_pred_mags, mr_tgt_mags)
+            else:
+                loss_mrstft = 0.0
 
-        # Backward pass (AMP disabled - causes NaN gradients)
+            # Adversarial + feature matching (MRSTFT discriminator)
+            loss_adv = 0.0
+            loss_feat = 0.0
+            disc_loss = torch.tensor(0.0, device=device)
+            disc_grad_before = torch.tensor(0.0, device=device)
+            disc_grad_after = torch.tensor(0.0, device=device)
+            disc_grad_ratio = torch.tensor(0.0, device=device)
+            adv_start = int(getattr(cfg, "adv_start_step", cfg.warmup_steps))
+            adv_every = max(1, int(getattr(cfg, "adv_every", 1)))
+            adv_ok = step > adv_start and (step % adv_every == 0)
+            stage_allows_adv = use_vq or not getattr(cfg, "no_adv_stage1", False)
+            use_adv = cfg.use_mrstft and mrstft_disc is not None and adv_ok and stage_allows_adv
+
+            if use_adv:
+                if mr_pred_mags is not None and mr_tgt_mags is not None:
+                    pred_mags_b1ft = [m.unsqueeze(1) for m in mr_pred_mags]
+                    tgt_mags_b1ft = [m.unsqueeze(1) for m in mr_tgt_mags]
+                    real_out, real_feats = mrstft_disc.forward_from_mags(tgt_mags_b1ft)
+                    fake_out, fake_feats = mrstft_disc.forward_from_mags(pred_mags_b1ft)
+                else:
+                    real_out, real_feats = mrstft_disc(wave)
+                    fake_out, fake_feats = mrstft_disc(x_hat)
+                loss_adv = adversarial_g_loss(fake_out)
+                loss_feat = feature_matching_loss(real_feats, fake_feats)
+
+            # Generator loss
+            if use_vq:
+                loss_gen = (cfg.lambda_mel * loss_mel
+                            + cfg.lambda_adv * loss_adv
+                            + cfg.lambda_feat * loss_feat
+                            + cfg.lambda_commit * commit_loss
+                            + cfg.lambda_codebook * cb_loss
+                            + 0.1 * entropy_loss)
+                if mrstft_loss_fn:
+                    loss_gen += 1.0 * loss_mrstft
+                if abr_aux:
+                    loss_gen = (loss_gen
+                                + cfg.abr_lambda_rate * abr_aux["rate"]
+                                + cfg.abr_depth_entropy_lambda * abr_aux["ent"])
+            else:
+                loss_gen = cfg.lambda_mel * loss_mel + cfg.lambda_adv * loss_adv + cfg.lambda_feat * loss_feat
+                if mrstft_loss_fn:
+                    loss_gen = loss_gen + 1.0 * loss_mrstft
+
+        # Backward pass
         opt_gen.zero_grad()
-        
+
         # NaN/inf check on loss
         loss_val = loss_gen.item() if isinstance(loss_gen, torch.Tensor) else loss_gen
         if not math.isfinite(loss_val):
@@ -472,9 +521,8 @@ def run_stage(codec, cfg, device, start_step, end_step,
             sched_gen.step()
             continue
 
-        # Backward (no loss clamping - it kills gradients!)
         loss_gen.backward()
-        trainable_params = [p for p in codec.parameters() if p.requires_grad]
+        trainable_params = [p for p in _unwrap_compiled(codec).parameters() if p.requires_grad]
         
         # Check for NaN/Inf in gradients
         grad_has_nan_inf = False
@@ -493,13 +541,14 @@ def run_stage(codec, cfg, device, start_step, end_step,
             if step % cfg.log_every == 0:
                 print(f"\n  WARNING: NaN/Inf gradients at step {step}, skipping optimizer step")
         else:
-            grad_norm_before = _grad_l2_norm(trainable_params)
             grad_clip_active = grad_clip_value
-            if not torch.isfinite(grad_norm_before):
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_active)
+            grad_norm_before = grad_norm
+            if not torch.isfinite(grad_norm):
                 grad_clip_ratio = torch.tensor(0.0, device=device)
                 grad_clip_hit = torch.tensor(0.0, device=device)
             else:
-                grad_norm_before_f = float(grad_norm_before.item())
+                grad_norm_before_f = float(grad_norm.item())
                 grad_clip_ratio = torch.tensor(1.0, device=device)
                 grad_clip_hit = torch.tensor(0.0, device=device)
                 if grad_clip_active > 0:
@@ -507,11 +556,14 @@ def run_stage(codec, cfg, device, start_step, end_step,
                     grad_clip_ratio = torch.tensor(clip_ratio_f, device=device)
                     grad_clip_hit = torch.tensor(1.0 if grad_norm_before_f > grad_clip_active else 0.0, device=device)
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_active)
             if torch.isfinite(grad_norm):
                 opt_gen.step()
                 sched_gen.step()
-            grad_norm_after = _grad_l2_norm(trainable_params)
+            log_grads = (step % cfg.log_every == 0) or (step == start_step)
+            if log_grads:
+                grad_norm_after = _grad_l2_norm(trainable_params)
+            else:
+                grad_norm_after = grad_norm
             if torch.isfinite(grad_norm_before) and grad_norm_before.item() > 0:
                 grad_norm_ratio = grad_norm_after / (grad_norm_before + 1e-12)
             else:
@@ -551,17 +603,18 @@ def run_stage(codec, cfg, device, start_step, end_step,
 
         # Discriminator update (Cycle 25: MRSTFT only)
         # Cycle 32: Train discriminator in Stage 1 for Mamba/Zipformer decoders
-        if opt_disc and use_adv and mrstft_disc:
+        if opt_disc and use_adv and mrstft_disc is not None:
             disc_grad_before = _grad_l2_norm(disc_params)
             # Reuse real logits from the generator pass (feature matching already detached reals).
             real_for_d = [r.detach() for r in real_out]
-            if mr_pred_mags is not None:
-                fake_out, _ = mrstft_disc.forward_from_mags(
-                    [m.unsqueeze(1).detach() for m in mr_pred_mags]
-                )
-            else:
-                fake_out, _ = mrstft_disc(x_hat.detach())
-            disc_loss = adversarial_d_loss(real_for_d, fake_out)
+            with amp_forward():
+                if mr_pred_mags is not None:
+                    fake_out, _ = mrstft_disc.forward_from_mags(
+                        [m.unsqueeze(1).detach() for m in mr_pred_mags]
+                    )
+                else:
+                    fake_out, _ = mrstft_disc(x_hat.detach())
+                disc_loss = adversarial_d_loss(real_for_d, fake_out)
             if disc_loss > 0 and torch.isfinite(disc_loss):
                 opt_disc.zero_grad()
                 disc_loss.backward()
@@ -696,6 +749,32 @@ def run_stage(codec, cfg, device, start_step, end_step,
                 )
             sys.stdout.flush()
 
+        # Mel / waveform comparison PNG (subfolder)
+        spec_every = int(getattr(cfg, "spectrogram_every", 0) or 0)
+        if spec_every > 0 and step % spec_every == 0 and step > start_step:
+            from sirencodec.spectrogram_comparison import save_spectrogram_comparison_png
+
+            out_dir = Path(cfg.spectrogram_dir)
+            stage_label = "S1" if not use_vq else "S2"
+            saved = save_spectrogram_comparison_png(
+                codec,
+                cfg,
+                wave,
+                step,
+                out_dir,
+                device,
+                use_vq,
+                stage_label=stage_label,
+            )
+            if saved is not None:
+                sys.stdout.write(f"  [SPECTROGRAM] {saved}\n")
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(
+                    "  [SPECTROGRAM] skipped — install matplotlib: pip install 'matplotlib>=3.7'\n"
+                )
+                sys.stdout.flush()
+
         # Checkpoint
         if step % cfg.save_every == 0 and step > start_step:
             sys.stdout.write("\n")
@@ -758,6 +837,8 @@ def run_pipeline(args):
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+    if args.fp16 and device.type in ("cuda", "mps"):
+        print("fp16: autocast ON for forward (mel/STFT/disc); backward fp32 — omit --fp16 if you see NaNs")
     elif device.type == "mps":
         print("Device: Apple MPS (full arch-a-v2b — Vocos iSTFT, mel, MRSTFT, EMA VQ)")
     else:
@@ -791,6 +872,11 @@ def run_pipeline(args):
         grad_clip=args.grad_clip,
         lambda_mel=args.lambda_mel,
         frame_skip_target=args.frame_skip_target,
+        abr_enabled=args.abr,
+        abr_mode=args.abr_mode,
+        abr_lambda_rate=args.abr_lambda_rate,
+        abr_depth_entropy_lambda=args.abr_depth_entropy_lambda,
+        abr_gumbel_temp=args.abr_gumbel_temp,
     )
 
     cfg.adv_start_step = (
@@ -798,6 +884,19 @@ def run_pipeline(args):
     )
     cfg.adv_every = max(1, int(getattr(args, "adv_every", 1)))
     cfg.no_adv_stage1 = bool(getattr(args, "no_adv_stage1", False))
+    cfg.spectrogram_every = int(getattr(args, "spectrogram_every", cfg.spectrogram_every))
+    cfg.spectrogram_dir = str(getattr(args, "spectrogram_dir", cfg.spectrogram_dir))
+    cfg.spectrogram_viz_seconds = float(
+        getattr(args, "spectrogram_viz_seconds", cfg.spectrogram_viz_seconds)
+    )
+    cfg.spectrogram_viz_from_batch = bool(getattr(args, "spectrogram_from_batch", False))
+    if not cfg.spectrogram_viz_from_batch:
+        print(
+            f"Spectrogram PNGs: {cfg.spectrogram_viz_seconds:.1f}s clip (manifest or synthetic), "
+            "same layout as plot_pipeline_spectrogram.py"
+        )
+    else:
+        print("Spectrogram PNGs: training batch segment (--spectrogram-from-batch)")
     print(
         f"MRSTFT adversarial: enable after step {cfg.adv_start_step}, "
         f"every {cfg.adv_every} step(s) (discriminator is the main cost)"
@@ -921,8 +1020,10 @@ def run_pipeline(args):
     print(f"Target bitrate: {cfg.bitrate} bps")
 
     # Optimizers
-    gen_params = list(codec.parameters())
-    disc_params = list(mrstft_disc.parameters()) if mrstft_disc else []
+    gen_params = list(_unwrap_compiled(codec).parameters())
+    disc_params = (
+        list(_unwrap_compiled(mrstft_disc).parameters()) if mrstft_disc is not None else []
+    )
 
     opt_gen = optim.AdamW(gen_params, lr=cfg.lr_gen, betas=cfg.betas, weight_decay=cfg.weight_decay)
     opt_disc = optim.AdamW(disc_params, lr=cfg.lr_disc, betas=cfg.betas, weight_decay=cfg.weight_decay) if disc_params else None
@@ -994,6 +1095,7 @@ def run_pipeline(args):
                 "step\traw_bitrate_bps\teff_bitrate_bps\tn_codebooks\tloss_total\t"
                 "loss_mel\tloss_adv\tloss_feat\tloss_commit\tloss_cb\tloss_entropy\t"
                 "loss_mrstft\tloss_disc\tgrad_before\tgrad_after\tgrad_ratio\t"
+                "grad_clip_ratio\tgrad_clip_hit\tgrad_clip_cap\t"
                 "disc_grad_before\tdisc_grad_after\tdisc_grad_ratio\tvq_utilization\t"
                 "grad_norm\tlr\tadv_active\tencode_latency_ms\tdecode_latency_ms\t"
                 "total_latency_ms\tstage\n"
@@ -1035,10 +1137,15 @@ def run_pipeline(args):
         print(f"\nLoading checkpoint for fine-tuning: {args.load_checkpoint}")
         ckpt = torch.load(args.load_checkpoint, weights_only=False, map_location=device)
         # Load only matching keys (handles architecture changes)
-        model_dict = codec.state_dict()
-        pretrained_dict = {k: v for k, v in ckpt['codec'].items() if k in model_dict and model_dict[k].shape == v.shape}
+        _codec = _unwrap_compiled(codec)
+        model_dict = _codec.state_dict()
+        pretrained_dict = {
+            k: v
+            for k, v in ckpt["codec"].items()
+            if k in model_dict and model_dict[k].shape == v.shape
+        }
         model_dict.update(pretrained_dict)
-        codec.load_state_dict(model_dict)
+        _codec.load_state_dict(model_dict)
         print(f"  Loaded {len(pretrained_dict)}/{len(model_dict)} params")
         print(f"  Skipping Stage 1 (using pretrained encoder/decoder)")
         cfg.skip_stage1 = True
@@ -1080,6 +1187,7 @@ def run_pipeline(args):
             sched_gen, sched_disc,
             train_loader, val_loader, mel_loss_fn, mrstft_loss_fn,
             use_vq=False, skip_eval=args.no_eval,
+            use_fp16=bool(args.fp16),
         )
 
         # Save stage 1 checkpoint
@@ -1120,7 +1228,8 @@ def run_pipeline(args):
             sched_gen, sched_disc,
             train_loader, val_loader, mel_loss_fn, mrstft_loss_fn,
             use_vq=True, skip_eval=args.no_eval,
-        freeze_encoder=False,  # Default to not freezing encoder in Stage 2
+            freeze_encoder=False,
+            use_fp16=bool(args.fp16),
         )
 
     # Final checkpoint
@@ -1153,7 +1262,7 @@ def main():
     parser.add_argument("--arch", type=str, default="arch-a-v2b",
                        choices=["arch-a-v2b", "arch-a-spk", "arch-b-v1", "arch-c-v1", "arch-d-v1"])
     parser.add_argument("--steps", type=int, default=100000, help="Total training steps")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--segment", type=int, default=16000, help="Audio segment length in samples")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--no-eval", action="store_true", help="Skip PESQ evaluation")
@@ -1171,7 +1280,18 @@ def main():
     parser.add_argument("--preprocessed-manifest-name", type=str, default="master_manifest_preprocessed.jsonl", help="Filename of preprocessed manifest")
     parser.add_argument("--no-augment", action="store_true", help="Disable audio augmentation during training")
     parser.add_argument("--psych-mask", action="store_true", default=True, dest="psych_masking")
-    parser.add_argument("--decoder", type=str, default="vocos", choices=["vocos", "hifigan", "zipformer", "zipformer2", "mamba"])
+    parser.add_argument(
+        "--decoder",
+        type=str,
+        default="vocos",
+        choices=["vocos", "zipformer", "zipformer2", "mamba"],
+        help="Neural decoder (HiFi-GAN path removed to avoid extra smoothing vs iSTFT decoders).",
+    )
+    parser.add_argument("--abr", action="store_true", help="Adaptive bitrate: variable RVQ depth per latent frame")
+    parser.add_argument("--abr-mode", type=str, default="full", choices=["full", "heuristic", "learned"])
+    parser.add_argument("--abr-lambda-rate", type=float, default=0.01, help="Weight for mean soft depth (rate)")
+    parser.add_argument("--abr-depth-entropy-lambda", type=float, default=0.001, help="Weight for policy entropy term")
+    parser.add_argument("--abr-gumbel-temp", type=float, default=1.0, help="Gumbel-Softmax temperature (learned depth)")
     parser.add_argument("--stage1-steps", type=int, default=50000, help="Stage 1 (autoencoder) steps")
     parser.add_argument("--skip-stage1", action="store_true", help="Skip stage 1")
     parser.add_argument("--codebook-dim", type=int, default=128, help="Latent dimension (128=Mimi-style, 64=small)")
@@ -1202,15 +1322,63 @@ def main():
         help="Stage 1 (autoencoder, no VQ): train mel-only; no MRSTFT discriminator (much faster). Stage 2 unchanged.",
     )
     parser.add_argument("--lambda-mel", type=float, default=None, help="Override mel-loss weight")
+    parser.add_argument(
+        "--spectrogram-every",
+        type=int,
+        default=5000,
+        help="Save mel/waveform comparison PNG every N steps under --spectrogram-dir (0=off)",
+    )
+    parser.add_argument(
+        "--spectrogram-dir",
+        type=str,
+        default="spectrogram_comparisons",
+        help="Subfolder (under cwd) for training spectrogram PNGs",
+    )
+    parser.add_argument(
+        "--spectrogram-viz-seconds",
+        type=float,
+        default=8.0,
+        help="Audio length (s) for spectrogram PNGs (orig vs recon); matches tools/plot_pipeline_spectrogram.py default",
+    )
+    parser.add_argument(
+        "--spectrogram-from-batch",
+        action="store_true",
+        help="Use current batch for PNGs (short mel) instead of manifest/synthetic clip",
+    )
     parser.add_argument("--torch-compile", action="store_true", help="Compile model with torch.compile")
     parser.add_argument("--torch-compile-backend", type=str, default="aot_eager", choices=["inductor", "aot_eager", "eager"],
                         help="Backend for torch.compile (aot_eager is default for stability)")
     parser.add_argument("--torch-compile-mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--torch-compile-fullgraph", action="store_true", help="Use fullgraph=True for torch.compile")
-    parser.add_argument("--fp16", action="store_true", help="Enable mixed precision training (2x speedup)")
+    parser.add_argument("--fp16", action="store_true", help="Mixed precision: fp16 autocast on forward pass (CUDA/MPS)")
+    parser.add_argument(
+        "--max-throughput",
+        action="store_true",
+        help="Preset: adv_every≥4, no spectrogram PNGs, eval/log less often, torch.compile (aot_eager), --fp16",
+    )
+    parser.add_argument(
+        "--no-torch-compile",
+        action="store_true",
+        help="Skip torch.compile (use with --max-throughput if Dynamo/MPS compile hangs or you Ctrl+C)",
+    )
     parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps (effective batch = batch_size × grad_accum)")
 
     args = parser.parse_args()
+    if args.max_throughput:
+        args.adv_every = max(4, args.adv_every)
+        args.spectrogram_every = 0
+        args.eval_every = max(10000, args.eval_every)
+        args.log_every = max(400, args.log_every)
+        if not args.no_torch_compile:
+            args.torch_compile = True
+        args.fp16 = True
+        compile_note = "OFF (--no-torch-compile)" if args.no_torch_compile else "aot_eager"
+        print(
+            "MAX THROUGHPUT preset: adv_every={} spectrogram_every=0 eval_every={} log_every={} "
+            "save_every={} torch.compile={} fp16=ON".format(
+                args.adv_every, args.eval_every, args.log_every, args.save_every, compile_note
+            )
+        )
     run_pipeline(args)
 
 if __name__ == "__main__":

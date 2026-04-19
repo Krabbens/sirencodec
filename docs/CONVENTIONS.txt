@@ -1,0 +1,7 @@
+Git LFS: install `git-lfs`, run `git lfs install` once per machine so `.gitattributes` patterns apply before push.
+
+Training / SYSTEM.md commits:
+- results.tsv: one commit per cycle row (or batch), message cites cycle + verdict + last step from experiments/.../log.tsv when relevant.
+- experiments/<name>/log.tsv + resume_state.json: commit after milestones (paths in resume_state.json repo-relative). experiments/**/checkpoints/*.pt gitignored—keep local or LFS/release; don’t index.
+- Code / scripts: separate commits from data; conventional commits (feat/fix/docs).
+- Large binaries: Git LFS (*.pt where tracked, spectrograms, *.npy). Root checkpoints/ gitignored; experiment .pt local unless .gitignore overridden.

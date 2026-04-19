@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Compare NL vs PCA experiments: load final checkpoints, run PESQ/STOI/SI-SDR on dev set."""
 import sys, os, json, math
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO / "src"))
 
 import torch
 import torchaudio
-from pathlib import Path
 from dataclasses import fields
 
-from train_vocos_vq import (
+from sirencodec.core.train_vocos_vq import (
     VocosVQCodec,
     VocosVQConfig,
     AudioDataset,

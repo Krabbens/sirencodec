@@ -7,6 +7,13 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Caveman-compress backups (full prose before token squeeze)
+*.original.md
+
+# Local scratch / one-off plots (not part of source)
+/spectrogram_comparison.png
+installed_packages.txt
+
 # IDE / local
 .cursor/
 .idea/
@@ -27,8 +34,11 @@ build/
 # Root-only checkpoint dirs (do not use bare `checkpoints/` — that ignores experiments/**/checkpoints too)
 /checkpoints/
 /checkpoints_*/
-experiments/**/spectrograms/
-experiments/audio_listen_compare/
+# TensorBoard event dirs (train_mlx --tensorboard-dir)
+/tensorboard_logs/
+
+# Local experiment runs (optional; not part of source tree)
+/experiments/
 *.log
 pca_components.pt
 test_original.wav

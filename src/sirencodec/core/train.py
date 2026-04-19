@@ -41,6 +41,15 @@ Cycle 7 explore: ARCH-C-v1 — Adaptive frame rate (keyframe + interpolation, ~2
 """
 
 import torch
+import warnings
+
+# PyTorch prim STFT/iSTFT: internal `out` resize triggers a benign UserWarning on some builds.
+warnings.filterwarnings(
+    "ignore",
+    message="An output with one or more elements was resized since it had shape",
+    category=UserWarning,
+)
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -137,7 +146,15 @@ class CodecConfig:
     # Psychoacoustic weighting in mel loss
     psych_weight_low: float = 1.0  # 0-1kHz
     psych_weight_mid: float = 2.0  # 1-4kHz (intelligibility)
-    psych_weight_high: float = 0.5  # 4-8kHz
+    psych_weight_high: float = 0.75  # 4-8kHz (raised from 0.5 to reduce HF smoothing bias)
+
+    # Adaptive bitrate: variable RVQ depth per latent frame (monotonic layers 0..d-1)
+    abr_enabled: bool = False
+    abr_mode: str = "full"  # "full" | "heuristic" | "learned"
+    abr_lambda_rate: float = 0.01  # penalize mean depth (rate)
+    abr_depth_entropy_lambda: float = 0.001  # encourage confident depth policy
+    abr_heuristic_thresh: float = 0.15  # per-layer residual L2 mean threshold (heuristic mode)
+    abr_gumbel_temp: float = 1.0  # for learned depth Gumbel-Softmax
     
     # Training
     batch_size: int = 16
@@ -209,6 +226,14 @@ class CodecConfig:
 
     # Eval
     eval_every: int = 5000
+    # Periodic mel/waveform comparison PNG during train_pipeline (0 = disabled)
+    spectrogram_every: int = 5000
+    spectrogram_dir: str = "spectrogram_comparisons"
+    # Match tools/plot_pipeline_spectrogram.py (wide mel axis, same clip as default plot)
+    spectrogram_viz_seconds: float = 8.0
+    spectrogram_viz_manifest: str = "data/master_manifest.jsonl"
+    spectrogram_viz_seed: int = 42
+    spectrogram_viz_from_batch: bool = False  # True: use training batch only (shorter segment)
     save_every: int = 10000
     log_every: int = 100
     log_tsv: str = "log.tsv"
@@ -612,10 +637,13 @@ class Encoder(nn.Module):
         # GRU temporal context with residual
         if self.use_gru:
             x_perm = x.permute(0, 2, 1)  # [B, T/320, codebook_dim]
-            h0 = torch.zeros(1, x.size(0), self.gru.hidden_size, device=x.device)
-            gru_out, _ = self.gru(x_perm, h0)
+            # Autocast can make activations fp16; nn.GRU weights stay fp32 — RNN rejects that mix.
+            h0 = torch.zeros(
+                1, x.size(0), self.gru.hidden_size, device=x.device, dtype=torch.float32
+            )
+            gru_out, _ = self.gru(x_perm.float(), h0)
             gru_proj = self.gru_proj(gru_out)
-            x_perm = x_perm + self.gru_alpha * gru_proj  # residual connection
+            x_perm = x_perm + self.gru_alpha * gru_proj.to(dtype=x_perm.dtype)
             x = x_perm.permute(0, 2, 1)  # [B, codebook_dim, T/320]
         # Running mean subtraction (Cycle 3) — always on (was training-only, caused eval/train mismatch)
         if self.use_running_mean:
@@ -723,8 +751,9 @@ class VectorQuantize(nn.Module):
         self.register_buffer("ema_count", torch.ones(codebook_size))
         self.register_buffer("ema_weight", embed.clone())
     
-    def forward(self, x):
+    def forward(self, x, active_mask=None):
         # x: [B, D, T] → transpose to [B*T, D]
+        # active_mask: optional [B, T] float in {0,1} — zero out quantized output where 0
         B, D, T = x.shape
         x_flat = x.permute(0, 2, 1).reshape(-1, D)
         
@@ -755,17 +784,74 @@ class VectorQuantize(nn.Module):
                         self.ema_count[dead] = 1.0
         
         # Straight-through estimator
-        commitment_loss = F.mse_loss(x_flat, quantized.detach())
-        codebook_loss = F.mse_loss(quantized, x_flat.detach())
-        
         quantized_st = x_flat + (quantized - x_flat).detach()  # STE
-        quantized_st = quantized_st.reshape(B, T, D).permute(0, 2, 1)
+        quantized_st = quantized_st.reshape(B, T, D).permute(0, 2, 1)  # [B, D, T]
+        if active_mask is not None:
+            m = active_mask.unsqueeze(1).to(dtype=quantized_st.dtype, device=quantized_st.device)
+            quantized_st = quantized_st * m
+            q_flat = quantized_st.permute(0, 2, 1).reshape(-1, D)
+            x_f = x.permute(0, 2, 1).reshape(-1, D)
+            mf = active_mask.reshape(-1).unsqueeze(-1)
+            denom = mf.sum().clamp(min=1.0) * D
+            commitment_loss = ((x_f - q_flat.detach()) ** 2 * mf).sum() / denom
+            codebook_loss = ((q_flat - x_f.detach()) ** 2 * mf).sum() / denom
+            idx_m = active_mask.reshape(-1) > 0.5
+            if idx_m.any():
+                utilization = indices.reshape(-1)[idx_m].float().unique().numel() / self.n_codes
+            else:
+                utilization = 0.0
+        else:
+            commitment_loss = F.mse_loss(x_flat, quantized.detach())
+            codebook_loss = F.mse_loss(quantized, x_flat.detach())
+            utilization = len(indices.unique()) / self.n_codes
+        
         indices = indices.reshape(B, T)
         
-        # Utilization metric
-        utilization = len(indices.unique()) / self.n_codes
-        
         return quantized_st, indices, commitment_loss, codebook_loss, utilization
+
+
+def compute_abr_depth_heuristic(z: torch.Tensor, cfg: CodecConfig) -> torch.Tensor:
+    """Map latent energy to per-frame depth in {1, ..., n_codebooks} (monotonic RVQ)."""
+    B, D, T = z.shape
+    nq = cfg.n_codebooks
+    e = z.pow(2).mean(dim=1)
+    e = e / (e.mean(dim=-1, keepdim=True) + 1e-6)
+    depth = 1 + (e * float(nq - 1)).long().clamp(0, nq - 1)
+    return depth
+
+
+class DepthPolicy(nn.Module):
+    """Predicts discrete RVQ depth per latent frame (1..K) for ABR."""
+
+    def __init__(self, cfg: CodecConfig):
+        super().__init__()
+        self.n_codebooks = cfg.n_codebooks
+        d = cfg.codebook_dim
+        self.net = nn.Sequential(
+            nn.Conv1d(d, d, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(d, self.n_codebooks, 1),
+        )
+
+    def forward(self, z: torch.Tensor, cfg: CodecConfig, hard: bool = False):
+        """Returns depth [B,T] long in 1..K, rate penalty (mean soft depth), entropy of logits."""
+        logits = self.net(z)
+        tau = max(cfg.abr_gumbel_temp, 1e-3)
+        if self.training and not hard:
+            probs = F.gumbel_softmax(logits, tau=tau, dim=1, hard=True)
+        else:
+            idx = logits.argmax(dim=1)
+            probs = F.one_hot(idx, num_classes=self.n_codebooks).permute(0, 2, 1).to(dtype=logits.dtype)
+        depths_1_to_k = torch.arange(1, self.n_codebooks + 1, device=z.device, dtype=logits.dtype).view(
+            1, self.n_codebooks, 1
+        )
+        depth_soft = (probs * depths_1_to_k).sum(dim=1)
+        depth_hard = logits.argmax(dim=1) + 1
+        depth = (depth_hard + (depth_soft - depth_soft.detach())).long()
+        rate_penalty = depth_soft.mean()
+        ent = -(F.log_softmax(logits, dim=1) * F.softmax(logits, dim=1)).sum(dim=1).mean()
+        return depth, rate_penalty, ent
+
 
 class ResidualVQ(nn.Module):
     def __init__(self, cfg: CodecConfig):
@@ -783,11 +869,14 @@ class ResidualVQ(nn.Module):
             ])
             self.fsq = None
 
-    def forward(self, x, n_codebooks=None):
+    def forward(self, x, n_codebooks=None, depth: Optional[torch.Tensor] = None):
         if self.use_fsq:
             return self.fsq(x)
-        
+
         n_q = n_codebooks or self.n_codebooks
+        B, _, T = x.shape
+        if depth is None:
+            depth = torch.full((B, T), n_q, device=x.device, dtype=torch.long)
         residual = x
         quantized_total = torch.zeros_like(x)
         all_indices = []
@@ -796,7 +885,8 @@ class ResidualVQ(nn.Module):
         total_util = 0.0
 
         for i in range(n_q):
-            quantized, indices, commit, cb_loss, util = self.layers[i](residual)
+            active = (depth > i).to(dtype=x.dtype, device=x.device)
+            quantized, indices, commit, cb_loss, util = self.layers[i](residual, active_mask=active)
             residual = residual - quantized.detach()
             quantized_total = quantized_total + quantized
             all_indices.append(indices)
@@ -947,6 +1037,40 @@ class ZipformerBlock(nn.Module):
         x = x + ff_out
         return x
 
+
+def _istft_waveform(stft_complex, *, n_fft, hop_length, window, target_length=None):
+    """torch.istft wrapper: always pass ``length`` when inferable (avoids prim ``out`` resize warnings)."""
+    kwargs = dict(
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=window,
+        return_complex=False,
+    )
+    if target_length is not None:
+        kwargs["length"] = int(target_length)
+    else:
+        n_frames = stft_complex.size(-1)
+        if n_frames > 1:
+            # Matches torch.istft default length for center=True, onesided STFT (see torch.istft docs).
+            kwargs["length"] = (n_frames - 1) * hop_length
+    return torch.istft(stft_complex, **kwargs)
+
+
+def _audio_stft(x, *, n_fft, hop_length, window):
+    """Batched STFT with explicit win_length/center (avoids internal resize warnings on some PyTorch builds)."""
+    return torch.stft(
+        x,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=n_fft,
+        window=window,
+        center=True,
+        normalized=False,
+        onesided=True,
+        return_complex=True,
+    )
+
+
 class VocosDecoder(nn.Module):
     """iSTFT-based decoder with ConvNeXt processing at latent rate.
 
@@ -985,11 +1109,12 @@ class VocosDecoder(nn.Module):
 
         # iSTFT: T_compressed → T_audio via hop_length
         stft_complex = mag * torch.exp(1j * phase)
-        audio = torch.istft(
-            stft_complex, n_fft=self.n_fft, hop_length=self.hop_length,
+        audio = _istft_waveform(
+            stft_complex,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
             window=torch.hann_window(self.n_fft, device=z.device),
-            length=target_length,  # Fix length mismatch
-            return_complex=False
+            target_length=target_length,
         )
         return audio.unsqueeze(1)  # [B, 1, T]
 
@@ -1047,11 +1172,12 @@ class ZipformerDecoder(nn.Module):
 
         # iSTFT
         stft_complex = mag * torch.exp(1j * phase)
-        audio = torch.istft(
-            stft_complex, n_fft=self.n_fft, hop_length=self.hop_length,
+        audio = _istft_waveform(
+            stft_complex,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
             window=torch.hann_window(self.n_fft, device=z.device),
-            length=target_length,
-            return_complex=False
+            target_length=target_length,
         )
         return audio.unsqueeze(1)  # [B, 1, T]
 
@@ -1172,7 +1298,7 @@ class STFTDiscriminator(nn.Module):
         """x: [B, 1, T] audio → STFT → [B, 1, F, T'] → convs."""
         x = x.squeeze(1)  # [B, T]
         window = torch.hann_window(self.n_fft, device=x.device)
-        stft = torch.stft(x, self.n_fft, self.hop_length, window=window, return_complex=True)
+        stft = _audio_stft(x, n_fft=self.n_fft, hop_length=self.hop_length, window=window)
         mag = stft.abs().unsqueeze(1)  # [B, 1, F, T']
 
         feats = []
@@ -1325,8 +1451,8 @@ class MultiResolutionSTFTLoss(nn.Module):
         pred_mags, target_mags = [], []
         for n_fft, hop in self.resolutions:
             window = torch.hann_window(n_fft, device=pred.device)
-            pred_stft = torch.stft(pred, n_fft, hop, window=window, return_complex=True)
-            target_stft = torch.stft(target, n_fft, hop, window=window, return_complex=True)
+            pred_stft = _audio_stft(pred, n_fft=n_fft, hop_length=hop, window=window)
+            target_stft = _audio_stft(target, n_fft=n_fft, hop_length=hop, window=window)
             pred_mag = pred_stft.abs().clamp(min=1e-7)
             target_mag = target_stft.abs().clamp(min=1e-7)
             min_frames = min(pred_mag.size(-1), target_mag.size(-1))
@@ -1690,9 +1816,12 @@ class MambaISTFTNetDecoder(nn.Module):
         stft_complex = torch.complex(real_part, imag_part)
 
         # iSTFT: 200Hz → 16kHz (80× upsampling)
-        audio = torch.istft(
-            stft_complex, n_fft=self.n_fft, hop_length=self.hop_length,
-            window=self.window, length=target_length, return_complex=False
+        audio = _istft_waveform(
+            stft_complex,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=self.window,
+            target_length=target_length,
         )
 
         return audio.unsqueeze(1)  # [B, 1, T_audio]
@@ -1788,6 +1917,9 @@ class AudioCodec(nn.Module):
         self.cfg = cfg
         self.encoder = Encoder(cfg)
         self.quantizer = ResidualVQ(cfg)
+        self.depth_policy = (
+            DepthPolicy(cfg) if cfg.abr_enabled and cfg.abr_mode == "learned" and not cfg.use_fsq else None
+        )
         # Decoder selection (Cycle 35: Mamba iSTFTNet decoder)
         if cfg.decoder_type == "hifigan":
             self.decoder = HiFiGANGenerator(cfg)
@@ -1799,30 +1931,74 @@ class AudioCodec(nn.Module):
             self.decoder = VocosDecoder(cfg)
         # Cycle 2: entropy prior for training + inference compression
         self.entropy_prior = BigramEntropyPrior(cfg.codebook_size) if cfg.entropy_coding_enabled else None
+        # ABR: bigram prior over discrete depth symbols (0..K-1) alongside codebook indices
+        self.depth_entropy_prior = (
+            BigramEntropyPrior(cfg.n_codebooks, context_dim=32)
+            if cfg.abr_enabled and cfg.entropy_coding_enabled and not cfg.use_fsq
+            else None
+        )
+
+    def _abr_depth(self, z: torch.Tensor, n_q: int):
+        """Returns (depth [B,T] or None, abr_aux dict with optional rate/ent tensors)."""
+        cfg = self.cfg
+        if not cfg.abr_enabled or self.quantizer.use_fsq:
+            return None, {}
+        if cfg.abr_mode == "full":
+            d = torch.full((z.size(0), z.size(2)), n_q, device=z.device, dtype=torch.long)
+            return d, {}
+        if cfg.abr_mode == "heuristic":
+            return compute_abr_depth_heuristic(z, cfg).clamp(1, n_q), {}
+        if cfg.abr_mode == "learned":
+            assert self.depth_policy is not None
+            depth, rate_pen, ent = self.depth_policy(z, cfg)
+            depth = depth.clamp(1, n_q)
+            return depth, {"rate": rate_pen, "ent": ent}
+        d = torch.full((z.size(0), z.size(2)), n_q, device=z.device, dtype=torch.long)
+        return d, {}
 
     def forward(self, x, n_codebooks=None):
         z = self.encoder(x)
-        zq, indices, commit, cb_loss, util = self.quantizer(z, n_codebooks)
+        n_q = n_codebooks if n_codebooks is not None else self.cfg.n_codebooks
+        depth, abr_aux = self._abr_depth(z, n_q)
+        zq, indices, commit, cb_loss, util = self.quantizer(z, n_codebooks=n_q, depth=depth)
         x_hat = self.decoder(zq, target_length=x.size(-1))
-        # Entropy prior loss (Cycle 2)
-        entropy_loss = 0.0
+        entropy_loss = torch.tensor(0.0, device=z.device)
         if self.entropy_prior is not None and self.training:
-            # indices is a list [n_codebooks × [B, T]]
-            entropy_loss = self.entropy_prior.cross_entropy(indices[0])
-        return x_hat, indices, commit, cb_loss, util, entropy_loss
+            entropy_loss = entropy_loss + self.entropy_prior.cross_entropy(indices[0])
+        if self.depth_entropy_prior is not None and self.training and depth is not None:
+            d_idx = (depth - 1).clamp(min=0, max=n_q - 1)
+            entropy_loss = entropy_loss + self.depth_entropy_prior.cross_entropy(d_idx)
+        return x_hat, indices, commit, cb_loss, util, entropy_loss, abr_aux
 
-    def encode(self, x):
+    def encode(self, x, n_codebooks=None):
         z = self.encoder(x)
-        _, indices, _, _, _ = self.quantizer(z)
+        n_q = n_codebooks if n_codebooks is not None else self.cfg.n_codebooks
+        if self.quantizer.use_fsq:
+            _, indices, _, _, _ = self.quantizer(z)
+            return indices
+        depth = None
+        if self.cfg.abr_enabled:
+            if self.cfg.abr_mode == "learned" and self.depth_policy is not None:
+                depth, _, _ = self.depth_policy(z, self.cfg, hard=True)
+                depth = depth.clamp(1, n_q)
+            else:
+                depth, _ = self._abr_depth(z, n_q)
+        _, indices, _, _, _ = self.quantizer(z, n_codebooks=n_q, depth=depth)
+        if self.cfg.abr_enabled:
+            return indices, depth
         return indices
 
-    def decode(self, indices):
-        # Reconstruct from indices
+    def decode(self, indices, target_length=None, depth=None):
+        # Reconstruct from indices (match forward() length for eval / SI-SDR)
         zq = torch.zeros(indices[0].size(0), self.cfg.codebook_dim,
                          indices[0].size(1), device=indices[0].device)
         for i, idx in enumerate(indices):
-            zq += F.embedding(idx, self.quantizer.layers[i].embed).permute(0, 2, 1)
-        return self.decoder(zq)
+            emb = F.embedding(idx, self.quantizer.layers[i].embed).permute(0, 2, 1)
+            if depth is not None:
+                m = (depth > i).to(dtype=emb.dtype, device=emb.device).unsqueeze(1)
+                emb = emb * m
+            zq = zq + emb
+        return self.decoder(zq, target_length=target_length)
 
     def count_params(self):
         return sum(p.numel() for p in self.parameters()) / 1e6
@@ -1924,10 +2100,12 @@ class DualStreamDecoder(nn.Module):
         phase = torch.atan2(phase.sin(), phase.cos())
 
         stft_complex = mag * torch.exp(1j * phase)
-        audio = torch.istft(
-            stft_complex, n_fft=self.n_fft, hop_length=self.hop_length,
+        audio = _istft_waveform(
+            stft_complex,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
             window=torch.hann_window(self.n_fft, device=x.device),
-            return_complex=False
+            target_length=None,
         )
         return audio.unsqueeze(1)
 
@@ -2336,14 +2514,17 @@ class AudioCodecD(nn.Module):
         _, indices, _, _, _ = self.quantizer(z)
         return indices
 
-    def decode(self, indices):
+    def decode(self, indices, target_length=None):
         # Reconstruct from coarse + fine indices
         coarse_embed = F.embedding(indices[0], self.quantizer.coarse_vq.embed)
         fine_embed = F.embedding(indices[1], self.quantizer.fine_vq.embed)
         # Upsample coarse
         coarse_up = coarse_embed.repeat_interleave(2, dim=1)
         zq = coarse_up + fine_embed
-        return self.decoder(zq)
+        x_hat = self.decoder(zq, target_length=target_length)
+        if target_length is not None and x_hat.size(-1) != target_length:
+            x_hat = x_hat[..., :target_length]
+        return x_hat
 
     def count_params(self):
         return sum(p.numel() for p in self.parameters()) / 1e6
@@ -2612,18 +2793,37 @@ def evaluate_codec(
             if cfg.architecture == "arch-c-v1":
                 indices, is_kf = codec.encode(x)
             else:
-                indices = codec.encode(x)
+                enc_out = codec.encode(x)
+                if isinstance(enc_out, tuple):
+                    indices, abr_depth = enc_out
+                else:
+                    indices, abr_depth = enc_out, None
             encode_ms = (time.time() - t0) * 1000 / (x.size(-1) / cfg.sample_rate)
             encode_times.append(encode_ms)
 
             # Measure decode latency
             t0 = time.time()
+            tl = x.size(-1)
             if cfg.architecture == "arch-c-v1":
                 x_hat = codec.decode(indices, is_kf)
             else:
-                x_hat = codec.decode(indices)
+                try:
+                    x_hat = codec.decode(indices, target_length=tl, depth=abr_depth)
+                except TypeError:
+                    try:
+                        x_hat = codec.decode(indices, target_length=tl)
+                    except TypeError:
+                        x_hat = codec.decode(indices)
             decode_ms = (time.time() - t0) * 1000 / (x.size(-1) / cfg.sample_rate)
             decode_times.append(decode_ms)
+
+            if x_hat.dim() == 2:
+                x_hat = x_hat.unsqueeze(1)
+            if x_hat.size(-1) != tl:
+                if x_hat.size(-1) > tl:
+                    x_hat = x_hat[..., :tl]
+                else:
+                    x_hat = F.pad(x_hat, (0, tl - x_hat.size(-1)))
 
             x_hat_eval = x_hat if x_hat.dim() >= 2 else x_hat.unsqueeze(0)
             if x_hat_eval.dim() == 2:
@@ -2715,7 +2915,7 @@ def train(cfg: CodecConfig):
     
     # Optimizers
     gen_params = list(codec.parameters())
-    disc_params = list(mrstft_disc.parameters()) if mrstft_disc else []
+    disc_params = list(mrstft_disc.parameters()) if mrstft_disc is not None else []
 
     opt_gen = torch.optim.AdamW(gen_params, lr=cfg.lr_gen, betas=cfg.betas)
     opt_disc = torch.optim.AdamW(disc_params, lr=cfg.lr_disc, betas=cfg.betas) if disc_params else None
@@ -2781,7 +2981,8 @@ def train(cfg: CodecConfig):
 
     # Training
     codec.train()
-    if mrstft_disc: mrstft_disc.train()
+    if mrstft_disc is not None:
+        mrstft_disc.train()
 
     # Data iterator (persistent for real data)
     data_iter = None
@@ -2811,13 +3012,24 @@ def train(cfg: CodecConfig):
             x = torch.randn(cfg.batch_size, 1, cfg.segment_length, device=device) * 0.1
 
         # ── Generator step ──
+        abr_aux = {}
         if cfg.architecture == "arch-c-v1":
             x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss, kf_frac = codec(x)
         elif cfg.architecture in ("arch-a-spk", "arch-b-v1"):
-            x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss = codec(x)
+            out = codec(x)
+            if len(out) == 7:
+                x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss, abr_aux = out
+            else:
+                x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss = out
+                abr_aux = {}
             kf_frac = 0.0
         else:
-            x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss = codec(x, n_codebooks=n_cb)
+            out = codec(x, n_codebooks=n_cb)
+            if len(out) == 7:
+                x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss, abr_aux = out
+            else:
+                x_hat, indices, commit_loss, cb_loss, vq_util, entropy_loss = out
+                abr_aux = {}
             kf_frac = 0.0
 
         # Reconstruction losses
@@ -2834,7 +3046,7 @@ def train(cfg: CodecConfig):
         loss_feat = 0.0
         progress = step / cfg.total_steps
 
-        if mrstft_disc and step > cfg.warmup_steps:
+        if mrstft_disc is not None and step > cfg.warmup_steps:
             # Reuse MRSTFT mags from recon loss — one STFT bank for loss + disc.
             if mr_pred_mags is not None and mr_tgt_mags is not None:
                 pred_mags_b1ft = [m.unsqueeze(1) for m in mr_pred_mags]
@@ -2858,6 +3070,8 @@ def train(cfg: CodecConfig):
             if cfg.entropy_coding_enabled:
                 losses = losses + [entropy_loss]
             loss_gen = dynamic_loss_fn(losses)
+            if abr_aux:
+                loss_gen = loss_gen + cfg.abr_lambda_rate * abr_aux["rate"] + cfg.abr_depth_entropy_lambda * abr_aux["ent"]
         else:
             loss_gen = (cfg.lambda_mel * loss_mel
                         + cfg.lambda_adv * loss_adv
@@ -2867,6 +3081,8 @@ def train(cfg: CodecConfig):
                         + lambda_entropy * entropy_loss)
             if mrstft_loss_fn:
                 loss_gen += 1.0 * loss_mrstft  # Cycle 26: was lambda_mel * 0.5 = 22.5 → dominated training
+        if abr_aux:
+            loss_gen = loss_gen + cfg.abr_lambda_rate * abr_aux["rate"] + cfg.abr_depth_entropy_lambda * abr_aux["ent"]
         
         opt_gen.zero_grad()
         loss_gen.backward()
@@ -2879,7 +3095,7 @@ def train(cfg: CodecConfig):
             x_hat_det = x_hat.detach()
             loss_disc = 0.0
 
-            if mrstft_disc:
+            if mrstft_disc is not None:
                 # Reuse real logits from the generator pass (no second disc(x)).
                 real_for_d = [r.detach() for r in real_out]
                 if mr_pred_mags is not None:
@@ -2950,7 +3166,8 @@ def train(cfg: CodecConfig):
                 "opt_gen": opt_gen.state_dict(),
                 "config": cfg,
             }
-            if mrstft_disc: ckpt["mrstft_disc"] = mrstft_disc.state_dict()
+            if mrstft_disc is not None:
+                ckpt["mrstft_disc"] = mrstft_disc.state_dict()
             if opt_disc: ckpt["opt_disc"] = opt_disc.state_dict()
             
             path = Path(f"checkpoints/codec_step{step}.pt")

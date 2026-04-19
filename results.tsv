@@ -1,2 +1,0 @@
-cycle	phase	hypothesis	arch_id	bitrate_bps	pesq_est	visqol_est	latency_ms	params_M	verdict	key_finding	next_action
-0	setup	DDP torchrun nproc=8 global batch 80 LR 10x vs batch-8 baseline	vocos_vq_nl4_fsq4_94fps	752	-	-	-	-	BASELINE	DDP+rank0 I/O in train_vocos_vq.py; CPU precomputed; scripts/run_nl4_fsq4_94fps_long_ddp8.sh	Run training; append metrics from experiments/nl4_fsq4_94fps_long/log.tsv eval lines

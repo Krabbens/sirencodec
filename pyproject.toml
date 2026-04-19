@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sirencodec"
+version = "0.1.0"
+description = "Neural audio codec research (Vocos VQ, SEANet pipeline)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "torchaudio",
+  "vocos",
+  "matplotlib>=3.7",
+  "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+# Apple Silicon: array framework + Metal (utilities / future MLX paths; training stays PyTorch).
+mlx = ["mlx>=0.21"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
