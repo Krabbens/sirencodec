@@ -40,9 +40,15 @@ def fmt_num(v, decimals=3):
 
 
 def pct(v):
+    """Format utilization: log stores 0–1 fraction; misaligned columns may look like 10–100."""
     try:
-        return f"{float(v)*100:.1f}%"
-    except:
+        x = float(v)
+        if 0.0 <= x <= 1.0:
+            return f"{x * 100:.1f}%"
+        if 1.0 < x <= 100.0:
+            return f"{x:.1f}%"
+        return f"{x:.2f}"
+    except (TypeError, ValueError):
         return str(v)
 
 

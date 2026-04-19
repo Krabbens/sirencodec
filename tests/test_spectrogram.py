@@ -1,4 +1,8 @@
 """Generate spectrogram comparison: original vs reconstructed."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import torch
 import torchaudio
 import numpy as np
@@ -7,7 +11,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 
-from train_vocos_vq import VocosVQCodec, VocosVQConfig
+from sirencodec.core.train_vocos_vq import VocosVQCodec, VocosVQConfig
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 sr = 24000

@@ -3,8 +3,10 @@ import torch
 import torchaudio
 import os
 import sys
+from pathlib import Path
 
-from train_vocos_vq import VocosVQCodec, VocosVQConfig
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from sirencodec.core.train_vocos_vq import VocosVQCodec, VocosVQConfig
 
 try:
     from pesq import pesq as _pesq

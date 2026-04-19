@@ -1,5 +1,5 @@
 # Git LFS — large binaries (install: git lfs install)
+# Note: experiments/**/checkpoints/*.pt is gitignored; other *.pt (if tracked) use LFS.
 *.pt filter=lfs diff=lfs merge=lfs -text
-experiments/**/checkpoints/*.pt filter=lfs diff=lfs merge=lfs -text
 *.npy filter=lfs diff=lfs merge=lfs -text
 experiments/**/spectrograms/*.png filter=lfs diff=lfs merge=lfs -text

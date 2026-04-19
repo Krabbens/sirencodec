@@ -14,12 +14,13 @@ import soundfile as sf
 import torch
 import torchaudio
 
-# Repo root
+# Repo root + src for package imports
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_SRC = _ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-from train_vocos_vq import (  # noqa: E402
+from sirencodec.core.train_vocos_vq import (  # noqa: E402
     VocosVQCodec,
     VocosVQConfig,
     _normalize_ckpt_state_dict,

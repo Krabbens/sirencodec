@@ -1,49 +1,36 @@
 # SirenCodec
 
-Neural audio codec using pretrained Vocos vocoder + RVQ/FSQ compression.
+Neural audio codec (PyTorch): **Vocos + RVQ/FSQ** + **SEANet** research.
 
-## Architecture
-
-```
-Audio (24kHz) → MelSpectrogram (100-dim) → RVQ/FSQ → Vocos → Audio (24kHz)
-```
-
-- **Feature extractor**: 100-dim mel spectrogram at 24kHz
-- **Quantization**: RVQ (residual vector quantization) or FSQ (finite scalar quantization)
-- **Vocoder**: Pretrained Vocos (`charactr/vocos-mel-24khz`, 13.5M params, fine-tuned)
-
-## Bitrate Options
-
-| Config | Command | Bitrate |
-|--------|---------|---------|
-| 4 codebooks × 1024 @ 94fps | `--rvq --n-codebooks 4` | 3,750 bps |
-| 2 codebooks × 1024 @ 94fps | `--rvq --n-codebooks 2` | 1,875 bps |
-| **2 codebooks × 1024 @ 30fps** | `--rvq --n-codebooks 2 --mel-fps 30` | **600 bps** |
-
-## Usage
+## Quick start
 
 ```bash
-pip install vocos torch torchaudio
-
-# Train at 600 bps (2 codebooks, 30fps)
-python3 train_vocos_vq.py --steps 50000 --rvq --n-codebooks 2 --mel-fps 30
-
-# Train at 1,875 bps (2 codebooks, 94fps)
-python3 train_vocos_vq.py --steps 50000 --rvq --n-codebooks 2
-
-# Train with FSQ (experimental)
-python3 train_vocos_vq.py --steps 50000 --fsq-dims 16 --fsq-levels 5
+pip install torch torchaudio vocos   # optional: pesq, soundfile
+python3 run.py train_vocos_vq --help
+python3 run.py train_pipeline --help
+./scripts/run_training.sh         # SEANet arch-a-v2b + LibriSpeech
 ```
 
-## Dataset
+## Layout
 
-Expects `data/master_manifest.jsonl` with entries:
-```json
-{"path": "path/to/audio.flac"}
-```
+Target: **≤4 regular files** per source folder (`src/sirencodec`, `core`, `docs`, `scripts`, `tools`). Repo root: `.gitattributes` / `.gitignore` + LFS (5 files at root).
 
-## Results
+| Path | Contents |
+|------|----------|
+| `run.py` | Single CLI: `train`, `train_pipeline`, `train_vocos_vq`, `sidecars`, `bench_*`, `watch`, … |
+| `src/sirencodec/` | `data_pipeline`, `extras`, `sidecars`, `core/` (4 items) |
+| `src/sirencodec/core/` | `train`, `train_pipeline`, `train_vocos_vq` (+ `__init__.py`) |
+| `scripts/` | `run_training.sh`, `run_thesis_sweep.sh`, `export_codec_wav.py`, `compare_nl_vs_pca.py` |
+| `tools/` | `watch`, `bench_fps`, `bench_lowfps`, `precompute_mels` |
+| `tests/` | Optional smoke scripts |
+| `docs/` | `GUIDE.md`, `RESEARCH.md`, `ROADMAP_2026.md`, `CONVENTIONS.txt` |
 
-| Step | Bitrate | mel loss | SI-SDR | PESQ |
-|------|---------|----------|--------|------|
-| 10k | 3,750 bps (4×1024@94fps) | 0.34 | -28.5 dB | 2.15 |
+Optional: `pip install -e .`
+
+## Docs
+
+`docs/GUIDE.md` (overview + thesis commands), `docs/RESEARCH.md`.
+
+## Requirements
+
+Python **≥3.10** (`train_vocos_vq` uses modern typing).

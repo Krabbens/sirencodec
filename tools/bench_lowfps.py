@@ -1,6 +1,9 @@
 """Sweep: lower fps + bigger codebooks at fixed bitrate."""
-import torch, math, time, os
-from train_vocos_vq import VocosVQCodec, VocosVQConfig, AudioDataset, collate_fn
+import torch, math, time, os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from sirencodec.core.train_vocos_vq import VocosVQCodec, VocosVQConfig, AudioDataset, collate_fn
 
 DEVICE = torch.device("cuda")
 
