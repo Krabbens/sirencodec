@@ -81,6 +81,8 @@ def run() -> None:
     cfg.stft_scales = FAST_STFT_SCALES
     # experiment: narrower latent → faster steps → more updates / 300s.
     cfg.latent_dim = 384
+    # experiment: slightly lower STFT weight for short-run balance vs waveform + VQ.
+    cfg.lambda_stft = 0.30
     # Shorter ramps vs long production runs so short budget runs see fuller STFT / marginal weights.
     cfg.stft_ramp_steps = min(cfg.stft_ramp_steps, 8000)
     cfg.marginal_boost_steps = min(cfg.marginal_boost_steps, 8000)
