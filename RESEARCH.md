@@ -516,5 +516,5 @@ Progressive 2× upsampling with dilated residual blocks:
 - **Not** a claim about PESQ or final codec ranking — only about the **combined reconstruction loss** used in `train_mlx`.
 
 ### VERDICT: auxiliary frontier
-- Best logged row: **fast STFT + `latent_dim` 384** (`af40b90` in `results.tsv`).
-- **NEXT**: Optional — sweep **`latent_dim` ∈ {448, 512}** with fast STFT under the same wall clock; run the same winners for **≥50k steps** with real audio under `data/` and compare spectrograms / listening, not only `val_bpb`.
+- Best logged row: **fast STFT + `latent_dim` 384 + `lambda_stft` 0.30** (`aa2e494` in `results.tsv`; prior best without STFT tweak was `af40b90`). **`latent_dim` 448** under the same recipe was worse on the proxy.
+- **NEXT**: Optional — try **`lambda_stft` ∈ {0.28, 0.32}** around 0.30; long runs on real `data/` with spectrograms / listening, not only `val_bpb`.
