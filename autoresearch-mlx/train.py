@@ -76,6 +76,7 @@ def run() -> None:
     _reset_peak_memory()
 
     cfg = Config()
+    cfg.seed = int(os.environ.get("AUTORESEARCH_SEED", str(cfg.seed)))
     cfg.steps = LR_SCHEDULE_STEPS
     # experiment: match ``train_mlx --fast`` — two STFT scales → cheaper steps → more updates / 300s.
     cfg.stft_scales = FAST_STFT_SCALES
