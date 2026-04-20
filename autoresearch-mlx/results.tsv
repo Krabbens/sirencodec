@@ -1,3 +1,4 @@
 commit	val_bpb	memory_gb	status	description
 7d81fb5	0.615863	1.8	keep	baseline: default MLXCodec, 300s wall budget, prepare.py metric
 9f3819b	0.529912	1.8	keep	fast two-scale STFT (FAST_STFT_SCALES, train_mlx --fast)
+af40b90	0.512132	1.8	keep	latent_dim 384 + fast STFT (more steps / 300s)
