@@ -79,6 +79,8 @@ def run() -> None:
     cfg.steps = LR_SCHEDULE_STEPS
     # experiment: match ``train_mlx --fast`` — two STFT scales → cheaper steps → more updates / 300s.
     cfg.stft_scales = FAST_STFT_SCALES
+    # experiment: narrower latent → faster steps → more updates / 300s.
+    cfg.latent_dim = 384
     # Shorter ramps vs long production runs so short budget runs see fuller STFT / marginal weights.
     cfg.stft_ramp_steps = min(cfg.stft_ramp_steps, 8000)
     cfg.marginal_boost_steps = min(cfg.marginal_boost_steps, 8000)
