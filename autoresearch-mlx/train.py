@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 import prepare as prep
 
 from tools.train_mlx import (
+    FAST_STFT_SCALES,
     Config,
     MLXCodec,
     _eval_loss_and_grad_tree,
@@ -76,6 +77,8 @@ def run() -> None:
 
     cfg = Config()
     cfg.steps = LR_SCHEDULE_STEPS
+    # experiment: match ``train_mlx --fast`` — two STFT scales → cheaper steps → more updates / 300s.
+    cfg.stft_scales = FAST_STFT_SCALES
     # Shorter ramps vs long production runs so short budget runs see fuller STFT / marginal weights.
     cfg.stft_ramp_steps = min(cfg.stft_ramp_steps, 8000)
     cfg.marginal_boost_steps = min(cfg.marginal_boost_steps, 8000)
