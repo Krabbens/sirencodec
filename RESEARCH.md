@@ -497,3 +497,24 @@ Progressive 2× upsampling with dilated residual blocks:
 - First time HiFi-GAN training runs without immediate divergence
 - Stage 1 gradients are clean (no adversarial interference)
 - NEXT: Evaluate at 20k (end of S1) and at milestones during S2
+
+---
+
+## Cycle 24: Autoresearch-MLX — time-budget probes on `tools/train_mlx.py` (Apple Silicon)
+
+### Context
+- Subproject [`autoresearch-mlx/`](autoresearch-mlx/README.md): frozen `prepare.py` builds the validation scalar as the mean of **`make_train_fn`**’s total loss on a held-out batch stream (field name **`val_bpb`** is historical from LM-style autoresearch; **lower is better**).
+- Constraint: ~**300 s training wall** per trial; only [`train.py`](autoresearch-mlx/train.py) changes during the loop. Same RVQ+SEANet-ish **MLXCodec** as in [`tools/train_mlx.py`](tools/train_mlx.py).
+
+### Findings (see [`autoresearch-mlx/results.tsv`](autoresearch-mlx/results.tsv))
+1. **Two-scale STFT** (`FAST_STFT_SCALES`, same idea as `train_mlx --fast`): fewer FFT scales per step → higher step rate → large drop in `val_bpb` vs default three-scale STFT (~**0.62 → ~0.53** on the reference machine).
+2. **`latent_dim` 384** (default 512) with fast STFT: smaller per-step graph → more Adam steps in the same wall time → further gain (~**0.53 → ~0.51**). **`latent_dim` 320** removed too much capacity; **`batch = 8`** and **shortening STFT/marginal ramps** to ~5k steps **hurt** on this proxy (likely worse geometry or premature spectral pressure vs RVQ).
+3. **Learning rate** alone (e.g. **6.5e-4** vs **5e-4**) did not beat the best throughput-shaped config under the same budget.
+
+### Relation to cycles above
+- Cycles 1–23 focus on **bitrate vs perceptual quality** (PESQ, architecture families). This cycle is **compute vs training objective proxy** on MLX: useful for **ranking cheap knobs** (STFT layout, width, batch) before long GPU/PyTorch runs.
+- **Not** a claim about PESQ or final codec ranking — only about the **combined reconstruction loss** used in `train_mlx`.
+
+### VERDICT: auxiliary frontier
+- Best logged row: **fast STFT + `latent_dim` 384** (`af40b90` in `results.tsv`).
+- **NEXT**: Optional — sweep **`latent_dim` ∈ {448, 512}** with fast STFT under the same wall clock; run the same winners for **≥50k steps** with real audio under `data/` and compare spectrograms / listening, not only `val_bpb`.
