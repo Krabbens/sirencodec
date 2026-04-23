@@ -119,6 +119,16 @@ class Config:
     lambda_cos: float = 0.15  # adds λ·(1 − cos); pushes toward cos → 1
     cos_hinge: float = 0.0  # adds w·max(0, cos_target − cos); use to chase e.g. 90%+
     cos_target: float = 0.9
+    # Reconstruction loss balancer: off = raw lambdas, grad = EnCodec-style gradient-ratio balancing wrt y_hat.
+    loss_balancer: str = "off"  # "off" | "grad"
+    loss_balancer_eps: float = 1e-8
+    loss_balancer_max_scale: float = 10.0
+    # Curriculum without adversarial phase: A continuous AE, B RVQ/loss ramp, D full fine-tune.
+    curriculum: bool = False
+    curriculum_ae_frac: float = 0.05
+    curriculum_vq_ramp_frac: float = 0.20
+    curriculum_vq_start: float = 0.10
+    curriculum_entropy_start: float = 0.0
     # Logging
     log_every: int = 50
     # EMA of waveform cos % in the log line: ema ← β·ema + (1−β)·cos; 0 = print raw cos only
@@ -129,7 +139,7 @@ class Config:
     save_audio: bool = True  # with PNG: also write *_orig.wav / *_recon.wav (soundfile)
     # Longer PNG/WAV than training segment: seconds of audio (0 = use training batch for viz)
     spectrogram_seconds: float = 8.0  # 0 = use training batch length for PNG/WAV
-    checkpoint_every: int = 10_000  # 0 = no periodic saves; also saves last step
+    checkpoint_every: int = 0  # 0 = trainer default (10 epochs on fresh runs); explicit CLI still means updates
     checkpoint_dir: str = "mlx_checkpoints"
     # If True and ``data_dir`` is None, trainer resolves ``data/cv-corpus``. Set False for synthetic batches only.
     use_librispeech: bool = True
@@ -156,6 +166,8 @@ class Config:
     full_checkpoint: bool = True
     # Validation / logging: 0 = off. Writes ``log_mlx_tsv`` and optional ``results_tsv_path`` row.
     eval_every: int = 5000
+    eval_clips: int = 4
+    eval_seconds: float = 3.0
     log_mlx_tsv: str = "log_mlx.tsv"
     results_tsv_path: str = "results.tsv"
     # Adaptive / BWE stubs (see ``sirencodec_mlx.adaptive``): ``none`` | ``bwe_stub`` | ``fps_stub``.
@@ -310,6 +322,14 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lambda_cos": c.lambda_cos,
         "cos_hinge": c.cos_hinge,
         "cos_target": c.cos_target,
+        "loss_balancer": c.loss_balancer,
+        "loss_balancer_eps": c.loss_balancer_eps,
+        "loss_balancer_max_scale": c.loss_balancer_max_scale,
+        "curriculum": c.curriculum,
+        "curriculum_ae_frac": c.curriculum_ae_frac,
+        "curriculum_vq_ramp_frac": c.curriculum_vq_ramp_frac,
+        "curriculum_vq_start": c.curriculum_vq_start,
+        "curriculum_entropy_start": c.curriculum_entropy_start,
         "lambda_mag_l1": c.lambda_mag_l1,
         "activation": c.activation,
         "rvq_code_dim": c.rvq_code_dim,
@@ -320,6 +340,8 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "compile_loss": c.use_compile,
         "full_checkpoint": c.full_checkpoint,
         "eval_every": c.eval_every,
+        "eval_clips": c.eval_clips,
+        "eval_seconds": c.eval_seconds,
         "log_mlx_tsv": c.log_mlx_tsv,
         "results_tsv": c.results_tsv_path,
         "adaptive_mode": c.adaptive_mode,

@@ -37,6 +37,7 @@ test_original.wav
 .qwen/
 
 # Root-level MLX training artifacts (multi-GB, not LFS-tracked)
+/mlx_runs/
 /mlx_checkpoints/
 /mlx_checkpoints_*/
 /mlx_spectrograms/
