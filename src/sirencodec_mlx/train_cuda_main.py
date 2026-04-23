@@ -9,6 +9,7 @@ The command stays compatible with ``tools/train_mlx.py`` so existing scripts kee
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -17,7 +18,9 @@ import time
 import wave
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -61,12 +64,87 @@ def effective_lambda_marginal(step: int, cfg: Config) -> float:
     return cfg.lambda_marginal * (m + (1.0 - m) * t)
 
 
+class CurriculumState(NamedTuple):
+    phase: str
+    ae_only: bool
+    vq_mult: float
+    entropy_mult: float
+    marginal_mult: float
+    reset_enabled: bool
+
+
+def _smooth01(x: float) -> float:
+    t = min(1.0, max(0.0, float(x)))
+    return 0.5 - 0.5 * math.cos(math.pi * t)
+
+
+def curriculum_state(step: int, cfg: Config) -> CurriculumState:
+    if not bool(getattr(cfg, "curriculum", False)):
+        return CurriculumState("off", bool(cfg.ae_only), 1.0, 1.0, 1.0, True)
+    if cfg.ae_only:
+        return CurriculumState("ae", True, 0.0, 0.0, 0.0, False)
+    total = max(1, int(cfg.steps))
+    ae_steps = max(0, int(round(total * max(0.0, float(cfg.curriculum_ae_frac)))))
+    ramp_steps = max(1, int(round(total * max(0.0, float(cfg.curriculum_vq_ramp_frac)))))
+    if step < ae_steps:
+        return CurriculumState("A/AE", True, 0.0, 0.0, 0.0, False)
+    if step < ae_steps + ramp_steps:
+        t = _smooth01((step - ae_steps + 1) / float(ramp_steps))
+        vq_start = min(1.0, max(0.0, float(cfg.curriculum_vq_start)))
+        ent_start = min(1.0, max(0.0, float(cfg.curriculum_entropy_start)))
+        vq_mult = vq_start + (1.0 - vq_start) * t
+        ent_mult = ent_start + (1.0 - ent_start) * t
+        return CurriculumState("B/RVQ", False, vq_mult, ent_mult, ent_mult, False)
+    return CurriculumState("D/full", False, 1.0, 1.0, 1.0, True)
+
+
 def batch_mean_cosine(orig: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
     return F.cosine_similarity(orig.reshape(orig.shape[0], -1), recon.reshape(recon.shape[0], -1), dim=1, eps=1e-8).mean()
 
 
+def _balanced_reconstruction_loss(
+    terms: list[tuple[str, torch.Tensor, float]],
+    y_hat: torch.Tensor,
+    cfg: Config,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    active = [(name, loss, float(weight)) for name, loss, weight in terms if float(weight) > 0]
+    if not active:
+        return y_hat.new_zeros(()), {}
+    mode = (cfg.loss_balancer or "off").lower()
+    if mode == "off":
+        return sum(weight * loss for _, loss, weight in active), {}
+    if mode != "grad":
+        raise ValueError(f"unknown loss_balancer={cfg.loss_balancer!r}")
+    weight_sum = sum(weight for _, _, weight in active)
+    if weight_sum <= 0:
+        return y_hat.new_zeros(()), {}
+    norms: list[torch.Tensor] = []
+    for _, loss, _ in active:
+        grad = torch.autograd.grad(loss, y_hat, retain_graph=True, create_graph=False, allow_unused=True)[0]
+        if grad is None:
+            norms.append(y_hat.new_zeros(()))
+        else:
+            norms.append(torch.linalg.vector_norm(grad.detach()) / math.sqrt(max(1, grad.numel())))
+    ratios = [weight / weight_sum for _, _, weight in active]
+    avg_norm = sum(norm * ratio for norm, ratio in zip(norms, ratios)).detach()
+    eps = float(cfg.loss_balancer_eps)
+    total = y_hat.new_zeros(())
+    scales: dict[str, float] = {}
+    for (name, loss, _), norm, ratio in zip(active, norms, ratios):
+        scale_t = (float(weight_sum) * ratio * avg_norm / norm.clamp_min(eps)).clamp(max=float(cfg.loss_balancer_max_scale)).detach()
+        total = total + scale_t * loss
+        scales[name] = float(scale_t.float().item())
+    return total, scales
+
+
 def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, mel_fb: torch.Tensor | None):
-    y_hat, vq_l, ent_pos, marg_ent, idx = model.forward_full(batch)
+    curr = curriculum_state(step, cfg)
+    old_ae = bool(model.cfg.ae_only)
+    model.cfg.ae_only = bool(curr.ae_only)
+    try:
+        y_hat, vq_l, ent_pos, marg_ent, idx = model.forward_full(batch)
+    finally:
+        model.cfg.ae_only = old_ae
     lt = torch.mean(torch.abs(y_hat - batch))
     ls, lsg, lsc, l_lin, l_sc, l_cx = multi_stft_all_terms(
         y_hat,
@@ -84,32 +162,40 @@ def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, 
     )
     cos = batch_mean_cosine(batch, y_hat)
     ls_w = effective_lambda_stft(step, cfg)
-    total = cfg.lambda_time * lt + ls_w * ls + cfg.lambda_vq * vq_l
-    if cfg.lambda_mag_l1 > 0:
-        total = total + ls_w * cfg.lambda_mag_l1 * l_lin
-    if cfg.lambda_stft_grad > 0:
-        total = total + ls_w * cfg.lambda_stft_grad * lsg
-    if cfg.lambda_stft_cos > 0:
-        total = total + ls_w * cfg.lambda_stft_cos * lsc
-    if cfg.lambda_sc > 0:
-        total = total + ls_w * cfg.lambda_sc * l_sc
-    if cfg.lambda_complex_stft > 0:
-        total = total + ls_w * cfg.lambda_complex_stft * l_cx
-    if cfg.lambda_entropy > 0:
-        total = total + cfg.lambda_entropy * (mean_log_codebook_for_entropy(cfg) - ent_pos).clamp_min(0.0)
-    if cfg.lambda_marginal > 0:
-        total = total + effective_lambda_marginal(step, cfg) * (mean_log_codebook_for_entropy(cfg) - marg_ent).clamp_min(0.0)
-    if cfg.lambda_cos > 0:
-        total = total + cfg.lambda_cos * (1.0 - cos)
-    if cfg.cos_hinge > 0:
-        total = total + cfg.cos_hinge * (float(cfg.cos_target) - cos).clamp_min(0.0)
     lm1 = batch.new_zeros(())
     lm2 = batch.new_zeros(())
     if mel_fb is not None and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0):
         lm1, lm2 = mel_log_bin_losses(y_hat, batch, mel_fb, cfg.mel_n_fft, cfg.mel_hop)
-        total = total + ls_w * (cfg.lambda_mel_l1 * lm1 + cfg.lambda_mel_l2 * lm2)
+    recon_terms = [
+        ("time", lt, float(cfg.lambda_time)),
+        ("stft", ls, float(ls_w)),
+        ("mag", l_lin, float(ls_w * cfg.lambda_mag_l1)),
+        ("sgrad", lsg, float(ls_w * cfg.lambda_stft_grad)),
+        ("stft_cos", lsc, float(ls_w * cfg.lambda_stft_cos)),
+        ("sc", l_sc, float(ls_w * cfg.lambda_sc)),
+        ("complex", l_cx, float(ls_w * cfg.lambda_complex_stft)),
+        ("mel_l1", lm1, float(ls_w * cfg.lambda_mel_l1)),
+        ("mel_l2", lm2, float(ls_w * cfg.lambda_mel_l2)),
+        ("wave_cos", 1.0 - cos, float(cfg.lambda_cos)),
+    ]
+    recon_total, bal_scales = _balanced_reconstruction_loss(recon_terms, y_hat, cfg)
+    total = recon_total
+    if cfg.cos_hinge > 0:
+        total = total + cfg.cos_hinge * (float(cfg.cos_target) - cos).clamp_min(0.0)
+    if cfg.lambda_vq > 0 and curr.vq_mult > 0:
+        total = total + (cfg.lambda_vq * curr.vq_mult) * vq_l
+    if cfg.lambda_entropy > 0 and curr.entropy_mult > 0:
+        total = total + (cfg.lambda_entropy * curr.entropy_mult) * (mean_log_codebook_for_entropy(cfg) - ent_pos).clamp_min(0.0)
+    if cfg.lambda_marginal > 0 and curr.marginal_mult > 0:
+        total = total + (effective_lambda_marginal(step, cfg) * curr.marginal_mult) * (mean_log_codebook_for_entropy(cfg) - marg_ent).clamp_min(0.0)
     return total, {
         "y_hat": y_hat,
+        "phase": curr.phase,
+        "phase_vq_mult": curr.vq_mult,
+        "phase_entropy_mult": curr.entropy_mult,
+        "phase_marginal_mult": curr.marginal_mult,
+        "bal_scales": bal_scales,
+        "recon_total": recon_total.detach(),
         "lt": lt.detach(),
         "ls": ls.detach(),
         "lsg": lsg.detach(),
@@ -201,6 +287,7 @@ def print_run_header(
     steps_per_epoch: int,
     epoch_source: str,
     audio_paths: list[Path] | None,
+    run_dir: Path,
 ) -> None:
     samples_per_update = cfg.batch * cfg.grad_accum_steps
     epoch_items = len(audio_paths) if audio_paths is not None else steps_per_epoch * samples_per_update
@@ -215,6 +302,7 @@ def print_run_header(
     print(_kv("schedule", f"epochs={resolved_epochs}  updates/epoch={steps_per_epoch}  total_updates={cfg.steps}", ansi, color="blue"))
     print(_kv("epoch", f"{epoch_items} samples  {samples_per_update} samples/update", ansi, color="blue"))
     print(_kv("logging", f"every {cfg.log_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.log_every)))} logs/epoch)", ansi, color="cyan"))
+    print(_kv("run", str(run_dir), ansi, color="green"))
     if cfg.spectrogram_every > 0:
         print(_kv("viz", f"every {cfg.spectrogram_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.spectrogram_every)))}x/epoch) -> {cfg.spectrogram_dir}", ansi, color="cyan"))
     else:
@@ -222,6 +310,7 @@ def print_run_header(
     print(_kv("batch", f"micro={cfg.batch}  accum={cfg.grad_accum_steps}  effective={cfg.batch * cfg.grad_accum_steps}", ansi))
     if audio_paths is not None:
         print(_kv("prefetch", f"threads={cfg.load_audio_threads}  batches={cfg.prefetch_audio_batches if cfg.prefetch_audio else 0}", ansi, color="cyan"))
+    print(_kv("training", f"balancer={cfg.loss_balancer}  curriculum={'on' if cfg.curriculum else 'off'}", ansi, color="cyan"))
     print(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi))
     print(_kv("stft", f"{len(cfg.stft_scales)} scales: {stft_nfo}", ansi, color="magenta"))
     print(_kv("rvq", f"{cfg.n_codebooks} stages  K={'x'.join(str(k) for k in cb_sizes)}  cosine={cfg.vq_cosine}", ansi, color="magenta"))
@@ -358,7 +447,10 @@ def print_step_log(
     print(
         f"  {ansi.c('yellow', 'weights')} "
         f"stft {effective_lambda_stft(step, cfg):.4f}  "
-        f"marginal {effective_lambda_marginal(step, cfg):.4f}",
+        f"vq {cfg.lambda_vq * float(metrics.get('phase_vq_mult', 1.0)):.4f}  "
+        f"marginal {effective_lambda_marginal(step, cfg) * float(metrics.get('phase_marginal_mult', 1.0)):.4f}  "
+        f"phase {metrics.get('phase', 'off')}  "
+        f"bal {cfg.loss_balancer}",
     )
     print(
         f"  {ansi.c('cyan', 'throughput')} "
@@ -437,10 +529,153 @@ def save_reconstruction_wavs(orig: torch.Tensor, recon: torch.Tensor, sample_rat
 
 
 def _find_latest_checkpoint(ck_dir: Path) -> Path | None:
+    latest_alias = ck_dir / "latest.pt"
+    if latest_alias.is_file():
+        return latest_alias
     pts = list(ck_dir.glob("codec_step*.pt"))
     if not pts:
         return None
     return max(pts, key=lambda p: int("".join(ch for ch in p.stem if ch.isdigit()) or "0"))
+
+
+def _jsonable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _checkpoint_run_dir(ck_path: Path, ck: dict | None = None) -> Path:
+    if ck is not None:
+        run_meta = ck.get("run")
+        if isinstance(run_meta, dict) and run_meta.get("run_dir"):
+            return Path(run_meta["run_dir"]).expanduser().resolve()
+        if ck.get("run_dir"):
+            return Path(ck["run_dir"]).expanduser().resolve()
+    if ck_path.parent.name == "checkpoints":
+        return ck_path.parent.parent.resolve()
+    return ck_path.parent.resolve()
+
+
+def _resolve_continue_checkpoint(value: str) -> Path:
+    p = Path(value).expanduser().resolve()
+    if p.is_file():
+        return p
+    if p.is_dir():
+        state_path = p / "run_state.json"
+        if state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                latest_rel = state.get("latest_checkpoint")
+                if latest_rel:
+                    latest = (p / str(latest_rel)).resolve()
+                    if latest.is_file():
+                        return latest
+            except Exception:
+                pass
+        ck_dir = p / "checkpoints" if (p / "checkpoints").is_dir() else p
+        latest = _find_latest_checkpoint(ck_dir)
+        if latest is not None:
+            return latest.resolve()
+    raise SystemExit(f"--continue checkpoint not found: {value}")
+
+
+def _prepare_run_layout(cfg: Config, *, continue_ckpt: Path | None) -> dict[str, Path]:
+    if continue_ckpt is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = Path("mlx_runs")
+        run_dir = (base_dir / stamp).resolve()
+        if run_dir.exists():
+            idx = 2
+            while True:
+                cand = (base_dir / f"{stamp}_{idx:02d}").resolve()
+                if not cand.exists():
+                    run_dir = cand
+                    break
+                idx += 1
+    else:
+        run_dir = _checkpoint_run_dir(continue_ckpt).resolve()
+    layout = {
+        "run_dir": run_dir,
+        "checkpoints": run_dir / "checkpoints",
+        "inference": run_dir / "inference",
+        "log_tsv": run_dir / "log_mlx.tsv",
+        "results_tsv": run_dir / "results.tsv",
+        "meta_json": run_dir / "train_config.json",
+        "state_json": run_dir / "run_state.json",
+    }
+    layout["checkpoints"].mkdir(parents=True, exist_ok=True)
+    layout["inference"].mkdir(parents=True, exist_ok=True)
+    cfg.checkpoint_dir = str(layout["checkpoints"])
+    cfg.spectrogram_dir = str(layout["inference"])
+    cfg.log_mlx_tsv = str(layout["log_tsv"])
+    cfg.results_tsv_path = str(layout["results_tsv"])
+    return layout
+
+
+def _write_run_metadata(
+    *,
+    layout: dict[str, Path],
+    cfg: Config,
+    args,
+    total_steps: int,
+    steps_per_epoch: int,
+    resolved_epochs: int,
+    epoch_source: str,
+    audio_paths: list[Path] | None,
+    continue_ckpt: Path | None,
+) -> None:
+    payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "argv": sys.argv,
+        "run_dir": str(layout["run_dir"]),
+        "paths": {
+            "checkpoints": str(layout["checkpoints"]),
+            "inference": str(layout["inference"]),
+            "log_mlx_tsv": str(layout["log_tsv"]),
+            "results_tsv": str(layout["results_tsv"]),
+        },
+        "resume_from": None if continue_ckpt is None else str(continue_ckpt),
+        "args": _jsonable(vars(args)),
+        "config": _jsonable(copy.deepcopy(cfg.__dict__)),
+        "training": {
+            "total_steps": int(total_steps),
+            "steps_per_epoch": int(steps_per_epoch),
+            "resolved_epochs": int(resolved_epochs),
+            "epoch_source": epoch_source,
+            "dataset_items": None if audio_paths is None else int(len(audio_paths)),
+        },
+    }
+    layout["meta_json"].write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_run_state(
+    *,
+    layout: dict[str, Path],
+    latest_checkpoint: Path | None,
+    step: int,
+    total_steps: int,
+    steps_per_epoch: int,
+    data_off: int,
+    resumed: bool,
+) -> None:
+    latest_rel = None if latest_checkpoint is None else str(latest_checkpoint.resolve().relative_to(layout["run_dir"]))
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "run_dir": str(layout["run_dir"]),
+        "latest_checkpoint": latest_rel,
+        "step": int(step),
+        "next_step": int(step + 1),
+        "total_steps": int(total_steps),
+        "steps_per_epoch": int(steps_per_epoch),
+        "epoch": float((step + 1) / float(max(1, steps_per_epoch))) if step >= 0 else 0.0,
+        "data_off": int(data_off),
+        "resumed": bool(resumed),
+    }
+    layout["state_json"].write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def build_lr_scheduler(opt: torch.optim.Optimizer, cfg: Config, start_step: int):
@@ -458,6 +693,59 @@ def build_lr_scheduler(opt: torch.optim.Optimizer, cfg: Config, start_step: int)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
     sched.last_epoch = max(-1, int(start_step) - 1)
     return sched
+
+
+def _mean_metric(rows: list[dict[str, float | None]], key: str) -> float | None:
+    vals = [r[key] for r in rows if r.get(key) is not None]
+    if not vals:
+        return None
+    return float(sum(float(v) for v in vals) / len(vals))
+
+
+@torch.no_grad()
+def run_quality_eval(
+    model: CUDACodec,
+    cfg: Config,
+    audio_paths: list[Path] | None,
+    step: int,
+    device: torch.device,
+    cb_sizes: tuple[int, ...],
+) -> tuple[dict[str, float | None], list[float], float | None]:
+    n_samples = int(cfg.segment) if cfg.eval_seconds <= 0 else max(int(cfg.eval_seconds * cfg.sample_rate), int(cfg.segment))
+    rows: list[dict[str, float | None]] = []
+    entropies: list[float] = []
+    for i in range(max(1, int(cfg.eval_clips))):
+        key = step + i * 104729
+        batch_eval = (
+            load_audio_viz_clip(cfg, audio_paths, key, n_samples, device)
+            if audio_paths is not None
+            else synth_viz_clip(cfg, key + cfg.seed * 10007, n_samples, device)
+        )
+        if cfg.use_bf16 and device.type == "cuda":
+            batch_eval = batch_eval.to(torch.bfloat16)
+        y_ev, _, _, _, idx_ev = model.forward_full(batch_eval)
+        o = batch_eval[0, :, 0].detach().float().cpu().numpy()
+        r = y_ev[0, :, 0].detach().float().cpu().numpy()
+        rows.append(eval_metrics_mod.quality_metrics_16k(o, r))
+        if idx_ev is not None:
+            stage_h = []
+            for si, ix in enumerate(idx_ev):
+                kk = cb_sizes[si] if si < len(cb_sizes) else cb_sizes[-1]
+                stage_h.append(entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(ix.detach().cpu().reshape(-1).tolist(), kk))
+            if stage_h:
+                entropies.append(sum(stage_h) / len(stage_h))
+    mean_h = sum(entropies) / len(entropies) if entropies else None
+    idx_bps = None
+    if mean_h is not None:
+        idx_bps = mean_h * (cfg.sample_rate / float(encoder_time_stride(cfg))) * float(len(cb_sizes))
+    return {
+        "si_sdr_db": _mean_metric(rows, "si_sdr_db"),
+        "pesq_wb": _mean_metric(rows, "pesq_wb"),
+        "stoi": _mean_metric(rows, "stoi"),
+        "lsd_db": _mean_metric(rows, "lsd_db"),
+        "l1": _mean_metric(rows, "l1"),
+        "cos": _mean_metric(rows, "cos"),
+    }, entropies, idx_bps
 
 
 def resolve_training_steps(cfg: Config, args, audio_paths: list[Path] | None) -> tuple[int, int, int, str]:
@@ -621,6 +909,14 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--lambda-cos", type=float, default=c.lambda_cos)
     p.add_argument("--cos-hinge", type=float, default=c.cos_hinge)
     p.add_argument("--cos-target", type=float, default=c.cos_target)
+    p.add_argument("--loss-balancer", choices=["off", "grad"], default=c.loss_balancer, help="Balance reconstruction losses by gradient ratio wrt y_hat")
+    p.add_argument("--loss-balancer-eps", type=float, default=c.loss_balancer_eps)
+    p.add_argument("--loss-balancer-max-scale", type=float, default=c.loss_balancer_max_scale)
+    _add_bool(p, "--curriculum", c.curriculum, "A=AE warmup, B=RVQ ramp, D=full fine-tune; no GAN phase")
+    p.add_argument("--curriculum-ae-frac", type=float, default=c.curriculum_ae_frac)
+    p.add_argument("--curriculum-vq-ramp-frac", type=float, default=c.curriculum_vq_ramp_frac)
+    p.add_argument("--curriculum-vq-start", type=float, default=c.curriculum_vq_start)
+    p.add_argument("--curriculum-entropy-start", type=float, default=c.curriculum_entropy_start)
     p.add_argument("--activation", choices=["gelu", "snake", "snake_beta"], default=c.activation)
     p.add_argument("--rvq-code-dim", type=int, default=c.rvq_code_dim)
     p.add_argument("--vq-ema-decay", type=float, default=c.vq_ema_decay)
@@ -631,6 +927,8 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--torch-compile", action="store_true", help="Compile model with torch.compile when available")
     p.add_argument("--full-checkpoint", action=argparse.BooleanOptionalAction, default=c.full_checkpoint)
     p.add_argument("--eval-every", type=int, default=c.eval_every)
+    p.add_argument("--eval-clips", type=int, default=c.eval_clips)
+    p.add_argument("--eval-seconds", type=float, default=c.eval_seconds)
     p.add_argument("--log-mlx-tsv", type=str, default=c.log_mlx_tsv)
     p.add_argument("--results-tsv", type=str, default=c.results_tsv_path)
     p.add_argument("--adaptive-mode", choices=["none", "bwe_stub", "fps_stub"], default=c.adaptive_mode)
@@ -639,14 +937,15 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--logs-per-epoch", type=int, default=20, help="How many progress logs to print per epoch")
     p.add_argument("--log-every", type=int, default=None, help="Deprecated override: exact optimizer-step logging interval")
     p.add_argument("--log-cos-ema-beta", type=float, default=c.log_cos_ema_beta)
-    p.add_argument("--viz-per-epoch", type=int, default=2, help="Run reconstruction inference + PNG/WAV export N times per epoch")
+    p.add_argument("--viz-per-epoch", type=int, default=1, help="Run reconstruction inference + PNG/WAV export N times per epoch")
     p.add_argument("--spectrogram-every", type=int, default=None, help="Deprecated override: exact update interval for PNG/WAV export; 0 disables")
     p.add_argument("--spectrogram-dir", type=str, default=c.spectrogram_dir)
     p.add_argument("--save-audio", action=argparse.BooleanOptionalAction, default=c.save_audio)
     p.add_argument("--spectrogram-seconds", type=float, default=c.spectrogram_seconds)
-    p.add_argument("--checkpoint-every", type=int, default=c.checkpoint_every)
+    p.add_argument("--checkpoint-every", type=int, default=None, help="Numbered checkpoint interval in optimizer updates; omitted => every 10 epochs")
     p.add_argument("--checkpoint-dir", type=str, default=c.checkpoint_dir)
-    p.add_argument("--resume", nargs="?", const="__latest__", default=None)
+    p.add_argument("--continue", dest="continue_path", type=str, default=None, help="Resume full training state from checkpoint path or run dir")
+    p.add_argument("--resume", nargs="?", const="__latest__", default=None, help=argparse.SUPPRESS)
     p.add_argument("--profile", action="store_true")
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="ANSI colors in logs")
     args, unknown = p.parse_known_args(argv)
@@ -731,6 +1030,14 @@ def config_from_args(args) -> Config:
         lambda_cos=args.lambda_cos,
         cos_hinge=args.cos_hinge,
         cos_target=args.cos_target,
+        loss_balancer=args.loss_balancer,
+        loss_balancer_eps=args.loss_balancer_eps,
+        loss_balancer_max_scale=args.loss_balancer_max_scale,
+        curriculum=bool(args.curriculum),
+        curriculum_ae_frac=args.curriculum_ae_frac,
+        curriculum_vq_ramp_frac=args.curriculum_vq_ramp_frac,
+        curriculum_vq_start=args.curriculum_vq_start,
+        curriculum_entropy_start=args.curriculum_entropy_start,
         lambda_sc=args.lambda_sc,
         lambda_complex_stft=args.lambda_complex_stft,
         log_every=int(args.log_every) if args.log_every is not None else Config().log_every,
@@ -739,7 +1046,7 @@ def config_from_args(args) -> Config:
         spectrogram_dir=args.spectrogram_dir,
         save_audio=args.save_audio,
         spectrogram_seconds=args.spectrogram_seconds,
-        checkpoint_every=args.checkpoint_every,
+        checkpoint_every=int(args.checkpoint_every) if args.checkpoint_every is not None else 0,
         checkpoint_dir=args.checkpoint_dir,
         data_dir=Path(args.data_dir) if args.data_dir else None,
         use_librispeech=bool(args.librispeech),
@@ -753,6 +1060,8 @@ def config_from_args(args) -> Config:
         use_compile=bool(args.torch_compile),
         full_checkpoint=bool(args.full_checkpoint),
         eval_every=args.eval_every,
+        eval_clips=args.eval_clips,
+        eval_seconds=args.eval_seconds,
         log_mlx_tsv=args.log_mlx_tsv,
         results_tsv_path=args.results_tsv,
         adaptive_mode=args.adaptive_mode,
@@ -762,7 +1071,26 @@ def config_from_args(args) -> Config:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     ansi = _make_ansi(args.color)
-    cfg = config_from_args(args)
+    if args.continue_path is not None and args.resume is not None:
+        raise SystemExit("use either --continue or legacy --resume, not both")
+    if args.resume is not None:
+        if args.resume == "__latest__":
+            raise SystemExit("legacy --resume without path is no longer supported; use --continue <run_dir> or --continue <checkpoint>")
+        args.continue_path = args.resume
+        print_event(ansi, "warn", "--resume is deprecated; use --continue <run_dir/checkpoint>", color="yellow")
+    continue_ckpt = _resolve_continue_checkpoint(args.continue_path) if args.continue_path is not None else None
+    resume_blob: dict | None = None
+    resumed_from_checkpoint = continue_ckpt is not None
+    if continue_ckpt is not None:
+        resume_blob = torch.load(continue_ckpt, map_location="cpu", weights_only=False)
+        if "config" not in resume_blob:
+            raise SystemExit(f"--continue checkpoint missing config: {continue_ckpt}")
+        try:
+            cfg = Config(**resume_blob["config"])
+        except TypeError as e:
+            raise SystemExit(f"--continue incompatible checkpoint config: {e}")
+    else:
+        cfg = config_from_args(args)
     if (args.steps is not None and args.steps < 0) or cfg.batch < 1 or cfg.grad_accum_steps < 1:
         raise SystemExit("--steps must be >=0 and --batch/--grad-accum-steps must be >=1")
     if args.synthetic_steps_per_epoch < 1:
@@ -771,6 +1099,17 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--logs-per-epoch must be >= 1")
     if args.prefetch_audio_batches < 1:
         raise SystemExit("--prefetch-audio-batches must be >= 1")
+    if args.loss_balancer_eps <= 0:
+        raise SystemExit("--loss-balancer-eps must be > 0")
+    if args.loss_balancer_max_scale <= 0:
+        raise SystemExit("--loss-balancer-max-scale must be > 0")
+    for name in ("curriculum_ae_frac", "curriculum_vq_ramp_frac", "curriculum_vq_start", "curriculum_entropy_start"):
+        if getattr(args, name) < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be >= 0")
+    if args.eval_clips < 1:
+        raise SystemExit("--eval-clips must be >= 1")
+    if args.eval_seconds < 0:
+        raise SystemExit("--eval-seconds must be >= 0")
     if args.log_every is not None and args.log_every < 1:
         raise SystemExit("--log-every must be >= 1")
     if args.viz_per_epoch < 0:
@@ -786,15 +1125,49 @@ def main(argv: list[str] | None = None) -> None:
         if not audio_paths:
             raise SystemExit(f"No audio files under {cfg.data_dir}")
 
-    total_steps, steps_per_epoch, resolved_epochs, epoch_source = resolve_training_steps(cfg, args, audio_paths)
-    cfg.steps = total_steps
-    if args.log_every is None:
-        cfg.log_every = max(1, math.ceil(steps_per_epoch / int(args.logs_per_epoch)))
-    if args.spectrogram_every is None:
-        cfg.spectrogram_every = (
-            max(1, math.ceil(steps_per_epoch / int(args.viz_per_epoch)))
-            if int(args.viz_per_epoch) > 0
-            else 0
+    if resume_blob is not None:
+        total_steps = int(resume_blob.get("total_steps", cfg.steps))
+        steps_per_epoch = int(resume_blob.get("steps_per_epoch", 0))
+        if steps_per_epoch < 1:
+            total_steps, steps_per_epoch, resolved_epochs, epoch_source = resolve_training_steps(cfg, args, audio_paths)
+        else:
+            resolved_epochs = int(resume_blob.get("resolved_epochs", max(1, math.ceil(total_steps / float(steps_per_epoch)))))
+            epoch_source = str(resume_blob.get("epoch_source", "checkpoint"))
+        cfg.steps = total_steps
+    else:
+        total_steps, steps_per_epoch, resolved_epochs, epoch_source = resolve_training_steps(cfg, args, audio_paths)
+        cfg.steps = total_steps
+        if args.log_every is None:
+            cfg.log_every = max(1, math.ceil(steps_per_epoch / int(args.logs_per_epoch)))
+        if args.spectrogram_every is None:
+            cfg.spectrogram_every = (
+                max(1, math.ceil(steps_per_epoch / int(args.viz_per_epoch)))
+                if int(args.viz_per_epoch) > 0
+                else 0
+            )
+        if args.checkpoint_every is None:
+            cfg.checkpoint_every = max(1, 10 * steps_per_epoch)
+    layout = _prepare_run_layout(cfg, continue_ckpt=continue_ckpt)
+    _write_run_metadata(
+        layout=layout,
+        cfg=cfg,
+        args=args,
+        total_steps=cfg.steps,
+        steps_per_epoch=steps_per_epoch,
+        resolved_epochs=resolved_epochs,
+        epoch_source=epoch_source,
+        audio_paths=audio_paths,
+        continue_ckpt=continue_ckpt,
+    )
+    if resume_blob is None:
+        _write_run_state(
+            layout=layout,
+            latest_checkpoint=None,
+            step=-1,
+            total_steps=cfg.steps,
+            steps_per_epoch=steps_per_epoch,
+            data_off=0,
+            resumed=False,
         )
 
     torch.manual_seed(cfg.seed)
@@ -812,7 +1185,9 @@ def main(argv: list[str] | None = None) -> None:
     model = CUDACodec(cfg).to(device)
     if cfg.use_bf16 and device.type == "cuda":
         model = model.to(dtype=torch.bfloat16)
-    if args.torch_compile:
+    if args.torch_compile and cfg.curriculum:
+        print_event(ansi, "warn", "torch.compile disabled with --curriculum because AE/RVQ phase toggles model control flow", color="yellow")
+    elif args.torch_compile:
         try:
             model = torch.compile(model)  # type: ignore[assignment]
             print_event(ansi, "compile", "torch.compile enabled", color="green")
@@ -822,15 +1197,22 @@ def main(argv: list[str] | None = None) -> None:
     start_step = 0
     data_off = 0
     ck_path: Path | None = None
-    if args.resume is not None:
-        ck_path = _find_latest_checkpoint(Path(cfg.checkpoint_dir)) if args.resume == "__latest__" else Path(args.resume)
-        if ck_path is None or not ck_path.is_file():
-            raise SystemExit(f"--resume checkpoint not found: {args.resume}")
-        ck = torch.load(ck_path, map_location=device, weights_only=False)
+    if resume_blob is not None:
+        ck_path = continue_ckpt
+        ck = resume_blob if device.type == "cpu" else torch.load(ck_path, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"], strict=True)
         start_step = int(ck.get("step", -1)) + 1
         data_off = int(ck.get("data_off", start_step * cfg.batch * cfg.grad_accum_steps))
         print_event(ansi, "resume", f"{ck_path} -> train steps {start_step}..{cfg.steps - 1}", color="cyan")
+        _write_run_state(
+            layout=layout,
+            latest_checkpoint=ck_path,
+            step=max(-1, start_step - 1),
+            total_steps=cfg.steps,
+            steps_per_epoch=steps_per_epoch,
+            data_off=data_off,
+            resumed=True,
+        )
         if start_step >= cfg.steps:
             print_event(ansi, "done", f"checkpoint already reached target: step {start_step - 1} >= total steps {cfg.steps - 1}", color="green")
             return
@@ -838,7 +1220,7 @@ def main(argv: list[str] | None = None) -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     sched = build_lr_scheduler(opt, cfg, start_step)
     if ck_path is not None:
-        ck = torch.load(ck_path, map_location=device, weights_only=False)
+        ck = resume_blob if (resume_blob is not None and device.type == "cpu") else torch.load(ck_path, map_location=device, weights_only=False)
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
         if sched is not None and "scheduler" in ck and ck["scheduler"] is not None:
@@ -868,6 +1250,7 @@ def main(argv: list[str] | None = None) -> None:
         steps_per_epoch=steps_per_epoch,
         epoch_source=epoch_source,
         audio_paths=audio_paths,
+        run_dir=layout["run_dir"],
     )
 
     prefetch_ex: ThreadPoolExecutor | None = None
@@ -944,7 +1327,8 @@ def main(argv: list[str] | None = None) -> None:
         prof_t = profiler.mark()
         if 0.0 < float(cfg.vq_ema_decay) < 1.0 and last_batch is not None:
             update_vq_ema_codebooks(model, last_batch, cfg)
-        if cfg.vq_reset_every > 0 and not cfg.ae_only and step > 0 and step % cfg.vq_reset_every == 0 and last_batch is not None:
+        curr_after = curriculum_state(step, cfg)
+        if cfg.vq_reset_every > 0 and curr_after.reset_enabled and not cfg.ae_only and step > 0 and step % cfg.vq_reset_every == 0 and last_batch is not None:
             n_reset, per_st = vq_reset_dead_codes(model, last_batch, cfg)
             if n_reset > 0 and (cfg.vq_reset_log_every <= 0 or step % cfg.vq_reset_log_every == 0):
                 parts = [f"s{i}={c}" for i, c in enumerate(per_st) if c > 0]
@@ -987,62 +1371,114 @@ def main(argv: list[str] | None = None) -> None:
                 print_event(ansi, "profile", profiler.summary(), color="yellow")
 
         if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0 and last_batch is not None:
-            with torch.no_grad():
-                y_ev, _, _, _, idx_ev = model.forward_full(last_batch)
-            o = last_batch[0, :, 0].detach().float().cpu().numpy()
-            r = y_ev[0, :, 0].detach().float().cpu().numpy()
-            sisdr = eval_metrics_mod.si_sdr_db(o, r)
-            pesq_v = eval_metrics_mod.pesq_wb_16k(o, r)
-            pesq_s = f"{pesq_v:.3f}" if pesq_v is not None else "na"
-            print_event(ansi, "eval", f"SI-SDR={sisdr:.2f} dB  PESQ_wb={pesq_s}", color="green")
+            eval_m, h_vals, idx_bps = run_quality_eval(model, cfg, audio_paths, step, device, cb_sizes)
+
+            def fmt_opt(key: str, fmt: str = ".3f") -> str:
+                v = eval_m.get(key)
+                return "na" if v is None else format(float(v), fmt)
+
+            print_event(
+                ansi,
+                "eval",
+                (
+                    f"clips={cfg.eval_clips}  "
+                    f"SI-SDR={fmt_opt('si_sdr_db', '.2f')} dB  "
+                    f"PESQ={fmt_opt('pesq_wb')}  "
+                    f"STOI={fmt_opt('stoi')}  "
+                    f"LSD={fmt_opt('lsd_db', '.2f')} dB  "
+                    f"L1={fmt_opt('l1', '.4f')}  "
+                    f"cos={100.0 * float(eval_m.get('cos') or 0.0):.1f}%"
+                ),
+                color="green",
+            )
             if cfg.log_mlx_tsv:
                 p = Path(cfg.log_mlx_tsv)
                 p.parent.mkdir(parents=True, exist_ok=True)
+                desired_hdr = "step\tphase\tsisdr_db\tpesq_wb\tstoi\tlsd_db\tl1\tcos\tidx_bps\n"
                 hdr = not p.is_file()
+                if not hdr:
+                    try:
+                        hdr = p.read_text(encoding="utf-8").splitlines()[0].strip() != desired_hdr.strip()
+                    except Exception:
+                        hdr = True
                 with p.open("a", encoding="utf-8") as f:
                     if hdr:
-                        f.write("step\tsisdr_db\tpesq_wb\n")
-                    f.write(f"{step}\t{sisdr:.6f}\t{pesq_s}\n")
-            if idx_ev is not None:
-                h_stages = []
-                for si, ix in enumerate(idx_ev):
-                    kk = cb_sizes[si] if si < len(cb_sizes) else cb_sizes[-1]
-                    h_stages.append(entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(ix.detach().cpu().reshape(-1).tolist(), kk))
-                h_mean = sum(h_stages) / max(1, len(h_stages))
-                idx_bps = h_mean * (cfg.sample_rate / float(encoder_time_stride(cfg))) * float(len(h_stages))
-                print_event(ansi, "entropy", f"RVQ mean H={h_mean:.3f} b/sym  ~{idx_bps:.0f} b/s empirical index", color="magenta")
+                        f.write(desired_hdr)
+                    vals = {
+                        "sisdr": fmt_opt("si_sdr_db", ".6f"),
+                        "pesq": fmt_opt("pesq_wb", ".6f"),
+                        "stoi": fmt_opt("stoi", ".6f"),
+                        "lsd": fmt_opt("lsd_db", ".6f"),
+                        "l1": fmt_opt("l1", ".6f"),
+                        "cos": fmt_opt("cos", ".6f"),
+                        "bps": "na" if idx_bps is None else f"{idx_bps:.6f}",
+                    }
+                    f.write(f"{step}\t{curriculum_state(step, cfg).phase}\t{vals['sisdr']}\t{vals['pesq']}\t{vals['stoi']}\t{vals['lsd']}\t{vals['l1']}\t{vals['cos']}\t{vals['bps']}\n")
+            if h_vals:
+                h_mean = sum(h_vals) / len(h_vals)
+                bps_s = "na" if idx_bps is None else f"{idx_bps:.0f}"
+                print_event(ansi, "entropy", f"RVQ mean H={h_mean:.3f} b/sym  ~{bps_s} b/s empirical index", color="magenta")
 
-        if cfg.checkpoint_every > 0 and step > 0 and (step % cfg.checkpoint_every == 0 or step == cfg.steps - 1):
+        save_latest = step > 0 and (epoch_boundary or step == cfg.steps - 1)
+        save_numbered = cfg.checkpoint_every > 0 and step > 0 and (step % cfg.checkpoint_every == 0 or step == cfg.steps - 1)
+        if save_latest or save_numbered:
             ck_dir = Path(cfg.checkpoint_dir)
             ck_dir.mkdir(parents=True, exist_ok=True)
-            ck_path = ck_dir / f"codec_step{step}.pt"
-            torch.save(
-                {
-                    "step": step,
-                    "epoch": (step + 1) / float(steps_per_epoch),
-                    "steps_per_epoch": steps_per_epoch,
-                    "data_off": data_off,
-                    "model": model.state_dict(),
-                    "optimizer": opt.state_dict(),
-                    "scheduler": sched.state_dict() if sched is not None else None,
-                    "config": cfg.__dict__,
+            latest_path = ck_dir / "latest.pt"
+            numbered_path = ck_dir / f"codec_step{step}.pt"
+            ck_payload = {
+                "step": step,
+                "epoch": (step + 1) / float(steps_per_epoch),
+                "total_steps": cfg.steps,
+                "resolved_epochs": resolved_epochs,
+                "epoch_source": epoch_source,
+                "steps_per_epoch": steps_per_epoch,
+                "data_off": data_off,
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "scheduler": sched.state_dict() if sched is not None else None,
+                "config": cfg.__dict__,
+                "run": {
+                    "run_dir": str(layout["run_dir"]),
+                    "checkpoint_dir": str(layout["checkpoints"]),
+                    "inference_dir": str(layout["inference"]),
+                    "log_mlx_tsv": str(layout["log_tsv"]),
+                    "results_tsv": str(layout["results_tsv"]),
                 },
-                ck_path,
+            }
+            torch.save(ck_payload, latest_path)
+            ck_path = latest_path
+            if save_numbered:
+                torch.save(ck_payload, numbered_path)
+                (ck_dir / f"codec_step{step}.json").write_text(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "epoch": (step + 1) / float(steps_per_epoch),
+                            "total_steps": cfg.steps,
+                            "resolved_epochs": resolved_epochs,
+                            "steps_per_epoch": steps_per_epoch,
+                            "data_off": data_off,
+                            "run_dir": str(layout["run_dir"]),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                ck_path = numbered_path
+            _write_run_state(
+                layout=layout,
+                latest_checkpoint=latest_path,
+                step=step,
+                total_steps=cfg.steps,
+                steps_per_epoch=steps_per_epoch,
+                data_off=data_off,
+                resumed=resumed_from_checkpoint,
             )
-            (ck_dir / f"codec_step{step}.json").write_text(
-                json.dumps(
-                    {
-                        "step": step,
-                        "epoch": (step + 1) / float(steps_per_epoch),
-                        "steps_per_epoch": steps_per_epoch,
-                        "data_off": data_off,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            print_event(ansi, "checkpoint", str(ck_path), color="cyan")
-            if cfg.results_tsv_path:
+            print_event(ansi, "latest", str(latest_path), color="cyan")
+            if save_numbered:
+                print_event(ansi, "checkpoint", str(numbered_path), color="cyan")
+            if save_numbered and cfg.results_tsv_path:
                 rp = Path(cfg.results_tsv_path)
                 rp.parent.mkdir(parents=True, exist_ok=True)
                 need_hdr = not rp.is_file()
@@ -1057,7 +1493,6 @@ def main(argv: list[str] | None = None) -> None:
             and (
                 (((step % max(1, steps_per_epoch)) + 1) % cfg.spectrogram_every == 0)
                 or epoch_boundary
-                or step == cfg.steps - 1
             )
         )
         if viz_due:
@@ -1071,11 +1506,12 @@ def main(argv: list[str] | None = None) -> None:
                     if cfg.use_bf16 and device.type == "cuda":
                         batch_viz = batch_viz.to(torch.bfloat16)
                     y_viz, _, _, _, _ = model.forward_full(batch_viz)
-                    out = Path(cfg.spectrogram_dir) / f"step_{step:08d}.png"
+                    step_dir = Path(cfg.spectrogram_dir) / f"{step:08d}"
+                    out = step_dir / "spectrogram.png"
                     if save_spectrogram_png(batch_viz[0, :, 0], y_viz[0, :, 0], cfg.sample_rate, out, step):
                         print_event(ansi, "spectrogram", str(out), color="cyan")
                     if cfg.save_audio:
-                        stem = Path(cfg.spectrogram_dir) / f"step_{step:08d}"
+                        stem = step_dir / "reconstruction"
                         if save_reconstruction_wavs(batch_viz[0, :, 0], y_viz[0, :, 0], cfg.sample_rate, stem):
                             print_event(ansi, "audio", f"{stem}_orig.wav  {stem}_recon.wav", color="cyan")
         profiler.add_since("misc", prof_t)
@@ -1086,6 +1522,16 @@ def main(argv: list[str] | None = None) -> None:
         row_ex.shutdown(wait=False, cancel_futures=True)
     ran = cfg.steps - start_step
     total = time.time() - t0
+    final_step = cfg.steps - 1 if ran > 0 else start_step - 1
+    _write_run_state(
+        layout=layout,
+        latest_checkpoint=ck_path,
+        step=final_step,
+        total_steps=cfg.steps,
+        steps_per_epoch=steps_per_epoch,
+        data_off=data_off,
+        resumed=resumed_from_checkpoint,
+    )
     if ran > 0:
         print()
         print_event(ansi, "done", f"updates {start_step}..{cfg.steps - 1} ({ran} updates) in {total:.1f}s", color="green")

@@ -22,3 +22,6 @@ cycle	phase	hypothesis	arch_id	bitrate_bps	pesq_est	visqol_est	latency_ms	params
 0	mlx_train	plan_arch	mlx_cfg	937.5	na	na	na	5.86	train	step=120000	checkpoint
 0	mlx_train	plan_arch	mlx_cfg	937.5	na	na	na	5.86	train	step=130000	checkpoint
 0	cuda_train	plan_arch	cuda_cfg	937.5	na	na	na	5.86	train	step=2904	checkpoint
+0	cuda_train	plan_arch	cuda_cfg	937.5	na	na	na	5.86	train	step=2904	checkpoint
+0	cuda_train	plan_arch	cuda_cfg	937.5	na	na	na	5.86	train	step=10000	checkpoint
+0	cuda_train	plan_arch	cuda_cfg	937.5	na	na	na	5.86	train	step=20000	checkpoint
