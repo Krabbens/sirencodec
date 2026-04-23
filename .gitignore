@@ -11,6 +11,7 @@ __pycache__/
 .cursor/
 .idea/
 *.swp
+.DS_Store
 
 # Data & large local assets (keep manifests out or use LFS explicitly)
 data/
@@ -34,6 +35,25 @@ pca_components.pt
 test_original.wav
 .agents/
 .qwen/
+
+# Root-level MLX training artifacts (multi-GB, not LFS-tracked)
+/mlx_checkpoints/
+/mlx_checkpoints_*/
+/mlx_spectrograms/
+/mlx_spectrograms_*/
+/mlx_grid_search/
+/infer_mlx_out/
+/archive/
+
+# Root-level demo outputs (regenerable)
+/spectrogram_demo.png
+/spectrogram_pipeline.png
+/spectrogram_pipeline_orig.wav
+/spectrogram_pipeline_recon.wav
+
+# Caveman-compress backups at repo root
+/README.original.md
+/results.tsv.root.bak
 
 # Bundled upstream clone (nested .git); use submodule or copy separately if needed
 LuxTTS/
