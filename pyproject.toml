@@ -1,18 +1,28 @@
 [project]
 name = "sirencodec"
 version = "0.1.0"
-description = "SirenCodec MLX neural audio codec trainer"
+description = "SirenCodec CUDA neural audio codec trainer"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mlx>=0.21",
     "numpy",
     "soundfile",
     "matplotlib",
+    "torch",
+    "torchaudio",
 ]
 
 [project.scripts]
-train = "sirencodec_mlx.train_mlx_main:main"
+train = "sirencodec_mlx.train_cuda_main:main"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [build-system]
 requires = ["setuptools>=61", "wheel"]

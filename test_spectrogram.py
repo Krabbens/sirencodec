@@ -24,7 +24,7 @@ model.eval()
 
 # Load a test file
 import json
-with open("data/master_manifest.jsonl") as f:
+with open("data/cv-corpus/master_manifest.jsonl") as f:
     entries = [json.loads(line) for line in f]
 
 import random

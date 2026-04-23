@@ -16,7 +16,7 @@ Audio (24kHz) → MelSpectrogram (100-dim, variable fps) → RVQ/FSQ → Upsampl
 - **Quant**: RVQ (EMA codebooks) or FSQ
 - **Vocoder**: `charactr/vocos-mel-24khz` (~13.5M), fine-tuned
 - **Disc**: multi-res STFT (3 resolutions)
-- **Data**: LibriSpeech via `data/master_manifest.jsonl` (~28k EN utterances)
+- **Data**: Polish Common Voice via `data/cv-corpus/master_manifest.jsonl`
 
 **Design**: Mel fps **decoupled** from Vocos input fps — e.g. analyze **30 fps** (hop=800), **upsample to 94 fps** (hop=256) before Vocos → bitrate drop, vocoder unchanged.
 
@@ -74,10 +74,10 @@ python3 run.py train_vocos_vq --steps 50000 --fsq-dims 16 --fsq-levels 5
 Manifest lines:
 
 ```json
-{"path": "data/librispeech/.../audio.flac"}
+{"path": "data/cv-corpus/pl/clips/common_voice_pl_20547774.mp3"}
 ```
 
-`src/sirencodec/data_pipeline.py`: LibriSpeech, CommonVoice, VCTK, etc.
+`src/sirencodec/data_pipeline.py`: builds Common Voice manifests with repo-relative paths.
 
 ### Checkpoints / logs
 

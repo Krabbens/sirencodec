@@ -24,7 +24,7 @@ def run(cfg_dict):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5+0.5*(s+1)/100 if s<100 else 1.0)
 
-    ds = AudioDataset("data/master_manifest.jsonl", 24000)
+    ds = AudioDataset("data/cv-corpus/master_manifest.jsonl", 24000)
     n = len(ds)
     train_ds, dev_ds = torch.utils.data.random_split(ds, [int(n*0.9), n-int(n*0.9)])
     train_dl = torch.utils.data.DataLoader(train_ds, batch_size=BATCH, shuffle=True,

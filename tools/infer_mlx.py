@@ -298,7 +298,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="MLX codec: load .npz checkpoint, reconstruct WAV")
     p.add_argument("checkpoint", type=Path, help="codec_step*.npz from train_mlx")
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--input", "-i", type=Path, help="Input .wav / .flac / .ogg (any file you choose)")
+    src.add_argument("--input", "-i", type=Path, help="Input .wav / .flac / .ogg / .mp3 (any file you choose)")
     src.add_argument(
         "--random-dev",
         action="store_true",
@@ -318,8 +318,8 @@ def main() -> None:
     p.add_argument(
         "--manifest",
         type=Path,
-        default=repo / "data" / "master_manifest.jsonl",
-        help="Used with --random-dev (default: repo data/master_manifest.jsonl)",
+        default=repo / "data" / "cv-corpus" / "master_manifest.jsonl",
+        help="Used with --random-dev (default: repo data/cv-corpus/master_manifest.jsonl)",
     )
     p.add_argument(
         "--librispeech-root",

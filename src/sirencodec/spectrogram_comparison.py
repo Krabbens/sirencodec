@@ -68,7 +68,7 @@ def _viz_wave_like_plot_pipeline(
 
     seconds = float(getattr(cfg, "spectrogram_viz_seconds", 8.0))
     seed = int(getattr(cfg, "spectrogram_viz_seed", 42))
-    manifest_rel = getattr(cfg, "spectrogram_viz_manifest", "data/master_manifest.jsonl")
+    manifest_rel = getattr(cfg, "spectrogram_viz_manifest", "data/cv-corpus/master_manifest.jsonl")
     sr = cfg.sample_rate
 
     mp = Path(manifest_rel)

@@ -129,9 +129,9 @@ class Config:
     spectrogram_seconds: float = 8.0  # 0 = use training batch length for PNG/WAV
     checkpoint_every: int = 10_000  # 0 = no periodic saves; also saves last step
     checkpoint_dir: str = "mlx_checkpoints"
-    # If True and ``data_dir`` is None, trainer resolves ``<repo>/data/librispeech``. Set False for synthetic batches only.
+    # If True and ``data_dir`` is None, trainer resolves ``data/cv-corpus``. Set False for synthetic batches only.
     use_librispeech: bool = True
-    # Optional data (recursive *.wav / *.flac / *.ogg). When None + ``use_librispeech``, Libri path is filled in main.
+    # Optional data (recursive *.wav / *.flac / *.ogg / *.mp3). When None + ``use_librispeech``, local corpus is filled in main.
     data_dir: Path | None = None
     # Extra mean L1 on **linear** STFT magnitudes (same scales as log-STFT; weighted by λ_stft ramp).
     # Without GAN this carries more of the absolute harmonic-amplitude shaping.

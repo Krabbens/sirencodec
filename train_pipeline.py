@@ -1105,7 +1105,7 @@ def main():
     parser.add_argument("--save-every", type=int, default=10000)
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--real-data", action="store_true", default=True)
-    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--data-dir", type=str, default="data/cv-corpus")
     parser.add_argument("--data-num-workers", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)  # unused, kept for compat
     parser.add_argument("--codebook-size", type=int, default=1024)

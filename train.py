@@ -160,25 +160,10 @@ class CodecConfig:
     })
     
     # Data (Cycle 18: real multilingual pipeline)
-    data_dir: str = "data"  # root for downloaded datasets
+    data_dir: str = "data/cv-corpus"  # local Common Voice corpus
     use_real_data: bool = False  # set True to use real data (requires download)
-    # Multilingual dataset selection
-    datasets: list = field(default_factory=lambda: [
-        "librispeech-clean-100",
-        "librispeech-clean-360",
-        "librispeech-other-500",
-        "vctk",
-        "commonvoice-en",
-        "commonvoice-de",
-        "commonvoice-fr",
-        "commonvoice-es",
-        "commonvoice-it",
-        "commonvoice-zh",
-        "commonvoice-ja",
-        "commonvoice-ru",
-        "commonvoice-hi",
-        "commonvoice-ar",
-    ])
+    # Dataset selection metadata
+    datasets: list = field(default_factory=lambda: ["commonvoice-pl"])
     augment_noise_snr_range: tuple = (5, 40)  # dB
     augment_reverb_prob: float = 0.3
     data_num_workers: int = 4  # DataLoader workers
@@ -2678,7 +2663,7 @@ def train(cfg: CodecConfig):
         # Download if manifests don't exist yet
         master_manifest = Path(cfg.data_dir) / "master_manifest.jsonl"
         if not master_manifest.exists():
-            print("No manifest found — downloading datasets first...")
+            print("No manifest found — preparing dataset first...")
             download_and_prepare(data_cfg)
         else:
             print(f"Using existing manifest: {master_manifest} ({master_manifest.stat().st_size} bytes)")
@@ -2872,7 +2857,7 @@ if __name__ == "__main__":
         if not HAS_DATA_PIPELINE:
             print("ERROR: data_pipeline.py not available. Install it first.")
             sys.exit(1)
-        data_dir = sys.argv[2] if len(sys.argv) > 2 else "data"
+        data_dir = sys.argv[2] if len(sys.argv) > 2 else "data/cv-corpus"
         from data_pipeline import DataConfig, download_and_prepare
         dc = DataConfig(data_dir=data_dir)
         download_and_prepare(dc)
@@ -2883,7 +2868,7 @@ if __name__ == "__main__":
 
     # Check for --real-data flag
     use_real = "--real-data" in sys.argv
-    data_dir = "data"
+    data_dir = "data/cv-corpus"
     for i, arg in enumerate(sys.argv):
         if arg == "--data-dir" and i + 1 < len(sys.argv):
             data_dir = sys.argv[i + 1]
