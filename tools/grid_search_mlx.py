@@ -43,6 +43,11 @@ from typing import Any, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 COS_EMA_RE = re.compile(r"cos_ema=([\d.]+)%")
 # Waveform cos%% on train_mlx lines (avoid matching stft_cos=… which has no %).
 COS_WAVE_RE = re.compile(r"\bcos=([\d.]+)%")
@@ -318,7 +323,7 @@ def _train_mlx_speed_extras(librispeech: bool, use_fast: bool) -> list[str]:
 
 def calibrate_steps(
     python: str,
-    run_py: Path,
+    train_script: Path,
     wall_seconds: float,
     extra_train_args: list[str],
 ) -> int:
@@ -329,8 +334,7 @@ def calibrate_steps(
     calib_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         python,
-        str(run_py),
-        "train_mlx",
+        str(train_script),
         "--steps",
         str(warmup + measure),
         "--spectrogram-every",
@@ -374,7 +378,7 @@ def calibrate_steps(
 
 def run_one(
     python: str,
-    run_py: Path,
+    train_script: Path,
     steps: int,
     name: str,
     base_dir: Path,
@@ -388,8 +392,7 @@ def run_one(
     ckpt.mkdir(parents=True, exist_ok=True)
     cmd = [
         python,
-        str(run_py),
-        "train_mlx",
+        str(train_script),
         "--steps",
         str(steps),
         "--spectrogram-every",
@@ -562,7 +565,7 @@ def main() -> None:
         metavar="ARG",
         help="Extra train_mlx args, e.g. --fixed --fast --seed 1",
     )
-    ap.add_argument("--python", type=str, default=sys.executable, help="Python to run run.py.")
+    ap.add_argument("--python", type=str, default=sys.executable, help="Python executable used for training subprocesses.")
     ap.add_argument(
         "-j",
         "--jobs",
@@ -625,9 +628,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    run_py = REPO_ROOT / "run.py"
-    if not run_py.is_file():
-        print(f"[grid] missing {run_py}", file=sys.stderr)
+    train_script = REPO_ROOT / "tools" / "train_mlx.py"
+    if not train_script.is_file():
+        print(f"[grid] missing {train_script}", file=sys.stderr)
         sys.exit(1)
 
     jobs = resolve_jobs(args.jobs, len(runs))
@@ -649,7 +652,7 @@ def main() -> None:
     elif args.calibrate and not args.dry_run:
         steps = calibrate_steps(
             args.python,
-            run_py,
+            train_script,
             args.seconds,
             _train_mlx_speed_extras(args.librispeech, use_fast),
         )
@@ -713,7 +716,7 @@ def main() -> None:
             print(f"[grid] === {name} ===", flush=True)
             row = run_one(
                 args.python,
-                run_py,
+                train_script,
                 steps,
                 name,
                 base_dir,
@@ -732,7 +735,7 @@ def main() -> None:
             i, (name, train) = item
             row = run_one(
                 args.python,
-                run_py,
+                train_script,
                 steps,
                 name,
                 base_dir,

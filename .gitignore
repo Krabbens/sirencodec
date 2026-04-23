@@ -21,13 +21,16 @@ dist/
 build/
 *.egg-info/
 
-# Root-level training TSV dumps (results.tsv is tracked)
+# Root-level training TSV dumps
+/results.tsv
+/log_mlx.tsv
 /log.tsv
 /log_*.tsv
 
 # Root-only checkpoint dirs (do not use bare `checkpoints/` — that ignores experiments/**/checkpoints too)
 /checkpoints/
 /checkpoints_*/
+/experiments/
 experiments/**/spectrograms/
 experiments/audio_listen_compare/
 *.log
@@ -37,6 +40,7 @@ test_original.wav
 .qwen/
 
 # Root-level MLX training artifacts (multi-GB, not LFS-tracked)
+/mlx_runs/
 /mlx_checkpoints/
 /mlx_checkpoints_*/
 /mlx_spectrograms/
@@ -47,6 +51,8 @@ test_original.wav
 
 # Root-level demo outputs (regenerable)
 /spectrogram_demo.png
+/spectrogram_comparison.png
+/spectrogram_step*.png
 /spectrogram_pipeline.png
 /spectrogram_pipeline_orig.wav
 /spectrogram_pipeline_recon.wav
