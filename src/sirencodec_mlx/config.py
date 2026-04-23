@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-# Smoke / ``--fast`` preset (two scales).
+# Smoke / ``--fast`` preset (three scales).
 DEFAULT_STFT_SCALES: tuple[tuple[int, int], ...] = ((512, 128), (1024, 256), (2048, 512))
 FAST_STFT_SCALES: tuple[tuple[int, int], ...] = ((512, 128), (1024, 256))
 # LibriSpeech default: wide multi-scale STFT (Parallel WaveGAN-style).
@@ -26,6 +26,8 @@ class Config:
     load_audio_threads: int = 12  # 0 or 1 = legacy sequential loop; else ``min(batch, threads, 32)`` workers.
     # Prefetch the next batch on a worker thread while the current step runs (only with ``--data-dir`` / Libri).
     prefetch_audio: bool = True
+    # Number of ready/queued CPU batches when prefetching. >1 hides disk jitter better on Windows.
+    prefetch_audio_batches: int = 2
     steps: int = 250_000
     lr: float = 8e-5
     # Adam LR: cosine decay to lr×lr_min_ratio by last step, or none = constant --lr.
@@ -255,6 +257,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "grad_accum_steps": c.grad_accum_steps,
         "load_audio_threads": c.load_audio_threads,
         "prefetch_audio": c.prefetch_audio,
+        "prefetch_audio_batches": c.prefetch_audio_batches,
         "segment": c.segment,
         "lr": c.lr,
         "lr_schedule": c.lr_schedule,

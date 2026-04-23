@@ -133,6 +133,63 @@ def multi_stft_spectral_terms(pred: torch.Tensor, tgt: torch.Tensor, scales: tup
     return total_mag / den, total_grad / den, total_cos / den
 
 
+def multi_stft_all_terms(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    scales: tuple[tuple[int, int], ...],
+    *,
+    with_grad: bool,
+    with_cos_1m: bool,
+    with_linear: bool,
+    with_sc: bool,
+    with_complex: bool,
+    grad_freq_weight: float = 1.0,
+    grad_time_weight: float = 1.0,
+    hf_emphasis: float = 0.0,
+    scale_weights: tuple[float, ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute all multi-STFT losses from one STFT pair per scale."""
+    if not scales:
+        z = pred.new_zeros(())
+        return z, z, z, z, z, z
+    ws = _scale_weights(scales, scale_weights)
+    total_mag = pred.new_zeros((), dtype=torch.float32)
+    total_grad = pred.new_zeros((), dtype=torch.float32)
+    total_cos = pred.new_zeros((), dtype=torch.float32)
+    total_linear = pred.new_zeros((), dtype=torch.float32)
+    total_sc = pred.new_zeros((), dtype=torch.float32)
+    total_complex = pred.new_zeros((), dtype=torch.float32)
+    for (n_fft, hop), w in zip(scales, ws):
+        sp, sq = _stft_pair(pred, tgt, n_fft, hop)
+        sp_abs = sp.abs()
+        sq_abs = sq.abs()
+        lp = torch.log(sp_abs + 1e-5)
+        lq = torch.log(sq_abs + 1e-5)
+        ww = float(w)
+        total_mag = total_mag + ww * _weighted_mean_abs(lp - lq, hf_emphasis)
+        if with_grad:
+            total_grad = total_grad + ww * stft_gradient_l1_from_log_mag(
+                lp,
+                lq,
+                freq_weight=grad_freq_weight,
+                time_weight=grad_time_weight,
+            )
+        if with_cos_1m:
+            total_cos = total_cos + ww * stft_logmag_cosine_1m(lp, lq)
+        if with_linear:
+            total_linear = total_linear + ww * _weighted_mean_abs(sp_abs - sq_abs, hf_emphasis)
+        if with_sc:
+            p = sp_abs.reshape(sp_abs.shape[0], -1)
+            q = sq_abs.reshape(sq_abs.shape[0], -1)
+            sc = torch.linalg.vector_norm(p - q, dim=1) / (torch.linalg.vector_norm(q, dim=1) + 1e-8)
+            total_sc = total_sc + ww * sc.mean()
+        if with_complex:
+            l1 = 0.5 * ((sp.real - sq.real).abs().mean() + (sp.imag - sq.imag).abs().mean())
+            total_complex = total_complex + ww * l1
+    den = float(sum(ws))
+    return total_mag / den, total_grad / den, total_cos / den, total_linear / den, total_sc / den, total_complex / den
+
+
 def multi_stft_mag_l1_linear(pred: torch.Tensor, tgt: torch.Tensor, scales: tuple[tuple[int, int], ...], *, hf_emphasis: float = 0.0, scale_weights: tuple[float, ...] | None = None) -> torch.Tensor:
     if not scales:
         return pred.new_zeros(())

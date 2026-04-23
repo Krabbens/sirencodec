@@ -15,7 +15,8 @@ import os
 import sys
 import time
 import wave
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -41,11 +42,7 @@ from .torch_data import collect_audio_paths, load_audio_batch, load_audio_batch_
 from .torch_losses import (
     mel_filterbank_torch,
     mel_log_bin_losses,
-    multi_stft_complex_l1,
-    multi_stft_loss,
-    multi_stft_mag_l1_linear,
-    multi_stft_spectral_convergence,
-    multi_stft_spectral_terms,
+    multi_stft_all_terms,
 )
 
 
@@ -71,52 +68,32 @@ def batch_mean_cosine(orig: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
 def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, mel_fb: torch.Tensor | None):
     y_hat, vq_l, ent_pos, marg_ent, idx = model.forward_full(batch)
     lt = torch.mean(torch.abs(y_hat - batch))
-    if cfg.lambda_stft_grad > 0 or cfg.lambda_stft_cos > 0:
-        ls, lsg, lsc = multi_stft_spectral_terms(
-            y_hat,
-            batch,
-            cfg.stft_scales,
-            with_grad=cfg.lambda_stft_grad > 0,
-            with_cos_1m=cfg.lambda_stft_cos > 0,
-            grad_freq_weight=cfg.stft_grad_freq_weight,
-            grad_time_weight=cfg.stft_grad_time_weight,
-            hf_emphasis=cfg.stft_hf_emphasis,
-            scale_weights=cfg.stft_scale_weights,
-        )
-    else:
-        ls = multi_stft_loss(
-            y_hat,
-            batch,
-            cfg.stft_scales,
-            hf_emphasis=cfg.stft_hf_emphasis,
-            scale_weights=cfg.stft_scale_weights,
-        )
-        lsg = batch.new_zeros(())
-        lsc = batch.new_zeros(())
+    ls, lsg, lsc, l_lin, l_sc, l_cx = multi_stft_all_terms(
+        y_hat,
+        batch,
+        cfg.stft_scales,
+        with_grad=cfg.lambda_stft_grad > 0,
+        with_cos_1m=cfg.lambda_stft_cos > 0,
+        with_linear=cfg.lambda_mag_l1 > 0,
+        with_sc=cfg.lambda_sc > 0,
+        with_complex=cfg.lambda_complex_stft > 0,
+        grad_freq_weight=cfg.stft_grad_freq_weight,
+        grad_time_weight=cfg.stft_grad_time_weight,
+        hf_emphasis=cfg.stft_hf_emphasis,
+        scale_weights=cfg.stft_scale_weights,
+    )
     cos = batch_mean_cosine(batch, y_hat)
     ls_w = effective_lambda_stft(step, cfg)
     total = cfg.lambda_time * lt + ls_w * ls + cfg.lambda_vq * vq_l
-    l_lin = batch.new_zeros(())
     if cfg.lambda_mag_l1 > 0:
-        l_lin = multi_stft_mag_l1_linear(
-            y_hat,
-            batch,
-            cfg.stft_scales,
-            hf_emphasis=cfg.stft_hf_emphasis,
-            scale_weights=cfg.stft_scale_weights,
-        )
         total = total + ls_w * cfg.lambda_mag_l1 * l_lin
     if cfg.lambda_stft_grad > 0:
         total = total + ls_w * cfg.lambda_stft_grad * lsg
     if cfg.lambda_stft_cos > 0:
         total = total + ls_w * cfg.lambda_stft_cos * lsc
-    l_sc = batch.new_zeros(())
     if cfg.lambda_sc > 0:
-        l_sc = multi_stft_spectral_convergence(y_hat, batch, cfg.stft_scales, scale_weights=cfg.stft_scale_weights)
         total = total + ls_w * cfg.lambda_sc * l_sc
-    l_cx = batch.new_zeros(())
     if cfg.lambda_complex_stft > 0:
-        l_cx = multi_stft_complex_l1(y_hat, batch, cfg.stft_scales, scale_weights=cfg.stft_scale_weights)
         total = total + ls_w * cfg.lambda_complex_stft * l_cx
     if cfg.lambda_entropy > 0:
         total = total + cfg.lambda_entropy * (mean_log_codebook_for_entropy(cfg) - ent_pos).clamp_min(0.0)
@@ -243,6 +220,8 @@ def print_run_header(
     else:
         print(_kv("viz", "disabled", ansi, color="yellow"))
     print(_kv("batch", f"micro={cfg.batch}  accum={cfg.grad_accum_steps}  effective={cfg.batch * cfg.grad_accum_steps}", ansi))
+    if audio_paths is not None:
+        print(_kv("prefetch", f"threads={cfg.load_audio_threads}  batches={cfg.prefetch_audio_batches if cfg.prefetch_audio else 0}", ansi, color="cyan"))
     print(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi))
     print(_kv("stft", f"{len(cfg.stft_scales)} scales: {stft_nfo}", ansi, color="magenta"))
     print(_kv("rvq", f"{cfg.n_codebooks} stages  K={'x'.join(str(k) for k in cb_sizes)}  cosine={cfg.vq_cosine}", ansi, color="magenta"))
@@ -251,6 +230,57 @@ def print_run_header(
 
 def print_event(ansi: _Ansi, kind: str, message: str, *, color: str = "cyan") -> None:
     print(f"{ansi.c(color, '[' + kind + ']')} {message}", flush=True)
+
+
+class _ProfileStats:
+    def __init__(self, enabled: bool, device: torch.device):
+        self.enabled = bool(enabled)
+        self.device = device
+        self.n_updates = 0
+        self.times = {
+            "data": 0.0,
+            "train": 0.0,
+            "opt": 0.0,
+            "aux": 0.0,
+            "misc": 0.0,
+        }
+
+    def mark(self) -> float:
+        if not self.enabled:
+            return 0.0
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def add_since(self, name: str, start: float) -> float:
+        if not self.enabled:
+            return 0.0
+        end = self.mark()
+        self.times[name] += end - start
+        return end
+
+    def step_done(self) -> None:
+        if self.enabled:
+            self.n_updates += 1
+
+    def summary(self) -> str:
+        n = max(1, self.n_updates)
+        total = sum(self.times.values())
+
+        def part(name: str, label: str) -> str:
+            s = self.times[name]
+            pct = 100.0 * s / max(total, 1e-9)
+            return f"{label} {1000.0 * s / n:.1f}ms ({pct:.0f}%)"
+
+        return (
+            f"avg/update over {self.n_updates}: "
+            f"{part('data', 'data')}  "
+            f"{part('train', 'loss+bwd')}  "
+            f"{part('opt', 'opt')}  "
+            f"{part('aux', 'vq/eval')}  "
+            f"{part('misc', 'log/viz/ckpt')}  "
+            f"measured {1000.0 * total / n:.1f}ms"
+        )
 
 
 def print_step_log(
@@ -295,7 +325,7 @@ def print_step_log(
         f"{ansi.c('dim', f'({epoch_pct:5.1f}%)')}  "
         f"{ansi.c('cyan', 'iter')} {ansi.c('bold', f'{iter_in_epoch}/{steps_per_epoch}')}  "
         f"{ansi.c('cyan', 'seen')} {ansi.c('bold', f'{samples_seen_epoch}/{epoch_items}')}  "
-        f"{ansi.c('cyan', 'time')} {ansi.c('bold', f'{ms_per_step:.1f} ms/step')}  "
+        f"{ansi.c('cyan', 'time')} {ansi.c('bold', f'{ms_per_step:.1f} ms/update')}  "
         f"{ansi.c('cyan', 'lr')} {ansi.c('bold', f'{lr_log:.2e}')}"
     )
     print(
@@ -508,10 +538,14 @@ def update_vq_ema_codebooks(model: CUDACodec, batch: torch.Tensor, cfg: Config) 
         z_i, _, _, idx = stage(residual)
         flat_idx = idx.reshape(-1)
         flat_r = r.reshape(-1, r.shape[-1])
-        for code in torch.unique(flat_idx):
-            mask = flat_idx == code
-            if torch.any(mask):
-                stage.embedding.weight.data[code] = dec * stage.embedding.weight.data[code] + beta * flat_r[mask].mean(dim=0)
+        sums = torch.zeros((stage.num_embeddings, flat_r.shape[-1]), device=flat_r.device, dtype=flat_r.dtype)
+        counts = torch.zeros((stage.num_embeddings, 1), device=flat_r.device, dtype=flat_r.dtype)
+        sums.index_add_(0, flat_idx, flat_r)
+        counts.index_add_(0, flat_idx, torch.ones((flat_idx.numel(), 1), device=flat_r.device, dtype=flat_r.dtype))
+        used = counts.squeeze(1) > 0
+        if torch.any(used):
+            means = sums[used] / counts[used].clamp_min(1.0)
+            stage.embedding.weight.data[used] = dec * stage.embedding.weight.data[used] + beta * means
         quantized = quantized + z_i
 
 
@@ -529,6 +563,7 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--grad-accum-steps", type=int, default=c.grad_accum_steps)
     p.add_argument("--load-audio-threads", type=int, default=c.load_audio_threads)
     _add_bool(p, "--prefetch-audio", c.prefetch_audio)
+    p.add_argument("--prefetch-audio-batches", type=int, default=c.prefetch_audio_batches, help="CPU audio batches queued ahead of GPU training")
     p.add_argument("--segment", type=int, default=c.segment)
     p.add_argument("--lr", type=float, default=c.lr)
     p.add_argument("--lr-schedule", choices=["none", "cosine"], default=c.lr_schedule)
@@ -641,6 +676,7 @@ def config_from_args(args) -> Config:
         batch=args.batch,
         load_audio_threads=args.load_audio_threads,
         prefetch_audio=bool(args.prefetch_audio),
+        prefetch_audio_batches=args.prefetch_audio_batches,
         segment=args.segment,
         lr=args.lr,
         lr_schedule=args.lr_schedule,
@@ -733,6 +769,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--synthetic-steps-per-epoch must be >= 1")
     if args.logs_per_epoch < 1:
         raise SystemExit("--logs-per-epoch must be >= 1")
+    if args.prefetch_audio_batches < 1:
+        raise SystemExit("--prefetch-audio-batches must be >= 1")
     if args.log_every is not None and args.log_every < 1:
         raise SystemExit("--log-every must be >= 1")
     if args.viz_per_epoch < 0:
@@ -833,14 +871,32 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     prefetch_ex: ThreadPoolExecutor | None = None
-    prefetch_future = None
+    prefetch_futures: deque[Future[torch.Tensor]] = deque()
+    row_ex: ThreadPoolExecutor | None = None
     acm = max(1, int(cfg.grad_accum_steps))
-    if audio_paths is not None and cfg.prefetch_audio and acm <= 1 and cfg.steps > start_step + 1:
-        prefetch_ex = ThreadPoolExecutor(max_workers=1)
-        prefetch_future = prefetch_ex.submit(load_audio_batch_cpu, cfg, audio_paths, data_off)
+    pin_audio_batches = device.type == "cuda" and audio_paths is not None
+    if audio_paths is not None and int(cfg.load_audio_threads) > 1 and cfg.batch > 1:
+        row_ex = ThreadPoolExecutor(max_workers=min(int(cfg.load_audio_threads), int(cfg.batch), 32))
+    prefetch_depth = max(1, int(cfg.prefetch_audio_batches))
+
+    def submit_prefetch() -> None:
+        nonlocal data_off
+        if prefetch_ex is None or audio_paths is None:
+            return
+        prefetch_futures.append(
+            prefetch_ex.submit(load_audio_batch_cpu, cfg, audio_paths, data_off, row_ex, pin_memory=pin_audio_batches)
+        )
         data_off += cfg.batch
 
+    if audio_paths is not None and cfg.prefetch_audio and acm <= 1 and cfg.steps > start_step:
+        prefetch_ex = ThreadPoolExecutor(max_workers=1)
+        for _ in range(min(prefetch_depth, cfg.steps - start_step)):
+            submit_prefetch()
+
     t0 = time.time()
+    profiler = _ProfileStats(args.profile, device)
+    if args.profile:
+        print_event(ansi, "profile", "enabled; CUDA syncs timing, training will run slower while profiling", color="yellow")
     ema_cos_pct: float | None = None
     last_metrics = None
     last_batch = None
@@ -848,27 +904,29 @@ def main(argv: list[str] | None = None) -> None:
         opt.zero_grad(set_to_none=True)
         loss_total = 0.0
         for micro in range(acm):
+            prof_t = profiler.mark()
             if audio_paths is not None:
-                if micro == 0 and prefetch_future is not None:
-                    batch = prefetch_future.result().to(device, non_blocking=device.type == "cuda")
-                    if step < cfg.steps - 1:
-                        prefetch_future = prefetch_ex.submit(load_audio_batch_cpu, cfg, audio_paths, data_off)
-                        data_off += cfg.batch
-                    else:
-                        prefetch_future = None
+                if micro == 0 and prefetch_futures:
+                    batch = prefetch_futures.popleft().result().to(device, non_blocking=device.type == "cuda")
+                    remaining_to_submit = cfg.steps - start_step - (step - start_step + 1) - len(prefetch_futures)
+                    if remaining_to_submit > 0:
+                        submit_prefetch()
                 else:
-                    batch = load_audio_batch(cfg, audio_paths, data_off, device)
+                    batch = load_audio_batch(cfg, audio_paths, data_off, device, row_ex, pin_memory=pin_audio_batches)
                     data_off += cfg.batch
             else:
                 batch = synth_batch(cfg, key=step * 1_000_003 + micro * 97 + cfg.seed * 10007, device=device)
+            prof_t = profiler.add_since("data", prof_t)
             if cfg.use_bf16 and device.type == "cuda":
                 batch = batch.to(torch.bfloat16)
             loss, metrics = compute_loss(model, cfg, batch, step, mel_fb)
             (loss / acm).backward()
+            profiler.add_since("train", prof_t)
             loss_total += float(loss.detach().float().item())
             last_metrics = metrics
             last_batch = batch
 
+        prof_t = profiler.mark()
         if not math.isfinite(loss_total):
             print_event(ansi, "skip", f"non-finite loss at step {step}", color="yellow")
             opt.zero_grad(set_to_none=True)
@@ -881,7 +939,9 @@ def main(argv: list[str] | None = None) -> None:
         opt.step()
         if sched is not None:
             sched.step()
+        profiler.add_since("opt", prof_t)
 
+        prof_t = profiler.mark()
         if 0.0 < float(cfg.vq_ema_decay) < 1.0 and last_batch is not None:
             update_vq_ema_codebooks(model, last_batch, cfg)
         if cfg.vq_reset_every > 0 and not cfg.ae_only and step > 0 and step % cfg.vq_reset_every == 0 and last_batch is not None:
@@ -889,8 +949,11 @@ def main(argv: list[str] | None = None) -> None:
             if n_reset > 0 and (cfg.vq_reset_log_every <= 0 or step % cfg.vq_reset_log_every == 0):
                 parts = [f"s{i}={c}" for i, c in enumerate(per_st) if c > 0]
                 print_event(ansi, "vq-reset", f"replaced {n_reset} dead codes" + (f" ({', '.join(parts)})" if parts else ""), color="magenta")
+        profiler.add_since("aux", prof_t)
+        profiler.step_done()
 
         epoch_boundary = (step + 1) % max(1, steps_per_epoch) == 0
+        prof_t = profiler.mark()
         if last_metrics is not None and (
             step % cfg.log_every == 0 or epoch_boundary or step == cfg.steps - 1
         ):
@@ -920,6 +983,8 @@ def main(argv: list[str] | None = None) -> None:
                 elapsed=elapsed,
                 start_step=start_step,
             )
+            if args.profile:
+                print_event(ansi, "profile", profiler.summary(), color="yellow")
 
         if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0 and last_batch is not None:
             with torch.no_grad():
@@ -1013,16 +1078,19 @@ def main(argv: list[str] | None = None) -> None:
                         stem = Path(cfg.spectrogram_dir) / f"step_{step:08d}"
                         if save_reconstruction_wavs(batch_viz[0, :, 0], y_viz[0, :, 0], cfg.sample_rate, stem):
                             print_event(ansi, "audio", f"{stem}_orig.wav  {stem}_recon.wav", color="cyan")
+        profiler.add_since("misc", prof_t)
 
     if prefetch_ex is not None:
         prefetch_ex.shutdown(wait=False, cancel_futures=True)
+    if row_ex is not None:
+        row_ex.shutdown(wait=False, cancel_futures=True)
     ran = cfg.steps - start_step
     total = time.time() - t0
     if ran > 0:
         print()
-        print_event(ansi, "done", f"steps {start_step}..{cfg.steps - 1} ({ran} steps) in {total:.1f}s", color="green")
+        print_event(ansi, "done", f"updates {start_step}..{cfg.steps - 1} ({ran} updates) in {total:.1f}s", color="green")
     else:
-        print_event(ansi, "done", "0 steps", color="green")
+        print_event(ansi, "done", "0 updates", color="green")
 
 
 if __name__ == "__main__":
