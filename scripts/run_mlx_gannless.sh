@@ -21,7 +21,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REPO_ROOT="$(pwd)"
-FINAL_STEP="${FINAL_STEP:-250000}"
+EPOCHS="${EPOCHS:-2}"
 LOG="${LOG:-${REPO_ROOT}/mlx_snake.log}"
 SPEC_DIR="${SPEC_DIR:-${REPO_ROOT}/mlx_spectrograms_snake}"
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/mlx_checkpoints_snake}"
@@ -29,7 +29,7 @@ BATCH="${BATCH:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-12}"
 
 exec uv run python tools/train_mlx.py \
-  --steps "${FINAL_STEP}" \
+  --epochs "${EPOCHS}" \
   --librispeech \
   --batch "${BATCH}" \
   --grad-accum-steps "${GRAD_ACCUM}" \

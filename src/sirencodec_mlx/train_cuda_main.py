@@ -3,14 +3,15 @@
 
 The command stays compatible with ``tools/train_mlx.py`` so existing scripts keep working:
 
-  uv run python tools/train_mlx.py --steps 500 --no-librispeech --fast
-  uv run python tools/train_mlx.py --steps 200000 --librispeech
+  uv run python tools/train_mlx.py --epochs 1 --no-librispeech --fast
+  uv run python tools/train_mlx.py --epochs 10 --librispeech
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import sys
 import time
 import wave
@@ -26,7 +27,6 @@ from . import entropy_coding as entropy_coding_mod
 from . import eval_metrics as eval_metrics_mod
 from .config import (
     DEFAULT_STFT_SCALES,
-    FAST_STFT_SCALES,
     Config,
     effective_codebook_sizes,
     encoder_time_stride,
@@ -158,7 +158,180 @@ def _format_vq_util(indices: list[torch.Tensor] | None, sizes: tuple[int, ...]) 
         k = sizes[i] if i < len(sizes) else sizes[-1]
         n_unique = int(torch.unique(idx.detach()).numel())
         parts.append(f"u{i}={n_unique}/{k}({100.0 * n_unique / max(1, k):.1f}%)")
-    return "  " + " ".join(parts)
+    return " ".join(parts)
+
+
+class _Ansi:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.reset = "\033[0m" if enabled else ""
+        self.bold = "\033[1m" if enabled else ""
+        self.dim = "\033[2m" if enabled else ""
+        self.red = "\033[31m" if enabled else ""
+        self.green = "\033[32m" if enabled else ""
+        self.yellow = "\033[33m" if enabled else ""
+        self.blue = "\033[34m" if enabled else ""
+        self.magenta = "\033[35m" if enabled else ""
+        self.cyan = "\033[36m" if enabled else ""
+
+    def c(self, color: str, text: object) -> str:
+        return f"{getattr(self, color)}{text}{self.reset}"
+
+
+def _make_ansi(mode: str) -> _Ansi:
+    m = (mode or "auto").lower()
+    if m == "always":
+        return _Ansi(True)
+    if m == "never" or "NO_COLOR" in os.environ:
+        return _Ansi(False)
+    return _Ansi(sys.stdout.isatty())
+
+
+def _kv(label: str, value: object, ansi: _Ansi, *, color: str = "bold", width: int = 11) -> str:
+    return f"{ansi.c('dim', label.ljust(width))} {ansi.c(color, value)}"
+
+
+def _bar(ansi: _Ansi) -> str:
+    return ansi.c("dim", "-" * 72)
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = max(0, int(round(float(seconds))))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 48:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h"
+
+
+def print_run_header(
+    *,
+    ansi: _Ansi,
+    device: torch.device,
+    device_name: str,
+    cfg: Config,
+    n_params: int,
+    st: int,
+    nom_kbps: float,
+    cb_sizes: tuple[int, ...],
+    stft_nfo: str,
+    resolved_epochs: int,
+    steps_per_epoch: int,
+    epoch_source: str,
+    audio_paths: list[Path] | None,
+) -> None:
+    samples_per_update = cfg.batch * cfg.grad_accum_steps
+    epoch_items = len(audio_paths) if audio_paths is not None else steps_per_epoch * samples_per_update
+    print()
+    print(ansi.c("cyan", ansi.bold + "SirenCodec CUDA training" + ansi.reset))
+    print(_bar(ansi))
+    print(_kv("device", f"{device}" + (f" ({device_name})" if device_name else ""), ansi, color="green" if device.type == "cuda" else "yellow"))
+    if audio_paths is not None:
+        print(_kv("data", f"{len(audio_paths)} audio files from {cfg.data_dir}", ansi, color="cyan"))
+    else:
+        print(_kv("data", f"synthetic sine/noise ({epoch_source})", ansi, color="yellow"))
+    print(_kv("schedule", f"epochs={resolved_epochs}  updates/epoch={steps_per_epoch}  total_updates={cfg.steps}", ansi, color="blue"))
+    print(_kv("epoch", f"{epoch_items} samples  {samples_per_update} samples/update", ansi, color="blue"))
+    print(_kv("logging", f"every {cfg.log_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.log_every)))} logs/epoch)", ansi, color="cyan"))
+    print(_kv("batch", f"micro={cfg.batch}  accum={cfg.grad_accum_steps}  effective={cfg.batch * cfg.grad_accum_steps}", ansi))
+    print(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi))
+    print(_kv("stft", f"{len(cfg.stft_scales)} scales: {stft_nfo}", ansi, color="magenta"))
+    print(_kv("rvq", f"{cfg.n_codebooks} stages  K={'x'.join(str(k) for k in cb_sizes)}  cosine={cfg.vq_cosine}", ansi, color="magenta"))
+    print(_bar(ansi), flush=True)
+
+
+def print_event(ansi: _Ansi, kind: str, message: str, *, color: str = "cyan") -> None:
+    print(f"{ansi.c(color, '[' + kind + ']')} {message}", flush=True)
+
+
+def print_step_log(
+    *,
+    ansi: _Ansi,
+    step: int,
+    cfg: Config,
+    steps_per_epoch: int,
+    resolved_epochs: int,
+    loss_value: float,
+    metrics: dict,
+    cos_pct: float,
+    ema_cos_pct: float | None,
+    util: str,
+    lr_log: float,
+    ms_per_step: float,
+    grad_norm: float,
+    samples_per_update: int,
+    epoch_items: int,
+    elapsed: float,
+    start_step: int,
+) -> None:
+    epoch_now = (step + 1) / float(max(1, steps_per_epoch))
+    iter_in_epoch = (step % max(1, steps_per_epoch)) + 1
+    samples_seen_epoch = min(epoch_items, iter_in_epoch * samples_per_update)
+    pct = 100.0 * (step + 1) / float(max(1, cfg.steps))
+    ran_updates = max(1, step - start_step + 1)
+    updates_per_s = ran_updates / max(elapsed, 1e-9)
+    samples_per_s = updates_per_s * samples_per_update
+    epochs_per_h = updates_per_s / float(max(1, steps_per_epoch)) * 3600.0
+    s_per_epoch = float(max(1, steps_per_epoch)) / max(updates_per_s, 1e-9)
+    remaining_updates = max(0, cfg.steps - step - 1)
+    eta_s = remaining_updates / max(updates_per_s, 1e-9)
+    cos_color = "green" if cos_pct >= 50.0 else ("yellow" if cos_pct >= 0.0 else "red")
+    print()
+    print(
+        f"{ansi.c('cyan', 'update')} {ansi.c('bold', f'{step + 1}/{cfg.steps}')} "
+        f"{ansi.c('dim', f'({pct:5.1f}%)')}  "
+        f"{ansi.c('cyan', 'epoch')} {ansi.c('bold', f'{epoch_now:.3f}/{resolved_epochs}')}  "
+        f"{ansi.c('cyan', 'iter')} {ansi.c('bold', f'{iter_in_epoch}/{steps_per_epoch}')}  "
+        f"{ansi.c('cyan', 'seen')} {ansi.c('bold', f'{samples_seen_epoch}/{epoch_items}')}  "
+        f"{ansi.c('cyan', 'time')} {ansi.c('bold', f'{ms_per_step:.1f} ms/step')}  "
+        f"{ansi.c('cyan', 'lr')} {ansi.c('bold', f'{lr_log:.2e}')}"
+    )
+    print(
+        f"  {ansi.c('blue', 'losses')}  "
+        f"total {ansi.c('bold', f'{loss_value:.5f}')}  "
+        f"L1 {float(metrics['lt'].float().item()):.4f}"
+    )
+    print(
+        f"  {ansi.c('blue', 'spectral')} "
+        f"stft {float(metrics['ls'].float().item()):.4f}  "
+        f"sgrad {float(metrics['lsg'].float().item()):.4f}  "
+        f"stft_cos {float(metrics['lsc'].float().item()):.4f}  "
+        f"sc {float(metrics['l_sc'].float().item()):.4f}  "
+        f"cx {float(metrics['l_cx'].float().item()):.4f}  "
+        f"mel {float(metrics['lm1'].float().item()):.4f}  "
+        f"lin {float(metrics['l_lin'].float().item()):.4f}"
+    )
+    ema = f"  ema {ema_cos_pct:.1f}%" if ema_cos_pct is not None else ""
+    print(
+        f"  {ansi.c('green', 'signal')}  "
+        f"cos {ansi.c(cos_color, f'{cos_pct:.1f}%')}{ema}  "
+        f"grad {grad_norm:.3f}"
+    )
+    print(
+        f"  {ansi.c('magenta', 'vq')}      "
+        f"loss {float(metrics['vq_l'].float().item()):.4g}  "
+        f"marg_ent {float(metrics['marg_ent'].float().item()):.4f}  "
+        f"{util}"
+    )
+    print(
+        f"  {ansi.c('yellow', 'weights')} "
+        f"stft {effective_lambda_stft(step, cfg):.4f}  "
+        f"marginal {effective_lambda_marginal(step, cfg):.4f}",
+    )
+    print(
+        f"  {ansi.c('cyan', 'throughput')} "
+        f"{updates_per_s:.2f} upd/s  "
+        f"{samples_per_s:.0f} samples/s  "
+        f"{epochs_per_h:.2f} epoch/h  "
+        f"{_fmt_duration(s_per_epoch)}/epoch  "
+        f"ETA {_fmt_duration(eta_s)}",
+        flush=True,
+    )
 
 
 def _count_params(model: torch.nn.Module) -> int:
@@ -250,6 +423,29 @@ def build_lr_scheduler(opt: torch.optim.Optimizer, cfg: Config, start_step: int)
     return sched
 
 
+def resolve_training_steps(cfg: Config, args, audio_paths: list[Path] | None) -> tuple[int, int, int, str]:
+    """Return (total_steps, steps_per_epoch, epochs, source_label)."""
+    acm = max(1, int(cfg.grad_accum_steps))
+    if audio_paths is not None:
+        samples_per_step = max(1, int(cfg.batch) * acm)
+        steps_per_epoch = max(1, math.ceil(len(audio_paths) / samples_per_step))
+        source = f"{len(audio_paths)} files / ({cfg.batch} batch * {acm} accum)"
+    else:
+        steps_per_epoch = max(1, int(args.synthetic_steps_per_epoch))
+        source = "synthetic steps-per-epoch"
+
+    if args.steps is not None:
+        total_steps = int(args.steps)
+        epochs = max(1, math.ceil(total_steps / float(steps_per_epoch)))
+        return total_steps, steps_per_epoch, epochs, "--steps override"
+
+    epochs = int(args.epochs)
+    if epochs < 1:
+        raise SystemExit("--epochs must be >= 1")
+    total_steps = epochs * steps_per_epoch
+    return total_steps, steps_per_epoch, epochs, source
+
+
 @torch.no_grad()
 def vq_reset_dead_codes(model: CUDACodec, batch: torch.Tensor, cfg: Config) -> tuple[int, list[int]]:
     if cfg.ae_only:
@@ -319,7 +515,9 @@ def _add_bool(p: argparse.ArgumentParser, name: str, default: bool, help: str = 
 def parse_args(argv: list[str] | None = None):
     c = Config()
     p = argparse.ArgumentParser(description="CUDA Karpathy-style audio codec trainer (former train_mlx CLI)")
-    p.add_argument("--steps", type=int, default=c.steps)
+    p.add_argument("--epochs", type=int, default=1, help="Full passes over the corpus; steps = ceil(files/(batch*accum))*epochs")
+    p.add_argument("--steps", type=int, default=None, help="Deprecated compatibility override: train exact optimizer steps")
+    p.add_argument("--synthetic-steps-per-epoch", type=int, default=1000, help="Epoch size when using --no-librispeech synthetic batches")
     p.add_argument("--batch", type=int, default=c.batch)
     p.add_argument("--grad-accum-steps", type=int, default=c.grad_accum_steps)
     p.add_argument("--load-audio-threads", type=int, default=c.load_audio_threads)
@@ -396,7 +594,8 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--adaptive-mode", choices=["none", "bwe_stub", "fps_stub"], default=c.adaptive_mode)
     p.add_argument("--data-dir", type=str, default=None)
     p.add_argument("--librispeech", action=argparse.BooleanOptionalAction, default=c.use_librispeech)
-    p.add_argument("--log-every", type=int, default=c.log_every)
+    p.add_argument("--logs-per-epoch", type=int, default=20, help="How many progress logs to print per epoch")
+    p.add_argument("--log-every", type=int, default=None, help="Deprecated override: exact optimizer-step logging interval")
     p.add_argument("--log-cos-ema-beta", type=float, default=c.log_cos_ema_beta)
     p.add_argument("--spectrogram-every", type=int, default=c.spectrogram_every)
     p.add_argument("--spectrogram-dir", type=str, default=c.spectrogram_dir)
@@ -406,6 +605,7 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--checkpoint-dir", type=str, default=c.checkpoint_dir)
     p.add_argument("--resume", nargs="?", const="__latest__", default=None)
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="ANSI colors in logs")
     args, unknown = p.parse_known_args(argv)
     if unknown:
         print(f"[warn] ignored old/unknown train_mlx args: {' '.join(unknown)}", file=sys.stderr)
@@ -429,7 +629,7 @@ def config_from_args(args) -> Config:
     if stft_weights is not None and len(stft_weights) != len(stft_scales):
         raise SystemExit("--stft-scale-weights must have one value per STFT scale")
     return Config(
-        steps=args.steps,
+        steps=int(args.steps) if args.steps is not None else 0,
         batch=args.batch,
         load_audio_threads=args.load_audio_threads,
         prefetch_audio=bool(args.prefetch_audio),
@@ -489,7 +689,7 @@ def config_from_args(args) -> Config:
         cos_target=args.cos_target,
         lambda_sc=args.lambda_sc,
         lambda_complex_stft=args.lambda_complex_stft,
-        log_every=args.log_every,
+        log_every=int(args.log_every) if args.log_every is not None else Config().log_every,
         log_cos_ema_beta=args.log_cos_ema_beta,
         spectrogram_every=args.spectrogram_every,
         spectrogram_dir=args.spectrogram_dir,
@@ -517,9 +717,30 @@ def config_from_args(args) -> Config:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    ansi = _make_ansi(args.color)
     cfg = config_from_args(args)
-    if cfg.steps < 0 or cfg.batch < 1 or cfg.grad_accum_steps < 1:
+    if (args.steps is not None and args.steps < 0) or cfg.batch < 1 or cfg.grad_accum_steps < 1:
         raise SystemExit("--steps must be >=0 and --batch/--grad-accum-steps must be >=1")
+    if args.synthetic_steps_per_epoch < 1:
+        raise SystemExit("--synthetic-steps-per-epoch must be >= 1")
+    if args.logs_per_epoch < 1:
+        raise SystemExit("--logs-per-epoch must be >= 1")
+    if args.log_every is not None and args.log_every < 1:
+        raise SystemExit("--log-every must be >= 1")
+
+    audio_paths: list[Path] | None = None
+    if cfg.data_dir is not None:
+        if args.librispeech and not cfg.data_dir.is_dir():
+            raise SystemExit(f"Dataset dir missing: {cfg.data_dir}")
+        audio_paths = collect_audio_paths(cfg.data_dir)
+        if not audio_paths:
+            raise SystemExit(f"No audio files under {cfg.data_dir}")
+
+    total_steps, steps_per_epoch, resolved_epochs, epoch_source = resolve_training_steps(cfg, args, audio_paths)
+    cfg.steps = total_steps
+    if args.log_every is None:
+        cfg.log_every = max(1, math.ceil(steps_per_epoch / int(args.logs_per_epoch)))
+
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -530,8 +751,7 @@ def main(argv: list[str] | None = None) -> None:
             pass
     else:
         device = torch.device("cpu")
-        print("[warn] CUDA not available; running on CPU", file=sys.stderr)
-    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""), flush=True)
+        print_event(ansi, "warn", "CUDA not available; running on CPU", color="yellow")
 
     model = CUDACodec(cfg).to(device)
     if cfg.use_bf16 and device.type == "cuda":
@@ -539,9 +759,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.torch_compile:
         try:
             model = torch.compile(model)  # type: ignore[assignment]
-            print("torch.compile: enabled", flush=True)
+            print_event(ansi, "compile", "torch.compile enabled", color="green")
         except Exception as e:
-            print(f"[warn] torch.compile failed: {e}", flush=True)
+            print_event(ansi, "warn", f"torch.compile failed: {e}", color="yellow")
 
     start_step = 0
     data_off = 0
@@ -554,7 +774,10 @@ def main(argv: list[str] | None = None) -> None:
         model.load_state_dict(ck["model"], strict=True)
         start_step = int(ck.get("step", -1)) + 1
         data_off = int(ck.get("data_off", start_step * cfg.batch * cfg.grad_accum_steps))
-        print(f"[resume] {ck_path} -> train steps {start_step}..{cfg.steps - 1}", flush=True)
+        print_event(ansi, "resume", f"{ck_path} -> train steps {start_step}..{cfg.steps - 1}", color="cyan")
+        if start_step >= cfg.steps:
+            print_event(ansi, "done", f"checkpoint already reached target: step {start_step - 1} >= total steps {cfg.steps - 1}", color="green")
+            return
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     sched = build_lr_scheduler(opt, cfg, start_step)
@@ -575,23 +798,21 @@ def main(argv: list[str] | None = None) -> None:
     nom_kbps = nominal_rvq_kbps(cfg) * adaptive_mod.nominal_bitrate_multiplier(cfg.adaptive_mode)
     cb_sizes = effective_codebook_sizes(cfg)
     stft_nfo = " ".join(f"nfft{n}/hop{h}" for n, h in cfg.stft_scales)
-    print(
-        f"Parameters: {n_params / 1e6:.2f}M  batch={cfg.batch}xaccum={cfg.grad_accum_steps}->{cfg.batch * cfg.grad_accum_steps} "
-        f"latent={cfg.latent_dim} enc_stride={st}x ~{nom_kbps:.1f} kbps nominal "
-        f"STFTx{len(cfg.stft_scales)}: {stft_nfo} RVQ={cfg.n_codebooks}xK={'x'.join(str(k) for k in cb_sizes)}",
-        flush=True,
+    print_run_header(
+        ansi=ansi,
+        device=device,
+        device_name=torch.cuda.get_device_name(0) if device.type == "cuda" else "",
+        cfg=cfg,
+        n_params=n_params,
+        st=st,
+        nom_kbps=nom_kbps,
+        cb_sizes=cb_sizes,
+        stft_nfo=stft_nfo,
+        resolved_epochs=resolved_epochs,
+        steps_per_epoch=steps_per_epoch,
+        epoch_source=epoch_source,
+        audio_paths=audio_paths,
     )
-
-    audio_paths: list[Path] | None = None
-    if cfg.data_dir is not None:
-        if args.librispeech and not cfg.data_dir.is_dir():
-            raise SystemExit(f"Dataset dir missing: {cfg.data_dir}")
-        audio_paths = collect_audio_paths(cfg.data_dir)
-        if not audio_paths:
-            raise SystemExit(f"No audio files under {cfg.data_dir}")
-        print(f"Using {len(audio_paths)} audio files from {cfg.data_dir}", flush=True)
-    else:
-        print("Using synthetic sine/noise batches", flush=True)
 
     prefetch_ex: ThreadPoolExecutor | None = None
     prefetch_future = None
@@ -631,12 +852,12 @@ def main(argv: list[str] | None = None) -> None:
             last_batch = batch
 
         if not math.isfinite(loss_total):
-            print(f"  [skip] non-finite loss at step {step}", flush=True)
+            print_event(ansi, "skip", f"non-finite loss at step {step}", color="yellow")
             opt.zero_grad(set_to_none=True)
             continue
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm) if cfg.grad_clip_norm > 0 else torch.tensor(0.0)
         if not torch.isfinite(torch.as_tensor(grad_norm)):
-            print(f"  [skip] non-finite gradient at step {step}", flush=True)
+            print_event(ansi, "skip", f"non-finite gradient at step {step}", color="yellow")
             opt.zero_grad(set_to_none=True)
             continue
         opt.step()
@@ -649,30 +870,37 @@ def main(argv: list[str] | None = None) -> None:
             n_reset, per_st = vq_reset_dead_codes(model, last_batch, cfg)
             if n_reset > 0 and (cfg.vq_reset_log_every <= 0 or step % cfg.vq_reset_log_every == 0):
                 parts = [f"s{i}={c}" for i, c in enumerate(per_st) if c > 0]
-                print(f"  [vq-reset] replaced {n_reset} dead codes" + (f" ({', '.join(parts)})" if parts else ""), flush=True)
+                print_event(ansi, "vq-reset", f"replaced {n_reset} dead codes" + (f" ({', '.join(parts)})" if parts else ""), color="magenta")
 
-        if last_metrics is not None and (step % cfg.log_every == 0 or step == cfg.steps - 1):
+        epoch_boundary = (step + 1) % max(1, steps_per_epoch) == 0
+        if last_metrics is not None and (
+            step % cfg.log_every == 0 or epoch_boundary or step == cfg.steps - 1
+        ):
             m = last_metrics
             cos_pct = 100.0 * float(m["cos_m"].float().item())
             if cfg.log_cos_ema_beta > 0:
                 ema_cos_pct = cos_pct if ema_cos_pct is None else cfg.log_cos_ema_beta * ema_cos_pct + (1.0 - cfg.log_cos_ema_beta) * cos_pct
-                cos_ema = f" cos_ema={ema_cos_pct:.1f}%"
-            else:
-                cos_ema = ""
             util = _format_vq_util(m["idx"], cb_sizes)
             elapsed = time.time() - t0
             lr_log = opt.param_groups[0]["lr"]
-            print(
-                f"step {step:6d}/{cfg.steps} loss={loss_total / acm:.5f} "
-                f"L1={float(m['lt'].float().item()):.4f} stft={float(m['ls'].float().item()):.4f} "
-                f"sgrad={float(m['lsg'].float().item()):.4f} stft_cos={float(m['lsc'].float().item()):.4f} "
-                f"sc={float(m['l_sc'].float().item()):.4f} cx={float(m['l_cx'].float().item()):.4f} "
-                f"mel_l1={float(m['lm1'].float().item()):.4f} lin_mag={float(m['l_lin'].float().item()):.4f} "
-                f"vq={float(m['vq_l'].float().item()):.4g} marg_ent={float(m['marg_ent'].float().item()):.4f} "
-                f"lambda_stft_eff={effective_lambda_stft(step, cfg):.4f} lambda_m_eff={effective_lambda_marginal(step, cfg):.4f} "
-                f"cos={cos_pct:.1f}%{cos_ema}{util} lr={lr_log:.2e} "
-                f"{elapsed / (step - start_step + 1) * 1000:.1f} ms/step",
-                flush=True,
+            print_step_log(
+                ansi=ansi,
+                step=step,
+                cfg=cfg,
+                steps_per_epoch=steps_per_epoch,
+                resolved_epochs=resolved_epochs,
+                loss_value=loss_total / acm,
+                metrics=m,
+                cos_pct=cos_pct,
+                ema_cos_pct=ema_cos_pct if cfg.log_cos_ema_beta > 0 else None,
+                util=util,
+                lr_log=lr_log,
+                ms_per_step=elapsed / (step - start_step + 1) * 1000,
+                grad_norm=float(torch.as_tensor(grad_norm).detach().float().item()),
+                samples_per_update=cfg.batch * cfg.grad_accum_steps,
+                epoch_items=len(audio_paths) if audio_paths is not None else steps_per_epoch * cfg.batch * cfg.grad_accum_steps,
+                elapsed=elapsed,
+                start_step=start_step,
             )
 
         if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0 and last_batch is not None:
@@ -683,7 +911,7 @@ def main(argv: list[str] | None = None) -> None:
             sisdr = eval_metrics_mod.si_sdr_db(o, r)
             pesq_v = eval_metrics_mod.pesq_wb_16k(o, r)
             pesq_s = f"{pesq_v:.3f}" if pesq_v is not None else "na"
-            print(f"  [eval] SI-SDR={sisdr:.2f} dB PESQ_wb={pesq_s}", flush=True)
+            print_event(ansi, "eval", f"SI-SDR={sisdr:.2f} dB  PESQ_wb={pesq_s}", color="green")
             if cfg.log_mlx_tsv:
                 p = Path(cfg.log_mlx_tsv)
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -699,7 +927,7 @@ def main(argv: list[str] | None = None) -> None:
                     h_stages.append(entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(ix.detach().cpu().reshape(-1).tolist(), kk))
                 h_mean = sum(h_stages) / max(1, len(h_stages))
                 idx_bps = h_mean * (cfg.sample_rate / float(encoder_time_stride(cfg))) * float(len(h_stages))
-                print(f"  [entropy] RVQ mean H={h_mean:.3f} b/sym ~{idx_bps:.0f} b/s empirical index", flush=True)
+                print_event(ansi, "entropy", f"RVQ mean H={h_mean:.3f} b/sym  ~{idx_bps:.0f} b/s empirical index", color="magenta")
 
         if cfg.checkpoint_every > 0 and step > 0 and (step % cfg.checkpoint_every == 0 or step == cfg.steps - 1):
             ck_dir = Path(cfg.checkpoint_dir)
@@ -708,6 +936,8 @@ def main(argv: list[str] | None = None) -> None:
             torch.save(
                 {
                     "step": step,
+                    "epoch": (step + 1) / float(steps_per_epoch),
+                    "steps_per_epoch": steps_per_epoch,
                     "data_off": data_off,
                     "model": model.state_dict(),
                     "optimizer": opt.state_dict(),
@@ -716,8 +946,19 @@ def main(argv: list[str] | None = None) -> None:
                 },
                 ck_path,
             )
-            (ck_dir / f"codec_step{step}.json").write_text(json.dumps({"step": step, "data_off": data_off}, indent=2), encoding="utf-8")
-            print(f"  [checkpoint] {ck_path}", flush=True)
+            (ck_dir / f"codec_step{step}.json").write_text(
+                json.dumps(
+                    {
+                        "step": step,
+                        "epoch": (step + 1) / float(steps_per_epoch),
+                        "steps_per_epoch": steps_per_epoch,
+                        "data_off": data_off,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print_event(ansi, "checkpoint", str(ck_path), color="cyan")
             if cfg.results_tsv_path:
                 rp = Path(cfg.results_tsv_path)
                 rp.parent.mkdir(parents=True, exist_ok=True)
@@ -740,17 +981,21 @@ def main(argv: list[str] | None = None) -> None:
                     y_viz, _, _, _, _ = model.forward_full(batch_viz)
                     out = Path(cfg.spectrogram_dir) / f"step_{step:08d}.png"
                     if save_spectrogram_png(batch_viz[0, :, 0], y_viz[0, :, 0], cfg.sample_rate, out, step):
-                        print(f"  [spectrogram] {out}", flush=True)
+                        print_event(ansi, "spectrogram", str(out), color="cyan")
                     if cfg.save_audio:
                         stem = Path(cfg.spectrogram_dir) / f"step_{step:08d}"
                         if save_reconstruction_wavs(batch_viz[0, :, 0], y_viz[0, :, 0], cfg.sample_rate, stem):
-                            print(f"  [audio] {stem}_orig.wav {stem}_recon.wav", flush=True)
+                            print_event(ansi, "audio", f"{stem}_orig.wav  {stem}_recon.wav", color="cyan")
 
     if prefetch_ex is not None:
         prefetch_ex.shutdown(wait=False, cancel_futures=True)
     ran = cfg.steps - start_step
     total = time.time() - t0
-    print(f"done steps {start_step}..{cfg.steps - 1} ({ran} steps) in {total:.1f}s" if ran > 0 else "done (0 steps)", flush=True)
+    if ran > 0:
+        print()
+        print_event(ansi, "done", f"steps {start_step}..{cfg.steps - 1} ({ran} steps) in {total:.1f}s", color="green")
+    else:
+        print_event(ansi, "done", "0 steps", color="green")
 
 
 if __name__ == "__main__":
