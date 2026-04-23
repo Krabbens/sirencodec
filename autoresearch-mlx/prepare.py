@@ -97,9 +97,7 @@ def evaluate_bpb(
     train_paths: list[Path],
     val_paths: list[Path],
 ) -> float:
-    """
-    Mean validation loss (``make_train_fn`` total) over ``VAL_NUM_BATCHES`` batches.
-    """
+    """Mean validation loss (``make_train_fn`` total) over ``VAL_NUM_BATCHES`` batches."""
     paths_for_val = val_paths if val_paths else train_paths
     if paths_for_val:
         losses: list[float] = []

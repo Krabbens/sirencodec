@@ -1,0 +1,22 @@
+[project]
+name = "sirencodec"
+version = "0.1.0"
+description = "SirenCodec MLX neural audio codec trainer"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.21",
+    "numpy",
+    "soundfile",
+    "matplotlib",
+]
+
+[project.scripts]
+train = "sirencodec_mlx.train_mlx_main:main"
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

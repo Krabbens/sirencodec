@@ -1,0 +1,161 @@
+% Pierwsza prezentacja, SirenCodec. Kompilacja: tectonic (+ BibTeX).
+% Zakres slajdów 3--9 = 5 podpunktów z polecenia (kolejność jak w ćwiczeniu).
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usepackage{fontspec}
+\usepackage[polish]{babel}
+\usepackage[
+  backend=bibtex,
+  style=numeric,
+  sorting=none,
+  maxbibnames=99,
+  doi=true,
+  url=true,
+  isbn=false,
+  abbreviate=false,
+]{biblatex}
+\addbibresource{pierwsza_prezentacja_slide.bib}
+\renewcommand*{\bibfont}{\fontsize{5.2pt}{6.1pt}\selectfont}
+\setbeamertemplate{bibliography item}{\insertbiblabel}
+
+\setsansfont{lmsans10}[
+  Extension      = .otf,
+  UprightFont    = *-regular,
+  BoldFont       = *-bold,
+  ItalicFont     = *-oblique,
+  BoldItalicFont = *-boldoblique,
+  Ligatures        = TeX,
+  Scale            = MatchLowercase,
+]
+\setmainfont{lmroman10}[
+  Extension      = .otf,
+  UprightFont    = *-regular,
+  BoldFont       = *-bold,
+  ItalicFont     = *-italic,
+  BoldItalicFont = *-bolditalic,
+  Ligatures        = TeX,
+]
+
+\usetheme{default}
+\usecolortheme{default}
+\usefonttheme{professionalfonts}
+\renewcommand{\familydefault}{\sfdefault}
+
+\setbeamercolor{titlebar}{fg=black,bg=gray!25}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{%
+  \hfill\insertframenumber{}/\inserttotalframenumber\hspace*{0.5em}\vspace*{0.3em}%
+}
+
+\title{Ultra niskobitowa kompresja mowy}
+\subtitle{\small Seminarium magisterskie · praca dyplomowa (2 autorów)}
+\author{Kosma Gąsiorowski \and Jakub Aszyk}
+\institute{Politechnika Poznańska\\[0.25em]
+  {\small Kierunek: Informatyka \quad Przedmiot: Internet}\\[0.35em]
+  Promotor: Mariusz Nowak}
+\date{\today}
+
+\newcommand{\exerciseheader}{%
+  \begin{center}\normalsize Ćwiczenie Pierwsza prezentacja\end{center}\vspace{0.5em}}
+
+\begin{document}
+\nocite{*}
+
+\begin{frame}[plain]
+  \titlepage
+\end{frame}
+
+% --- Slajd 2: jak w materiale z ćwiczenia ---
+\begin{frame}[plain]{}
+  \exerciseheader
+  \begin{beamercolorbox}[wd=\paperwidth,sep=0.55em,center]{titlebar}
+    \centering\Large\bfseries Pierwsza prezentacja
+  \end{beamercolorbox}
+  \vspace{0.55em}
+  {\small
+  \begin{itemize}\setlength{\itemsep}{0.35em}
+    \item Około 10 minut
+    \item Cel: \textbf{Uzasadnienie wyboru tematu i realności jego wykonania w ramach pracy dyplomowej}
+    \item Zakres (sl.\ 3--9):
+      \begin{itemize}\setlength{\itemsep}{0.22em}
+        \item Temat, promotor, zadania szczegółowe
+        \item Planowane rezultaty
+        \item Literatura
+        \item Harmonogram prac (punkty kontrolne, terminy)
+        \item Czynniki ryzyka
+      \end{itemize}
+  \end{itemize}
+  }
+\end{frame}
+
+% --- (1) Temat, promotor, zadania szczegółowe ---
+\begin{frame}{Temat, promotor, zadania szczegółowe}
+  \textbf{Temat:} \inserttitle\\[0.35em]
+  \textbf{Realizacja:} projekt \textbf{SirenCodec} (kodek neuronowy, niski bitrate).\\[0.5em]
+  \textbf{Promotor:} Mariusz Nowak \quad \textbf{Autorzy:} Kosma Gąsiorowski, Jakub Aszyk\\[0.55em]
+  \textbf{Zadania szczegółowe:}
+  \begin{enumerate}
+    \item Przegląd literatury i metryk.
+    \item Implementacja, trening, eksperymenty (m.in.\ od ok.\ pół roku pracy badawczej).
+    \item Rozdział w pracy: metoda, wyniki, wnioski.
+  \end{enumerate}
+\end{frame}
+
+% --- (2) Planowane rezultaty ---
+\begin{frame}{Planowane rezultaty}
+  \begin{itemize}
+    \item Działający łańcuch: nagranie $\rightarrow$ kody dyskretne $\rightarrow$ odtworzenie; szacowany bitrate.
+    \item Zestaw wyników: logi, checkpointy, przykłady audio, wykresy do rozdziału.
+    \item Odtwarzalność eksperymentów (środowisko, komendy).
+  \end{itemize}
+\end{frame}
+
+% --- (3) Literatura ---
+\begin{frame}[t,shrink=5]{Literatura (1/2)}
+  \vspace{-0.35em}
+  \printbibliography[heading=none,keyword=litA]
+\end{frame}
+
+\begin{frame}[t,shrink=5]{Literatura (2/2)}
+  \vspace{-0.35em}
+  \printbibliography[heading=none,keyword=litB]
+\end{frame}
+
+% --- (4a) Harmonogram --- terminy ---
+\begin{frame}{Harmonogram prac --- terminy}
+  \begin{itemize}
+    \item XII 2025\,--\,I 2026: przegląd literatury, przygotowanie środowiska.
+    \item II 2026: implementacja (kod, dane).
+    \item III\,--\,VI 2026: eksperymenty i pisanie pracy równolegle.
+    \item VII 2026: obrona.
+  \end{itemize}
+\end{frame}
+
+% --- (4b) Harmonogram --- punkty kontrolne ---
+\begin{frame}{Harmonogram prac --- punkty kontrolne}
+  \begin{itemize}
+    \item Zamknięcie przeglądu literatury i gotowość środowiska (koniec I\,2026).
+    \item Pierwszy stabilny trening + próbki audio (II\,2026).
+    \item Domknięcie pomiarów; konsolidacja rozdziału wyników (VI\,2026).
+    \item Wersja pracy do akceptacji promotora przed obroną (VII\,2026).
+  \end{itemize}
+\end{frame}
+
+% --- (5) Czynniki ryzyka ---
+\begin{frame}{Czynniki ryzyka}
+  \begin{itemize}
+    \item Jakość przy bardzo niskim bitrate (artefakty) --- ewentualna korekta celów po uzgodnieniu z promotorem.
+    \item Czas obliczeń na GPU --- krótsze przebiegi, podzbiór danych.
+    \item Koordynacja dwóch autorów --- podział modułów i gałęzi w repozytorium.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[plain]
+  \begin{center}
+    {\Large Dziękujemy za uwagę.}\\[1.2em]
+    Pytania?
+  \end{center}
+\end{frame}
+
+\end{document}
