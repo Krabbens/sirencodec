@@ -20,8 +20,8 @@ def extract_mel(audio_24k):
     return mel
 
 def main():
-    manifest_path = "data/master_manifest.jsonl"
-    output_dir = Path("data/precomputed_24fps")
+    manifest_path = "data/cv-corpus/master_manifest.jsonl"
+    output_dir = Path("data/cv-corpus/precomputed_24fps")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     entries = []

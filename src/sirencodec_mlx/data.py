@@ -51,8 +51,8 @@ def _skip_audio_path(p: Path) -> bool:
 
 
 def _collect_audio_paths(root: Path) -> list[Path]:
-    """Find audio files under ``root`` (recursive). LibriSpeech is ``*.flac``."""
-    exts = {".wav", ".flac", ".ogg"}
+    """Find audio files under ``root`` recursively."""
+    exts = {".wav", ".flac", ".ogg", ".mp3"}
     out: list[Path] = []
     for p in root.rglob("*"):
         if not p.is_file() or p.suffix.lower() not in exts:
@@ -89,7 +89,7 @@ def _load_audio_row_np(
     if wav is None:
         raise RuntimeError(
             "Could not read any audio file (all failed open/read). "
-            "Check --data-dir and that files are valid wav/flac/ogg."
+            "Check --data-dir and that files are valid wav/flac/ogg/mp3."
         )
     wav = wav[:, 0].astype(np.float32)
     if wav.size < need:
@@ -104,7 +104,7 @@ def _load_audio_row_np(
 
 
 def _load_audio_batch(cfg: Config, paths: list[Path], offset: int) -> mx.array:
-    """Load rotating batches from disk (wav/flac/ogg); requires soundfile + numpy."""
+    """Load rotating batches from disk (wav/flac/ogg/mp3); requires soundfile + numpy."""
     import numpy as np
 
     b, need = cfg.batch, cfg.segment

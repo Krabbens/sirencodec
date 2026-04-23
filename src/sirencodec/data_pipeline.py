@@ -48,7 +48,7 @@ def load_audio(path: str):
 # ═══════════════════════════════════════════════
 @dataclass
 class DataConfig:
-    data_dir: str = "data"  # root directory for all datasets
+    data_dir: str = "data/cv-corpus"  # local Common Voice corpus
     sample_rate: int = 16000
     segment_length: int = 16000  # 1 second
     batch_size: int = 16
@@ -75,15 +75,15 @@ class DataConfig:
     preprocessed_manifest_name: str = "master_manifest_preprocessed.jsonl"
 
     # Dataset selection
-    use_librispeech: bool = True
+    use_librispeech: bool = False
     librispeech_subsets: list = ("train-clean-100", "train-clean-360", "train-other-500")
 
-    use_commonvoice: bool = True
-    commonvoice_languages: list = ("en", "de", "fr", "es", "it", "nl", "pt", "ru", "zh", "ja", "ar", "hi")
+    use_commonvoice: bool = False
+    commonvoice_languages: list = ("pl",)
 
-    use_vctk: bool = True
+    use_vctk: bool = False
 
-    use_dns_noise: bool = True  # augmentation only
+    use_dns_noise: bool = False  # augmentation only
 
     # Augmentation
     augment_noise_snr_range: Tuple[float, float] = (5.0, 40.0)
@@ -403,6 +403,62 @@ def download_dns_noise(data_dir: str):
 # MANIFEST BUILDING
 # ═══════════════════════════════════════════════
 
+def _manifest_path(path: Path) -> str:
+    """Return repo-relative paths when possible so manifests are portable."""
+    try:
+        return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _commonvoice_tsvs(language_dir: Path) -> list[Path]:
+    """Prefer validated Common Voice audio; fall back to explicit splits."""
+    validated = language_dir / "validated.tsv"
+    if validated.exists():
+        return [validated]
+    splits = [language_dir / name for name in ("train.tsv", "dev.tsv", "test.tsv")]
+    existing = [p for p in splits if p.exists()]
+    if existing:
+        return existing
+    return sorted(language_dir.glob("*.tsv"))
+
+
+def _collect_commonvoice_entries(base: Path) -> list[dict]:
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for clips_dir in sorted(base.rglob("clips")):
+        language_dir = clips_dir.parent
+        for tsv_path in _commonvoice_tsvs(language_dir):
+            with tsv_path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                if "path" not in (reader.fieldnames or []):
+                    continue
+                for row in reader:
+                    clip_name = (row.get("path") or "").strip()
+                    if not clip_name:
+                        continue
+                    audio_path = clips_dir / clip_name
+                    if audio_path.suffix.lower() not in {".wav", ".flac", ".ogg", ".mp3"}:
+                        continue
+                    if not audio_path.exists():
+                        continue
+                    key = str(audio_path.resolve()).lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    entries.append(
+                        {
+                            "path": _manifest_path(audio_path),
+                            "relative_path": audio_path.relative_to(base).as_posix(),
+                            "dataset": "commonvoice",
+                            "language": row.get("locale") or language_dir.name,
+                            "subset": tsv_path.stem,
+                            "text": row.get("sentence", ""),
+                        }
+                    )
+    return entries
+
+
 def build_manifests(data_dir: str):
     """Build all manifests. Call after downloads complete."""
     base = Path(data_dir)
@@ -415,6 +471,8 @@ def build_manifests(data_dir: str):
             for line in f:
                 if line.strip():
                     all_entries.append(json.loads(line))
+
+    all_entries.extend(_collect_commonvoice_entries(base))
 
     master = base / "master_manifest.jsonl"
     with open(master, "w") as f:
@@ -932,7 +990,7 @@ def download_and_prepare(data_config: DataConfig):
     data_dir = data_config.data_dir
 
     print("=" * 60)
-    print("DOWNLOADING MULTILINGUAL SPEECH DATA")
+    print("PREPARING SPEECH DATA")
     print("=" * 60)
 
     if data_config.use_librispeech:
@@ -964,11 +1022,11 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "download":
         cfg = DataConfig(
-            data_dir=sys.argv[2] if len(sys.argv) > 2 else "data",
+            data_dir=sys.argv[2] if len(sys.argv) > 2 else "data/cv-corpus",
         )
         download_and_prepare(cfg)
     elif len(sys.argv) > 1 and sys.argv[1] == "precompute":
-        data_dir = "data"
+        data_dir = "data/cv-corpus"
         force = False
         max_items = None
         args = sys.argv[2:]
@@ -989,7 +1047,7 @@ if __name__ == "__main__":
         cfg = DataConfig(data_dir=data_dir)
         build_preprocessed_dataset(cfg, force=force, max_items=max_items)
     elif len(sys.argv) > 1 and sys.argv[1] == "test":
-        cfg = DataConfig(data_dir="data", batch_size=4)
+        cfg = DataConfig(data_dir="data/cv-corpus", batch_size=4)
         ds = MultilingualSpeechDataset(cfg, mode="train")
         print(f"\nDataset length (virtual): {len(ds)}")
 
@@ -1004,6 +1062,6 @@ if __name__ == "__main__":
         batch = next(iter(loader))
         print(f"\nBatch: waveforms {batch[0].shape}, languages: {batch[1]}")
     else:
-        print("Usage: python data_pipeline.py download [data_dir]")
+        print("Usage: python data_pipeline.py download [data_dir]  # default: data/cv-corpus")
         print("       python data_pipeline.py precompute [data_dir] [--force] [--max-items N]")
         print("       python data_pipeline.py test")

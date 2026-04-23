@@ -18,7 +18,7 @@ Audio (24kHz) → MelSpectrogram (100-dim, variable fps) → RVQ/FSQ → Upsampl
 - **Quantization**: RVQ (residual vector quantization, EMA codebooks) or FSQ (finite scalar quantization)
 - **Vocoder**: Pretrained Vocos (`charactr/vocos-mel-24khz`, 13.5M params, fine-tuned)
 - **Discriminator**: Multi-resolution STFT discriminator (3 resolutions) for adversarial training
-- **Dataset**: 28,539 English speech files from LibriSpeech via `data/master_manifest.jsonl`
+- **Dataset**: Polish Common Voice under `data/cv-corpus` via `data/cv-corpus/master_manifest.jsonl`
 
 ### Key Design Decision
 
@@ -82,12 +82,12 @@ python3 train_vocos_vq.py --steps 50000 --fsq-dims 16 --fsq-levels 5
 
 ### Data Setup
 
-Data must be in `data/master_manifest.jsonl` format:
+Data must be in `data/cv-corpus/master_manifest.jsonl` format:
 ```json
-{"path": "data/librispeech/.../audio.flac"}
+{"path": "data/cv-corpus/pl/clips/common_voice_pl_20547774.mp3"}
 ```
 
-The `data_pipeline.py` script can download and build manifests for LibriSpeech, CommonVoice, VCTK.
+The `data_pipeline.py` script builds this manifest from Common Voice TSV files using repo-relative paths.
 
 ### Checkpoints
 

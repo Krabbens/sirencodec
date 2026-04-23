@@ -28,7 +28,7 @@ model.eval()
 print(f"Model loaded. Step: {ckpt.get('step', 'unknown')}")
 
 # Load a few test files from dev set
-manifest_path = "data/master_manifest.jsonl"
+manifest_path = "data/cv-corpus/master_manifest.jsonl"
 import json
 with open(manifest_path) as f:
     entries = [json.loads(line) for line in f]

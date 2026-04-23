@@ -24,7 +24,7 @@ echo "╠═══════════════════════�
 echo "║  Steps:    $STEPS"
 echo "║  Resume:   ${RESUME:+Yes}${RESUME:-No}"
 echo "║  Arch:     arch-a-v2b (500bps)"
-echo "║  Data:     LibriSpeech train-clean-100"
+echo "║  Data:     Common Voice PL (data/cv-corpus)"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -38,13 +38,13 @@ else
 fi
 
 # Check data
-if [ ! -d "data/librispeech/LibriSpeech" ]; then
-    echo "ERROR: Training data not found. Run: python train.py download data"
+if [ ! -d "data/cv-corpus/pl/clips" ]; then
+    echo "ERROR: Training data not found at data/cv-corpus/pl/clips"
     exit 1
 fi
 
-FLAC_COUNT=$(find data/librispeech/LibriSpeech -name "*.flac" | wc -l)
-echo "Data: $FLAC_COUNT FLAC files found"
+MP3_COUNT=$(find data/cv-corpus/pl/clips -name "*.mp3" | wc -l)
+echo "Data: $MP3_COUNT MP3 files found"
 echo ""
 
 # Clean old log for fresh run
@@ -63,7 +63,7 @@ python3 train_pipeline.py \
     --arch arch-a-v2b \
     --batch-size 8 \
     --real-data \
-    --data-dir data \
+    --data-dir data/cv-corpus \
     --eval-every 5000 \
     --save-every 5000 \
     --log-every 200 \

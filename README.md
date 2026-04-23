@@ -37,9 +37,15 @@ python3 train_vocos_vq.py --steps 50000 --fsq-dims 16 --fsq-levels 5
 
 ## Dataset
 
-Expects `data/master_manifest.jsonl` with entries:
+Uses the Common Voice corpus under `data/cv-corpus` by default. Build the manifest with:
+
+```bash
+python data_pipeline.py download data/cv-corpus
+```
+
+This creates `data/cv-corpus/master_manifest.jsonl` with repo-relative entries:
 ```json
-{"path": "path/to/audio.flac"}
+{"path": "data/cv-corpus/pl/clips/common_voice_pl_20547774.mp3"}
 ```
 
 ## Results

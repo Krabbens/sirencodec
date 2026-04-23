@@ -1,5 +1,7 @@
-"""MLX neural audio codec (SirenCodec) — modular training stack (submodules: ``config``, ``codec``, …)."""
+"""SirenCodec training modules.
 
-from . import train_mlx_main
+Legacy MLX modules remain importable when MLX is installed. The active trainer uses
+``train_cuda_main`` / ``torch_codec``.
+"""
 
-__all__ = ["train_mlx_main"]
+__all__ = ["train_cuda_main", "torch_codec"]

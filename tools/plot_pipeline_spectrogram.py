@@ -117,7 +117,7 @@ def main() -> None:
         help="train_pipeline checkpoint (codec + config)",
     )
     p.add_argument("--out", type=str, default="spectrogram_pipeline.png")
-    p.add_argument("--manifest", type=str, default="data/master_manifest.jsonl")
+    p.add_argument("--manifest", type=str, default="data/cv-corpus/master_manifest.jsonl")
     p.add_argument("--seconds", type=float, default=8.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--step", type=int, default=-1, help="curriculum step (default: ckpt step)")

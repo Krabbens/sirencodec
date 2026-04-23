@@ -678,7 +678,7 @@ class VocosVQConfig:
     commit_warmup_steps: int = 0  # No warmup — commit must constrain from step 0
 
     # Paths
-    data_dir: str = "data"
+    data_dir: str = "data/cv-corpus"
     log_tsv: str = "log_vocos_vq.tsv"
     results_tsv: str = "results_vocos_vq.tsv"
     vocos_pretrained: str = "charactr/vocos-mel-24khz"
@@ -1812,7 +1812,7 @@ def main():
     parser = argparse.ArgumentParser(description="Vocos VQ Codec Training with FSQ/RVQ")
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--data-dir", type=str, default="data/cv-corpus")
     parser.add_argument("--vocos-pretrained", type=str, default="charactr/vocos-mel-24khz")
 
     # RVQ options

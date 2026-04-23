@@ -7,8 +7,8 @@ time + **multi-scale** log-STFT loss + default **log-mel bin L1** only (``λ_mel
 
   uv sync --extra mlx
   uv run python tools/train_mlx.py --steps 500 --data-dir data/mlx_smoke
-  uv run python tools/train_mlx.py --librispeech --steps 200000   # ``data/librispeech/**/*.flac``
-  (``--librispeech`` or ``--data-dir``; LibriSpeech = ``.flac`` under ``data/librispeech/``)
+  uv run python tools/train_mlx.py --steps 200000   # defaults to ``data/cv-corpus/**/*.mp3``
+  (``--data-dir`` overrides the default local corpus path)
   PNG spectrograms (orig vs recon) every ``--spectrogram-every`` steps → ``--spectrogram-dir`` (default 1000).
   Waveform **cos** (mean cosine similarity, logged as %). Default ``--lambda-cos 0.15``; for **90%+** also try
   ``--cos-hinge 1.0 --cos-target 0.9`` (longer training helps).
@@ -1230,13 +1230,13 @@ def main() -> None:
         "--data-dir",
         type=str,
         default=None,
-        help="Folder with audio: recursive *.wav, *.flac, *.ogg (overrides default Libri path when set)",
+        help="Folder with audio: recursive *.wav, *.flac, *.ogg, *.mp3 (default: data/cv-corpus)",
     )
     p.add_argument(
         "--librispeech",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use repo data/librispeech (default on); --no-librispeech for synthetic data if no --data-dir",
+        help="Use default local corpus when no --data-dir is set; --no-librispeech for synthetic data",
     )
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument(
@@ -1298,9 +1298,8 @@ def main() -> None:
     p.set_defaults(**argparse_defaults_from_config())
     args = p.parse_args()
 
-    repo_root = Path(__file__).resolve().parents[2]
     if not args.data_dir and args.librispeech:
-        args.data_dir = str(repo_root / "data" / "librispeech")
+        args.data_dir = str(Path("data") / "cv-corpus")
 
     if args.spectrogram_seconds < 0:
         print("--spectrogram-seconds must be >= 0", file=sys.stderr)
@@ -1502,7 +1501,7 @@ def main() -> None:
         spectrogram_seconds=args.spectrogram_seconds,
         checkpoint_every=args.checkpoint_every,
         checkpoint_dir=args.checkpoint_dir,
-        data_dir=Path(args.data_dir).resolve() if args.data_dir else None,
+        data_dir=Path(args.data_dir) if args.data_dir else None,
         use_librispeech=bool(args.librispeech),
         lambda_mag_l1=args.lambda_mag_l1,
         activation=args.activation,
@@ -1714,20 +1713,19 @@ def main() -> None:
     if cfg.data_dir is not None:
         if args.librispeech and not cfg.data_dir.is_dir():
             print(
-                f"LibriSpeech dir missing: {cfg.data_dir}\n"
-                "  Expected e.g. data/librispeech/LibriSpeech/train-clean-100/.../*.flac\n"
-                "  See src/sirencodec/data_pipeline.py download_librispeech or place tarball under data/librispeech/",
+                f"Dataset dir missing: {cfg.data_dir}\n"
+                "  Expected e.g. data/cv-corpus/pl/clips/*.mp3",
                 file=sys.stderr,
             )
             sys.exit(1)
         audio_paths = _collect_audio_paths(cfg.data_dir)
         if not audio_paths:
             print(
-                f"No audio files (.wav/.flac/.ogg) under {cfg.data_dir}",
+                f"No audio files (.wav/.flac/.ogg/.mp3) under {cfg.data_dir}",
                 file=sys.stderr,
             )
             sys.exit(1)
-        tag = " (LibriSpeech)" if args.librispeech else ""
+        tag = " (default corpus)" if args.librispeech else ""
         io_bits: list[str] = []
         if cfg.load_audio_threads > 1:
             io_bits.append(f"io_threads={cfg.load_audio_threads}")

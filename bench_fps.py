@@ -34,7 +34,7 @@ def benchmark(cfg_dict):
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_fn)
     
     # Data
-    manifest = "data/master_manifest.jsonl"
+    manifest = "data/cv-corpus/master_manifest.jsonl"
     ds = AudioDataset(manifest, 24000)
     n = len(ds)
     train_ds, dev_ds = torch.utils.data.random_split(ds, [int(n*0.9), n-int(n*0.9)])
