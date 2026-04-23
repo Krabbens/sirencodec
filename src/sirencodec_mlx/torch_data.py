@@ -65,7 +65,14 @@ def _load_audio_row_np(paths: list[Path], n: int, need: int, sample_rate: int, o
     return row_i, (wav[:need] / (float(np.max(np.abs(wav))) + 1e-5)).astype(np.float32)
 
 
-def load_audio_batch_cpu(cfg: Config, paths: list[Path], offset: int) -> torch.Tensor:
+def load_audio_batch_cpu(
+    cfg: Config,
+    paths: list[Path],
+    offset: int,
+    executor: ThreadPoolExecutor | None = None,
+    *,
+    pin_memory: bool = False,
+) -> torch.Tensor:
     b, need, n = int(cfg.batch), int(cfg.segment), len(paths)
     th = max(0, int(cfg.load_audio_threads))
     out = np.zeros((b, need, 1), dtype=np.float32)
@@ -74,16 +81,37 @@ def load_audio_batch_cpu(cfg: Config, paths: list[Path], offset: int) -> torch.T
             ri, row = _load_audio_row_np(paths, n, need, cfg.sample_rate, offset, i)
             out[ri, :, 0] = row
     else:
-        with ThreadPoolExecutor(max_workers=min(th, b, 32)) as ex:
+        ex = executor
+        if ex is None:
+            with ThreadPoolExecutor(max_workers=min(th, b, 32)) as owned:
+                futs = [owned.submit(_load_audio_row_np, paths, n, need, cfg.sample_rate, offset, i) for i in range(b)]
+                for fut in futs:
+                    ri, row = fut.result()
+                    out[ri, :, 0] = row
+        else:
             futs = [ex.submit(_load_audio_row_np, paths, n, need, cfg.sample_rate, offset, i) for i in range(b)]
             for fut in futs:
                 ri, row = fut.result()
                 out[ri, :, 0] = row
-    return torch.from_numpy(out)
+    batch = torch.from_numpy(out)
+    if pin_memory:
+        try:
+            batch = batch.pin_memory()
+        except RuntimeError:
+            pass
+    return batch
 
 
-def load_audio_batch(cfg: Config, paths: list[Path], offset: int, device: torch.device) -> torch.Tensor:
-    return load_audio_batch_cpu(cfg, paths, offset).to(device, non_blocking=device.type == "cuda")
+def load_audio_batch(
+    cfg: Config,
+    paths: list[Path],
+    offset: int,
+    device: torch.device,
+    executor: ThreadPoolExecutor | None = None,
+    *,
+    pin_memory: bool = False,
+) -> torch.Tensor:
+    return load_audio_batch_cpu(cfg, paths, offset, executor, pin_memory=pin_memory).to(device, non_blocking=device.type == "cuda")
 
 
 def load_audio_viz_clip(cfg: Config, paths: list[Path], step: int, n_samples: int, device: torch.device) -> torch.Tensor:
