@@ -238,6 +238,10 @@ def print_run_header(
     print(_kv("schedule", f"epochs={resolved_epochs}  updates/epoch={steps_per_epoch}  total_updates={cfg.steps}", ansi, color="blue"))
     print(_kv("epoch", f"{epoch_items} samples  {samples_per_update} samples/update", ansi, color="blue"))
     print(_kv("logging", f"every {cfg.log_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.log_every)))} logs/epoch)", ansi, color="cyan"))
+    if cfg.spectrogram_every > 0:
+        print(_kv("viz", f"every {cfg.spectrogram_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.spectrogram_every)))}x/epoch) -> {cfg.spectrogram_dir}", ansi, color="cyan"))
+    else:
+        print(_kv("viz", "disabled", ansi, color="yellow"))
     print(_kv("batch", f"micro={cfg.batch}  accum={cfg.grad_accum_steps}  effective={cfg.batch * cfg.grad_accum_steps}", ansi))
     print(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi))
     print(_kv("stft", f"{len(cfg.stft_scales)} scales: {stft_nfo}", ansi, color="magenta"))
@@ -271,6 +275,8 @@ def print_step_log(
 ) -> None:
     epoch_now = (step + 1) / float(max(1, steps_per_epoch))
     iter_in_epoch = (step % max(1, steps_per_epoch)) + 1
+    epoch_index = min(resolved_epochs, (step // max(1, steps_per_epoch)) + 1)
+    epoch_pct = 100.0 * iter_in_epoch / float(max(1, steps_per_epoch))
     samples_seen_epoch = min(epoch_items, iter_in_epoch * samples_per_update)
     pct = 100.0 * (step + 1) / float(max(1, cfg.steps))
     ran_updates = max(1, step - start_step + 1)
@@ -285,7 +291,8 @@ def print_step_log(
     print(
         f"{ansi.c('cyan', 'update')} {ansi.c('bold', f'{step + 1}/{cfg.steps}')} "
         f"{ansi.c('dim', f'({pct:5.1f}%)')}  "
-        f"{ansi.c('cyan', 'epoch')} {ansi.c('bold', f'{epoch_now:.3f}/{resolved_epochs}')}  "
+        f"{ansi.c('cyan', 'epoch')} {ansi.c('bold', f'{epoch_index}/{resolved_epochs}')} "
+        f"{ansi.c('dim', f'({epoch_pct:5.1f}%)')}  "
         f"{ansi.c('cyan', 'iter')} {ansi.c('bold', f'{iter_in_epoch}/{steps_per_epoch}')}  "
         f"{ansi.c('cyan', 'seen')} {ansi.c('bold', f'{samples_seen_epoch}/{epoch_items}')}  "
         f"{ansi.c('cyan', 'time')} {ansi.c('bold', f'{ms_per_step:.1f} ms/step')}  "
@@ -597,7 +604,8 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--logs-per-epoch", type=int, default=20, help="How many progress logs to print per epoch")
     p.add_argument("--log-every", type=int, default=None, help="Deprecated override: exact optimizer-step logging interval")
     p.add_argument("--log-cos-ema-beta", type=float, default=c.log_cos_ema_beta)
-    p.add_argument("--spectrogram-every", type=int, default=c.spectrogram_every)
+    p.add_argument("--viz-per-epoch", type=int, default=2, help="Run reconstruction inference + PNG/WAV export N times per epoch")
+    p.add_argument("--spectrogram-every", type=int, default=None, help="Deprecated override: exact update interval for PNG/WAV export; 0 disables")
     p.add_argument("--spectrogram-dir", type=str, default=c.spectrogram_dir)
     p.add_argument("--save-audio", action=argparse.BooleanOptionalAction, default=c.save_audio)
     p.add_argument("--spectrogram-seconds", type=float, default=c.spectrogram_seconds)
@@ -691,7 +699,7 @@ def config_from_args(args) -> Config:
         lambda_complex_stft=args.lambda_complex_stft,
         log_every=int(args.log_every) if args.log_every is not None else Config().log_every,
         log_cos_ema_beta=args.log_cos_ema_beta,
-        spectrogram_every=args.spectrogram_every,
+        spectrogram_every=int(args.spectrogram_every) if args.spectrogram_every is not None else Config().spectrogram_every,
         spectrogram_dir=args.spectrogram_dir,
         save_audio=args.save_audio,
         spectrogram_seconds=args.spectrogram_seconds,
@@ -727,6 +735,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--logs-per-epoch must be >= 1")
     if args.log_every is not None and args.log_every < 1:
         raise SystemExit("--log-every must be >= 1")
+    if args.viz_per_epoch < 0:
+        raise SystemExit("--viz-per-epoch must be >= 0")
+    if args.spectrogram_every is not None and args.spectrogram_every < 0:
+        raise SystemExit("--spectrogram-every must be >= 0")
 
     audio_paths: list[Path] | None = None
     if cfg.data_dir is not None:
@@ -740,6 +752,12 @@ def main(argv: list[str] | None = None) -> None:
     cfg.steps = total_steps
     if args.log_every is None:
         cfg.log_every = max(1, math.ceil(steps_per_epoch / int(args.logs_per_epoch)))
+    if args.spectrogram_every is None:
+        cfg.spectrogram_every = (
+            max(1, math.ceil(steps_per_epoch / int(args.viz_per_epoch)))
+            if int(args.viz_per_epoch) > 0
+            else 0
+        )
 
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
@@ -968,7 +986,16 @@ def main(argv: list[str] | None = None) -> None:
                         rf.write("cycle\tphase\thypothesis\tarch_id\tbitrate_bps\tpesq_est\tvisqol_est\tlatency_ms\tparams_M\tverdict\tkey_finding\tnext_action\n")
                     rf.write(f"0\tcuda_train\tplan_arch\tcuda_cfg\t{nom_kbps * 1000.0:.1f}\tna\tna\tna\t{n_params / 1e6:.2f}\ttrain\tstep={step}\tcheckpoint\n")
 
-        if cfg.spectrogram_every > 0 and step > 0 and (step % cfg.spectrogram_every == 0 or step == cfg.steps - 1):
+        viz_due = (
+            cfg.spectrogram_every > 0
+            and step > 0
+            and (
+                (((step % max(1, steps_per_epoch)) + 1) % cfg.spectrogram_every == 0)
+                or epoch_boundary
+                or step == cfg.steps - 1
+            )
+        )
+        if viz_due:
             with torch.no_grad():
                 if cfg.spectrogram_seconds > 0:
                     n_viz = max(int(cfg.spectrogram_seconds * cfg.sample_rate), cfg.segment)
