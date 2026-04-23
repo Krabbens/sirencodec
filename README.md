@@ -32,7 +32,7 @@ uv run train --epochs 5 --fast --batch 256
 Resume:
 
 ```bash
-uv run train --continue mlx_runs/<run_dir>
+uv run train --continue experiments/<run_dir>
 ```
 
 ## Run artifacts
@@ -40,7 +40,7 @@ uv run train --continue mlx_runs/<run_dir>
 Each run creates:
 
 ```text
-mlx_runs/YYYYMMDD_HHMMSS/
+experiments/YYYYMMDD_HHMMSS/
   checkpoints/
   inference/
   log_mlx.tsv

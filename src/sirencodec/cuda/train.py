@@ -586,7 +586,7 @@ def _resolve_continue_checkpoint(value: str) -> Path:
 def _prepare_run_layout(cfg: Config, *, continue_ckpt: Path | None) -> dict[str, Path]:
     if continue_ckpt is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_dir = Path("mlx_runs")
+        base_dir = Path("experiments")
         run_dir = (base_dir / stamp).resolve()
         if run_dir.exists():
             idx = 2
