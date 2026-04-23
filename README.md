@@ -1,55 +1,71 @@
 # SirenCodec
 
-Neural audio codec using pretrained Vocos vocoder + RVQ/FSQ compression.
+CUDA-first neural audio codec training repo with an optional MLX backend kept for Apple Silicon experiments.
 
-## Architecture
+## Layout
 
-```
-Audio (24kHz) → MelSpectrogram (100-dim) → RVQ/FSQ → Vocos → Audio (24kHz)
-```
+- `src/sirencodec/cuda/` - active CUDA trainer, model, data pipeline and losses
+- `src/sirencodec/mlx/` - optional MLX backend
+- `src/sirencodec/` - shared config and utilities
+- `uv run train` - canonical training entrypoint
 
-- **Feature extractor**: 100-dim mel spectrogram at 24kHz
-- **Quantization**: RVQ (residual vector quantization) or FSQ (finite scalar quantization)
-- **Vocoder**: Pretrained Vocos (`charactr/vocos-mel-24khz`, 13.5M params, fine-tuned)
-
-## Bitrate Options
-
-| Config | Command | Bitrate |
-|--------|---------|---------|
-| 4 codebooks × 1024 @ 94fps | `--rvq --n-codebooks 4` | 3,750 bps |
-| 2 codebooks × 1024 @ 94fps | `--rvq --n-codebooks 2` | 1,875 bps |
-| **2 codebooks × 1024 @ 30fps** | `--rvq --n-codebooks 2 --mel-fps 30` | **600 bps** |
-
-## Usage
+## Local setup
 
 ```bash
-pip install vocos torch torchaudio
-
-# Train at 600 bps (2 codebooks, 30fps)
-python3 train_vocos_vq.py --steps 50000 --rvq --n-codebooks 2 --mel-fps 30
-
-# Train at 1,875 bps (2 codebooks, 94fps)
-python3 train_vocos_vq.py --steps 50000 --rvq --n-codebooks 2
-
-# Train with FSQ (experimental)
-python3 train_vocos_vq.py --steps 50000 --fsq-dims 16 --fsq-levels 5
+uv sync
 ```
 
-## Dataset
+## Train
 
-Uses the Common Voice corpus under `data/cv-corpus` by default. Build the manifest with:
+Synthetic smoke test:
 
 ```bash
-python data_pipeline.py download data/cv-corpus
+uv run train --epochs 1 --no-librispeech --fast
 ```
 
-This creates `data/cv-corpus/master_manifest.jsonl` with repo-relative entries:
-```json
-{"path": "data/cv-corpus/pl/clips/common_voice_pl_20547774.mp3"}
+Real corpus:
+
+```bash
+uv run train --epochs 5 --fast --batch 256
 ```
 
-## Results
+Resume:
 
-| Step | Bitrate | mel loss | SI-SDR | PESQ |
-|------|---------|----------|--------|------|
-| 10k | 3,750 bps (4×1024@94fps) | 0.34 | -28.5 dB | 2.15 |
+```bash
+uv run train --continue mlx_runs/<run_dir>
+```
+
+## Run artifacts
+
+Each run creates:
+
+```text
+mlx_runs/YYYYMMDD_HHMMSS/
+  checkpoints/
+  inference/
+  log_mlx.tsv
+  results.tsv
+  run_state.json
+  train_config.json
+```
+
+- numbered checkpoints: every 10 epochs by default
+- `checkpoints/latest.pt`: updated every epoch
+- inference exports: one subdirectory per step under `inference/XXXXXXXX/`
+
+## Docker
+
+Build:
+
+```bash
+docker build -t sirencodec .
+```
+
+Run with NVIDIA runtime:
+
+```bash
+docker run --rm --gpus all -it -v $(pwd)/data:/workspace/data sirencodec \
+  uv run train --epochs 5 --fast --batch 256
+```
+
+The container requires NVIDIA Container Toolkit on the host.
