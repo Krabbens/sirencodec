@@ -1,0 +1,18 @@
+{
+  "dataset": "train-clean-100",
+  "epochs": 5,
+  "fast": true,
+  "batch": 320,
+  "grad_accum_steps": 1,
+  "logs_per_epoch": 5,
+  "viz_per_epoch": 1,
+  "curriculum": true,
+  "lambda_adv": 0.0,
+  "curriculum_ae_frac": 0.15,
+  "curriculum_vq_ramp_frac": 0.35,
+  "curriculum_gan_frac": 0.0,
+  "loss_balancer": "grad",
+  "lambda_mel_l1": 0.03,
+  "lambda_time": 2.0,
+  "lambda_cos": 0.2
+}

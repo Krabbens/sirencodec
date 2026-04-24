@@ -3,16 +3,19 @@
 
 The command stays compatible with ``tools/train_mlx.py`` so existing scripts keep working:
 
-  uv run python tools/train_mlx.py --epochs 1 --no-librispeech --fast
-  uv run python tools/train_mlx.py --epochs 10 --librispeech
+  uv run python tools/train_mlx.py --epochs 1 --dataset cv-corpus --fast
+  uv run python tools/train_mlx.py --epochs 10 --dataset train-clean-100
+  uv run python tools/train_mlx.py --epochs 10 --dataset train-clean-360
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 import json
 import math
 import os
+import re
 import sys
 import time
 import wave
@@ -20,7 +23,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TextIO
 
 import numpy as np
 import torch
@@ -36,17 +39,65 @@ from ..config import (
     encoder_time_stride,
     mean_log_codebook_for_entropy,
     nominal_rvq_kbps,
+    parse_positive_int_list_arg,
     parse_codebook_sizes_arg,
     parse_stft_scales_arg,
     parse_stft_scale_weights_arg,
 )
-from .codec import CUDACodec, VectorQuantizerStage
-from .data import collect_audio_paths, load_audio_batch, load_audio_batch_cpu, load_audio_viz_clip, synth_batch, synth_viz_clip
+from .codec import CUDACodec, MultiScaleWaveDiscriminator, VectorQuantizerStage
+from .data import (
+    DATASET_CHOICES,
+    collect_audio_paths,
+    load_audio_batch,
+    load_audio_batch_cpu,
+    load_audio_viz_clip,
+    resolve_dataset_dir,
+    synth_batch,
+    synth_viz_clip,
+)
 from .losses import (
     mel_filterbank_torch,
     mel_log_bin_losses,
     multi_stft_all_terms,
 )
+from .semantic import FrozenSemanticTeacher
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_LOG_TXT_HANDLE: TextIO | None = None
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+
+def _emit(text: str = "", *, flush: bool = False, stderr: bool = False) -> None:
+    stream = sys.stderr if stderr else sys.stdout
+    print(text, file=stream, flush=flush)
+    if _LOG_TXT_HANDLE is not None:
+        _LOG_TXT_HANDLE.write(_strip_ansi(text) + "\n")
+        if flush:
+            _LOG_TXT_HANDLE.flush()
+
+
+def _open_text_log(path: Path) -> None:
+    global _LOG_TXT_HANDLE
+    if _LOG_TXT_HANDLE is not None:
+        try:
+            _LOG_TXT_HANDLE.close()
+        except Exception:
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _LOG_TXT_HANDLE = path.open("a", encoding="utf-8")
+
+
+def _close_text_log() -> None:
+    global _LOG_TXT_HANDLE
+    if _LOG_TXT_HANDLE is not None:
+        try:
+            _LOG_TXT_HANDLE.close()
+        finally:
+            _LOG_TXT_HANDLE = None
 
 
 def effective_lambda_stft(step: int, cfg: Config) -> float:
@@ -70,6 +121,7 @@ class CurriculumState(NamedTuple):
     vq_mult: float
     entropy_mult: float
     marginal_mult: float
+    gan_mult: float
     reset_enabled: bool
 
 
@@ -79,23 +131,30 @@ def _smooth01(x: float) -> float:
 
 
 def curriculum_state(step: int, cfg: Config) -> CurriculumState:
+    adv_enabled = float(getattr(cfg, "lambda_adv", 0.0)) > 0.0
     if not bool(getattr(cfg, "curriculum", False)):
-        return CurriculumState("off", bool(cfg.ae_only), 1.0, 1.0, 1.0, True)
+        return CurriculumState("off", bool(cfg.ae_only), 1.0, 1.0, 1.0, 1.0 if adv_enabled else 0.0, True)
     if cfg.ae_only:
-        return CurriculumState("ae", True, 0.0, 0.0, 0.0, False)
+        return CurriculumState("ae", True, 0.0, 0.0, 0.0, 0.0, False)
     total = max(1, int(cfg.steps))
     ae_steps = max(0, int(round(total * max(0.0, float(cfg.curriculum_ae_frac)))))
     ramp_steps = max(1, int(round(total * max(0.0, float(cfg.curriculum_vq_ramp_frac)))))
+    gan_steps = max(0, int(round(total * max(0.0, float(getattr(cfg, "curriculum_gan_frac", 0.0))))))
     if step < ae_steps:
-        return CurriculumState("A/AE", True, 0.0, 0.0, 0.0, False)
+        return CurriculumState("A/AE", True, 0.0, 0.0, 0.0, 0.0, False)
     if step < ae_steps + ramp_steps:
         t = _smooth01((step - ae_steps + 1) / float(ramp_steps))
         vq_start = min(1.0, max(0.0, float(cfg.curriculum_vq_start)))
         ent_start = min(1.0, max(0.0, float(cfg.curriculum_entropy_start)))
         vq_mult = vq_start + (1.0 - vq_start) * t
         ent_mult = ent_start + (1.0 - ent_start) * t
-        return CurriculumState("B/RVQ", False, vq_mult, ent_mult, ent_mult, False)
-    return CurriculumState("D/full", False, 1.0, 1.0, 1.0, True)
+        return CurriculumState("B/RVQ", False, vq_mult, ent_mult, ent_mult, 0.0, False)
+    if adv_enabled and gan_steps > 0 and step < ae_steps + ramp_steps + gan_steps:
+        t = _smooth01((step - ae_steps - ramp_steps + 1) / float(max(1, gan_steps)))
+        adv_start = min(1.0, max(0.0, float(getattr(cfg, "curriculum_adv_start", 0.0))))
+        gan_mult = adv_start + (1.0 - adv_start) * t
+        return CurriculumState("C/GAN", False, 1.0, 1.0, 1.0, gan_mult, True)
+    return CurriculumState("D/full", False, 1.0, 1.0, 1.0, 1.0 if adv_enabled else 0.0, True)
 
 
 def batch_mean_cosine(orig: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
@@ -137,7 +196,51 @@ def _balanced_reconstruction_loss(
     return total, scales
 
 
-def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, mel_fb: torch.Tensor | None):
+def _gan_generator_loss(discriminator: MultiScaleWaveDiscriminator, fake: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    fake_scores = discriminator(fake)
+    adv = fake.new_zeros(())
+    fake_mean = fake.new_zeros(())
+    for score in fake_scores:
+        adv = adv - score.mean()
+        fake_mean = fake_mean + score.mean()
+    n = float(max(1, len(fake_scores)))
+    return adv / n, fake_mean / n
+
+
+def _gan_discriminator_loss(
+    discriminator: MultiScaleWaveDiscriminator,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    real_scores = discriminator(real)
+    fake_scores = discriminator(fake)
+    loss = real.new_zeros(())
+    real_mean = real.new_zeros(())
+    fake_mean = real.new_zeros(())
+    for real_score, fake_score in zip(real_scores, fake_scores):
+        loss = loss + F.relu(1.0 - real_score).mean() + F.relu(1.0 + fake_score).mean()
+        real_mean = real_mean + real_score.mean()
+        fake_mean = fake_mean + fake_score.mean()
+    n = float(max(1, len(real_scores)))
+    return loss / n, real_mean / n, fake_mean / n
+
+
+def _set_requires_grad(module: torch.nn.Module | None, enabled: bool) -> None:
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad_(enabled)
+
+
+def compute_loss(
+    model: CUDACodec,
+    cfg: Config,
+    batch: torch.Tensor,
+    step: int,
+    mel_fb: torch.Tensor | None,
+    discriminator: MultiScaleWaveDiscriminator | None = None,
+    semantic_teacher: FrozenSemanticTeacher | None = None,
+):
     curr = curriculum_state(step, cfg)
     old_ae = bool(model.cfg.ae_only)
     model.cfg.ae_only = bool(curr.ae_only)
@@ -166,6 +269,17 @@ def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, 
     lm2 = batch.new_zeros(())
     if mel_fb is not None and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0):
         lm1, lm2 = mel_log_bin_losses(y_hat, batch, mel_fb, cfg.mel_n_fft, cfg.mel_hop)
+    l_sem = batch.new_zeros((), dtype=torch.float32)
+    sem_cos = 0.0
+    sem_items = 0
+    if semantic_teacher is not None and float(cfg.lambda_semantic) > 0 and (step % max(1, int(cfg.semantic_every)) == 0):
+        l_sem, sem_info = semantic_teacher.loss(batch, y_hat, max_items=cfg.semantic_batch_items)
+        sem_cos = sem_info.feature_cos
+        sem_items = sem_info.subset_items
+    adv_g = batch.new_zeros(())
+    disc_fake = batch.new_zeros(())
+    if discriminator is not None and float(cfg.lambda_adv) > 0 and curr.gan_mult > 0:
+        adv_g, disc_fake = _gan_generator_loss(discriminator, y_hat)
     recon_terms = [
         ("time", lt, float(cfg.lambda_time)),
         ("stft", ls, float(ls_w)),
@@ -176,7 +290,9 @@ def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, 
         ("complex", l_cx, float(ls_w * cfg.lambda_complex_stft)),
         ("mel_l1", lm1, float(ls_w * cfg.lambda_mel_l1)),
         ("mel_l2", lm2, float(ls_w * cfg.lambda_mel_l2)),
+        ("semantic", l_sem, float(cfg.lambda_semantic)),
         ("wave_cos", 1.0 - cos, float(cfg.lambda_cos)),
+        ("adv", adv_g, float(cfg.lambda_adv * curr.gan_mult)),
     ]
     recon_total, bal_scales = _balanced_reconstruction_loss(recon_terms, y_hat, cfg)
     total = recon_total
@@ -194,6 +310,7 @@ def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, 
         "phase_vq_mult": curr.vq_mult,
         "phase_entropy_mult": curr.entropy_mult,
         "phase_marginal_mult": curr.marginal_mult,
+        "phase_gan_mult": curr.gan_mult,
         "bal_scales": bal_scales,
         "recon_total": recon_total.detach(),
         "lt": lt.detach(),
@@ -205,10 +322,15 @@ def compute_loss(model: CUDACodec, cfg: Config, batch: torch.Tensor, step: int, 
         "l_cx": l_cx.detach(),
         "lm1": lm1.detach(),
         "lm2": lm2.detach(),
+        "l_sem": l_sem.detach(),
+        "semantic_cos": sem_cos,
+        "semantic_items": sem_items,
         "vq_l": vq_l.detach(),
         "ent_pos": ent_pos.detach(),
         "marg_ent": marg_ent.detach(),
         "cos_m": cos.detach(),
+        "adv_g": adv_g.detach(),
+        "disc_fake": disc_fake.detach(),
         "idx": [i.detach() for i in idx] if idx is not None else None,
     }
 
@@ -220,8 +342,154 @@ def _format_vq_util(indices: list[torch.Tensor] | None, sizes: tuple[int, ...]) 
     for i, idx in enumerate(indices):
         k = sizes[i] if i < len(sizes) else sizes[-1]
         n_unique = int(torch.unique(idx.detach()).numel())
-        parts.append(f"u{i}={n_unique}/{k}({100.0 * n_unique / max(1, k):.1f}%)")
+        parts.append(f"u{i}={n_unique}/{k}")
     return " ".join(parts)
+
+
+def _vq_usage_cells(util: str, n_codebooks: int, *, max_cols: int = 4) -> list[tuple[str, str]]:
+    cells: list[tuple[str, str]] = []
+    parsed: dict[str, str] = {}
+    for token in util.split():
+        if "=" not in token:
+            continue
+        label, value = token.split("=", 1)
+        parsed[label] = value
+    n = min(max_cols, max(1, int(n_codebooks)))
+    for i in range(n):
+        label = f"u{i}"
+        cells.append((label, parsed.get(label, "-")))
+    return cells
+
+
+def _append_training_log_csv(
+    path: Path,
+    *,
+    step: int,
+    cfg: Config,
+    steps_per_epoch: int,
+    resolved_epochs: int,
+    loss_value: float,
+    metrics: dict,
+    cos_pct: float,
+    ema_cos_pct: float | None,
+    util: str,
+    lr_log: float,
+    ms_per_step: float,
+    grad_norm: float,
+    samples_per_update: int,
+    epoch_items: int,
+    elapsed: float,
+    start_step: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    epoch_index = min(resolved_epochs, (step // max(1, steps_per_epoch)) + 1)
+    iter_in_epoch = (step % max(1, steps_per_epoch)) + 1
+    progress_pct = 100.0 * (step + 1) / float(max(1, cfg.steps))
+    epoch_pct = 100.0 * iter_in_epoch / float(max(1, steps_per_epoch))
+    samples_seen_epoch = min(epoch_items, iter_in_epoch * samples_per_update)
+    ran_updates = max(1, step - start_step + 1)
+    updates_per_s = ran_updates / max(elapsed, 1e-9)
+    samples_per_s = updates_per_s * samples_per_update
+    eta_s = max(0.0, (cfg.steps - step - 1) / max(updates_per_s, 1e-9))
+    epochs_per_h = updates_per_s / float(max(1, steps_per_epoch)) * 3600.0
+    seconds_per_epoch = float(max(1, steps_per_epoch)) / max(updates_per_s, 1e-9)
+    usage = dict(_vq_usage_cells(util, cfg.n_codebooks))
+    fieldnames = [
+        "step",
+        "total_steps",
+        "progress_pct",
+        "epoch",
+        "resolved_epochs",
+        "epoch_pct",
+        "iter",
+        "steps_per_epoch",
+        "seen",
+        "epoch_items",
+        "phase",
+        "ms_per_update",
+        "lr",
+        "updates_per_s",
+        "samples_per_s",
+        "eta_seconds",
+        "loss_total",
+        "l1",
+        "sem",
+        "stft",
+        "sc",
+        "cx",
+        "sgrad",
+        "stft_cos",
+        "mel",
+        "lin",
+        "cos_pct",
+        "ema_cos_pct",
+        "grad_norm",
+        "vq_loss",
+        "marg_ent",
+        "u0",
+        "u1",
+        "u2",
+        "u3",
+        "stft_weight",
+        "sem_weight",
+        "vq_weight",
+        "adv_weight",
+        "marginal_weight",
+        "balancer",
+        "epochs_per_hour",
+        "seconds_per_epoch",
+    ]
+    row = {
+        "step": int(step + 1),
+        "total_steps": int(cfg.steps),
+        "progress_pct": f"{progress_pct:.4f}",
+        "epoch": int(epoch_index),
+        "resolved_epochs": int(resolved_epochs),
+        "epoch_pct": f"{epoch_pct:.4f}",
+        "iter": int(iter_in_epoch),
+        "steps_per_epoch": int(steps_per_epoch),
+        "seen": int(samples_seen_epoch),
+        "epoch_items": int(epoch_items),
+        "phase": str(metrics.get("phase", "off")),
+        "ms_per_update": f"{ms_per_step:.4f}",
+        "lr": f"{lr_log:.8e}",
+        "updates_per_s": f"{updates_per_s:.6f}",
+        "samples_per_s": f"{samples_per_s:.6f}",
+        "eta_seconds": f"{eta_s:.3f}",
+        "loss_total": f"{loss_value:.6f}",
+        "l1": f"{float(metrics['lt'].float().item()):.6f}",
+        "sem": f"{float(torch.as_tensor(metrics.get('l_sem', 0.0)).float().item()):.6f}",
+        "stft": f"{float(metrics['ls'].float().item()):.6f}",
+        "sc": f"{float(metrics['l_sc'].float().item()):.6f}",
+        "cx": f"{float(metrics['l_cx'].float().item()):.6f}",
+        "sgrad": f"{float(metrics['lsg'].float().item()):.6f}",
+        "stft_cos": f"{float(metrics['lsc'].float().item()):.6f}",
+        "mel": f"{float(metrics['lm1'].float().item()):.6f}",
+        "lin": f"{float(metrics['l_lin'].float().item()):.6f}",
+        "cos_pct": f"{cos_pct:.4f}",
+        "ema_cos_pct": "" if ema_cos_pct is None else f"{ema_cos_pct:.4f}",
+        "grad_norm": f"{grad_norm:.6f}",
+        "vq_loss": f"{float(metrics['vq_l'].float().item()):.6f}",
+        "marg_ent": f"{float(metrics['marg_ent'].float().item()):.6f}",
+        "u0": usage.get("u0", "-"),
+        "u1": usage.get("u1", "-"),
+        "u2": usage.get("u2", "-"),
+        "u3": usage.get("u3", "-"),
+        "stft_weight": f"{effective_lambda_stft(step, cfg):.6f}",
+        "sem_weight": f"{cfg.lambda_semantic:.6f}",
+        "vq_weight": f"{cfg.lambda_vq * float(metrics.get('phase_vq_mult', 1.0)):.6f}",
+        "adv_weight": f"{cfg.lambda_adv * float(metrics.get('phase_gan_mult', 0.0)):.6f}",
+        "marginal_weight": f"{effective_lambda_marginal(step, cfg) * float(metrics.get('phase_marginal_mult', 1.0)):.6f}",
+        "balancer": cfg.loss_balancer,
+        "epochs_per_hour": f"{epochs_per_h:.6f}",
+        "seconds_per_epoch": f"{seconds_per_epoch:.6f}",
+    }
+    need_header = not path.is_file()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if need_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 class _Ansi:
@@ -230,12 +498,14 @@ class _Ansi:
         self.reset = "\033[0m" if enabled else ""
         self.bold = "\033[1m" if enabled else ""
         self.dim = "\033[2m" if enabled else ""
+        self.gray = "\033[90m" if enabled else ""
         self.red = "\033[31m" if enabled else ""
         self.green = "\033[32m" if enabled else ""
         self.yellow = "\033[33m" if enabled else ""
         self.blue = "\033[34m" if enabled else ""
         self.magenta = "\033[35m" if enabled else ""
         self.cyan = "\033[36m" if enabled else ""
+        self.white = "\033[37m" if enabled else ""
 
     def c(self, color: str, text: object) -> str:
         return f"{getattr(self, color)}{text}{self.reset}"
@@ -255,7 +525,59 @@ def _kv(label: str, value: object, ansi: _Ansi, *, color: str = "bold", width: i
 
 
 def _bar(ansi: _Ansi) -> str:
-    return ansi.c("dim", "-" * 72)
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    ch = "─" if "utf" in enc else "="
+    return ansi.c("gray", ch * 156)
+
+
+def _section(label: str, ansi: _Ansi, *, color: str = "cyan", width: int = 10) -> str:
+    return ansi.c(color, label.ljust(width))
+
+
+def _stat(
+    label: str,
+    value: object,
+    ansi: _Ansi,
+    *,
+    label_color: str = "gray",
+    value_color: str = "white",
+) -> str:
+    return f"{ansi.c(label_color, label)} {ansi.c(value_color, value)}"
+
+
+def _join_stats(parts: list[str]) -> str:
+    return "  ".join(p for p in parts if p)
+
+
+def _stat_cell(
+    label: str,
+    value: object,
+    ansi: _Ansi,
+    *,
+    label_color: str = "gray",
+    value_color: str = "white",
+    label_width: int = 10,
+    value_width: int = 12,
+    total_width: int | None = None,
+    gap: int = 1,
+) -> str:
+    text = (
+        f"{ansi.c(label_color, f'{label:>{label_width}}')}"
+        f"{' ' * gap}"
+        f"{ansi.c(value_color, f'{str(value):<{value_width}}')}"
+    )
+    if total_width is not None:
+        pad = max(0, total_width - (label_width + gap + value_width))
+        text = text + (" " * pad)
+    return text
+
+
+def _row_line(section: str, color: str, cells: list[str], ansi: _Ansi) -> str:
+    return f"{_section(section, ansi, color=color)}  " + "".join(cells)
+
+
+def _blank_cell(width: int = 24) -> str:
+    return " " * width
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -291,34 +613,51 @@ def print_run_header(
 ) -> None:
     samples_per_update = cfg.batch * cfg.grad_accum_steps
     epoch_items = len(audio_paths) if audio_paths is not None else steps_per_epoch * samples_per_update
-    print()
-    print(ansi.c("cyan", ansi.bold + "SirenCodec CUDA training" + ansi.reset))
-    print(_bar(ansi))
-    print(_kv("device", f"{device}" + (f" ({device_name})" if device_name else ""), ansi, color="green" if device.type == "cuda" else "yellow"))
+    _emit("")
+    _emit(f"{ansi.c('bold', 'SirenCodec')} {ansi.c('cyan', 'CUDA training')}")
+    _emit(_bar(ansi))
+    _emit(_kv("device", f"{device}" + (f" ({device_name})" if device_name else ""), ansi, color="green" if device.type == "cuda" else "yellow"))
     if audio_paths is not None:
-        print(_kv("data", f"{len(audio_paths)} audio files from {cfg.data_dir}", ansi, color="cyan"))
+        dataset_label = cfg.dataset or "custom"
+        _emit(_kv("data", f"{len(audio_paths)} audio files from {dataset_label} ({cfg.data_dir})", ansi, color="white"))
     else:
-        print(_kv("data", f"synthetic sine/noise ({epoch_source})", ansi, color="yellow"))
-    print(_kv("schedule", f"epochs={resolved_epochs}  updates/epoch={steps_per_epoch}  total_updates={cfg.steps}", ansi, color="blue"))
-    print(_kv("epoch", f"{epoch_items} samples  {samples_per_update} samples/update", ansi, color="blue"))
-    print(_kv("logging", f"every {cfg.log_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.log_every)))} logs/epoch)", ansi, color="cyan"))
-    print(_kv("run", str(run_dir), ansi, color="green"))
+        _emit(_kv("data", f"synthetic sine/noise ({epoch_source})", ansi, color="yellow"))
+    _emit(_kv("schedule", f"epochs={resolved_epochs}  updates/epoch={steps_per_epoch}  total_updates={cfg.steps}", ansi, color="white"))
+    _emit(_kv("epoch", f"{epoch_items} samples  {samples_per_update} samples/update", ansi, color="white"))
+    _emit(_kv("logging", f"every {cfg.log_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.log_every)))} logs/epoch)", ansi, color="white"))
+    _emit(_kv("run", str(run_dir), ansi, color="green"))
     if cfg.spectrogram_every > 0:
-        print(_kv("viz", f"every {cfg.spectrogram_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.spectrogram_every)))}x/epoch) -> {cfg.spectrogram_dir}", ansi, color="cyan"))
+        _emit(_kv("viz", f"every {cfg.spectrogram_every} updates (~{max(1, math.ceil(steps_per_epoch / max(1, cfg.spectrogram_every)))}x/epoch) -> {cfg.spectrogram_dir}", ansi, color="white"))
     else:
-        print(_kv("viz", "disabled", ansi, color="yellow"))
-    print(_kv("batch", f"micro={cfg.batch}  accum={cfg.grad_accum_steps}  effective={cfg.batch * cfg.grad_accum_steps}", ansi))
+        _emit(_kv("viz", "disabled", ansi, color="yellow"))
+    _emit(_kv("batch", f"micro={cfg.batch}  accum={cfg.grad_accum_steps}  effective={cfg.batch * cfg.grad_accum_steps}", ansi, color="white"))
     if audio_paths is not None:
-        print(_kv("prefetch", f"threads={cfg.load_audio_threads}  batches={cfg.prefetch_audio_batches if cfg.prefetch_audio else 0}", ansi, color="cyan"))
-    print(_kv("training", f"balancer={cfg.loss_balancer}  curriculum={'on' if cfg.curriculum else 'off'}", ansi, color="cyan"))
-    print(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi))
-    print(_kv("stft", f"{len(cfg.stft_scales)} scales: {stft_nfo}", ansi, color="magenta"))
-    print(_kv("rvq", f"{cfg.n_codebooks} stages  K={'x'.join(str(k) for k in cb_sizes)}  cosine={cfg.vq_cosine}", ansi, color="magenta"))
-    print(_bar(ansi), flush=True)
+        _emit(_kv("prefetch", f"threads={cfg.load_audio_threads}  batches={cfg.prefetch_audio_batches if cfg.prefetch_audio else 0}", ansi, color="white"))
+    _emit(
+        _kv(
+                "training",
+                f"balancer={cfg.loss_balancer}  curriculum={'on' if cfg.curriculum else 'off'}  sem={cfg.lambda_semantic:.3f}  adv={cfg.lambda_adv:.3f}",
+            ansi,
+            color="white",
+        )
+    )
+    if cfg.lambda_semantic > 0:
+        _emit(
+            _kv(
+                "semantic",
+                f"{cfg.semantic_model}  layers={','.join(str(x) for x in cfg.semantic_layers)}  subset={cfg.semantic_batch_items}  every={cfg.semantic_every}",
+                ansi,
+                color="white",
+            )
+        )
+    _emit(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi, color="white"))
+    _emit(_kv("stft", f"{len(cfg.stft_scales)} scales: {stft_nfo}", ansi, color="white"))
+    _emit(_kv("rvq", f"{cfg.n_codebooks} stages  K={'x'.join(str(k) for k in cb_sizes)}  cosine={cfg.vq_cosine}", ansi, color="white"))
+    sys.stdout.flush()
 
 
 def print_event(ansi: _Ansi, kind: str, message: str, *, color: str = "cyan") -> None:
-    print(f"{ansi.c(color, '[' + kind + ']')} {message}", flush=True)
+    _emit(f"{ansi.c('gray', '[' + kind + ']')} {ansi.c(color, message)}", flush=True)
 
 
 class _ProfileStats:
@@ -392,6 +731,7 @@ def print_step_log(
     elapsed: float,
     start_step: int,
 ) -> None:
+    cell_width = 24
     epoch_now = (step + 1) / float(max(1, steps_per_epoch))
     iter_in_epoch = (step % max(1, steps_per_epoch)) + 1
     epoch_index = min(resolved_epochs, (step // max(1, steps_per_epoch)) + 1)
@@ -406,61 +746,143 @@ def print_step_log(
     remaining_updates = max(0, cfg.steps - step - 1)
     eta_s = remaining_updates / max(updates_per_s, 1e-9)
     cos_color = "green" if cos_pct >= 50.0 else ("yellow" if cos_pct >= 0.0 else "red")
-    print()
-    print(
-        f"{ansi.c('cyan', 'update')} {ansi.c('bold', f'{step + 1}/{cfg.steps}')} "
-        f"{ansi.c('dim', f'({pct:5.1f}%)')}  "
-        f"{ansi.c('cyan', 'epoch')} {ansi.c('bold', f'{epoch_index}/{resolved_epochs}')} "
-        f"{ansi.c('dim', f'({epoch_pct:5.1f}%)')}  "
-        f"{ansi.c('cyan', 'iter')} {ansi.c('bold', f'{iter_in_epoch}/{steps_per_epoch}')}  "
-        f"{ansi.c('cyan', 'seen')} {ansi.c('bold', f'{samples_seen_epoch}/{epoch_items}')}  "
-        f"{ansi.c('cyan', 'time')} {ansi.c('bold', f'{ms_per_step:.1f} ms/update')}  "
-        f"{ansi.c('cyan', 'lr')} {ansi.c('bold', f'{lr_log:.2e}')}"
+    phase = str(metrics.get("phase", "off"))
+    total_color = "green" if loss_value < 3.0 else ("yellow" if loss_value < 8.0 else "red")
+    grad_color = "green" if grad_norm < 50 else ("yellow" if grad_norm < 200 else "red")
+    ema_text = f"{ema_cos_pct:.1f}%" if ema_cos_pct is not None else "-"
+    usage_cells = _vq_usage_cells(util, cfg.n_codebooks)
+
+    def row(section: str, color: str, cells: list[str]) -> None:
+        _emit(_row_line(section, color, cells, ansi))
+
+    _emit("")
+    _emit(_bar(ansi))
+    row(
+        "status",
+        "cyan",
+        [
+            _stat_cell("update", f"{step + 1}/{cfg.steps}", ansi, value_color="bold", label_width=10, value_width=13, total_width=cell_width),
+            _stat_cell("progress", f"{pct:5.1f}%", ansi, label_width=10, value_width=13, total_width=cell_width),
+            _stat_cell("epoch", f"{epoch_index}/{resolved_epochs}", ansi, value_color="bold", label_width=10, value_width=13, total_width=cell_width),
+            _stat_cell("epoch %", f"{epoch_pct:5.1f}%", ansi, label_width=10, value_width=13, total_width=cell_width),
+            _stat_cell("iter", f"{iter_in_epoch}/{steps_per_epoch}", ansi, value_color="bold", label_width=10, value_width=13, total_width=cell_width),
+            _stat_cell("seen", f"{samples_seen_epoch}/{epoch_items}", ansi, value_color="bold", label_width=10, value_width=13, total_width=cell_width),
+        ],
     )
-    print(
-        f"  {ansi.c('blue', 'losses')}  "
-        f"total {ansi.c('bold', f'{loss_value:.5f}')}  "
-        f"L1 {float(metrics['lt'].float().item()):.4f}"
+    row(
+        "runtime",
+        "cyan",
+        [
+            _stat_cell("phase", phase, ansi, value_color="cyan", value_width=12, total_width=cell_width),
+            _stat_cell("time", f"{ms_per_step:.1f} ms", ansi, value_width=10, total_width=cell_width),
+            _stat_cell("lr", f"{lr_log:.2e}", ansi, value_width=10, total_width=cell_width),
+            _stat_cell("upd/s", f"{updates_per_s:.2f}", ansi, value_width=8, total_width=cell_width),
+            _stat_cell("samples/s", f"{samples_per_s:.0f}", ansi, value_width=8, total_width=cell_width),
+            _stat_cell("ETA", _fmt_duration(eta_s), ansi, value_width=8, total_width=cell_width),
+        ],
     )
-    print(
-        f"  {ansi.c('blue', 'spectral')} "
-        f"stft {float(metrics['ls'].float().item()):.4f}  "
-        f"sgrad {float(metrics['lsg'].float().item()):.4f}  "
-        f"stft_cos {float(metrics['lsc'].float().item()):.4f}  "
-        f"sc {float(metrics['l_sc'].float().item()):.4f}  "
-        f"cx {float(metrics['l_cx'].float().item()):.4f}  "
-        f"mel {float(metrics['lm1'].float().item()):.4f}  "
-        f"lin {float(metrics['l_lin'].float().item()):.4f}"
+    row(
+        "loss",
+        "white",
+        [
+            _stat_cell("total", f"{loss_value:.5f}", ansi, value_color=total_color, value_width=10, total_width=cell_width),
+            _stat_cell("l1", f"{float(metrics['lt'].float().item()):.4f}", ansi, value_width=10, total_width=cell_width),
+            _stat_cell("sem", f"{float(torch.as_tensor(metrics.get('l_sem', 0.0)).float().item()):.4f}", ansi, value_width=10, total_width=cell_width),
+            _blank_cell(cell_width),
+            _blank_cell(cell_width),
+            _blank_cell(cell_width),
+        ],
     )
-    ema = f"  ema {ema_cos_pct:.1f}%" if ema_cos_pct is not None else ""
-    print(
-        f"  {ansi.c('green', 'signal')}  "
-        f"cos {ansi.c(cos_color, f'{cos_pct:.1f}%')}{ema}  "
-        f"grad {grad_norm:.3f}"
+    row(
+        "spectral",
+        "magenta",
+        [
+            _stat_cell("stft", f"{float(metrics['ls'].float().item()):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("sc", f"{float(metrics['l_sc'].float().item()):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("cx", f"{float(metrics['l_cx'].float().item()):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("sgrad", f"{float(metrics['lsg'].float().item()):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("stft_cos", f"{float(metrics['lsc'].float().item()):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("mel", f"{float(metrics['lm1'].float().item()):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("lin", f"{float(metrics['l_lin'].float().item()):.4f}", ansi, value_width=9, total_width=cell_width),
+        ],
     )
-    print(
-        f"  {ansi.c('magenta', 'vq')}      "
-        f"loss {float(metrics['vq_l'].float().item()):.4g}  "
-        f"marg_ent {float(metrics['marg_ent'].float().item()):.4f}  "
-        f"{util}"
+    row(
+        "signal",
+        "green",
+        [
+            _stat_cell("cos", f"{cos_pct:.1f}%", ansi, value_color=cos_color, value_width=9, total_width=cell_width),
+            _stat_cell("ema", ema_text, ansi, value_width=9, total_width=cell_width),
+            _stat_cell("grad", f"{grad_norm:.3f}", ansi, value_color=grad_color, value_width=10, total_width=cell_width),
+            _blank_cell(cell_width),
+            _blank_cell(cell_width),
+            _blank_cell(cell_width),
+        ],
     )
-    print(
-        f"  {ansi.c('yellow', 'weights')} "
-        f"stft {effective_lambda_stft(step, cfg):.4f}  "
-        f"vq {cfg.lambda_vq * float(metrics.get('phase_vq_mult', 1.0)):.4f}  "
-        f"marginal {effective_lambda_marginal(step, cfg) * float(metrics.get('phase_marginal_mult', 1.0)):.4f}  "
-        f"phase {metrics.get('phase', 'off')}  "
-        f"bal {cfg.loss_balancer}",
+    row(
+        "vq",
+        "yellow",
+        [
+            _stat_cell("loss", f"{float(metrics['vq_l'].float().item()):.4g}", ansi, value_width=10, total_width=cell_width),
+            _stat_cell("marg_ent", f"{float(metrics['marg_ent'].float().item()):.4f}", ansi, value_width=10, total_width=cell_width),
+            *[
+                _stat_cell(label, value, ansi, value_width=14, total_width=cell_width, label_width=10)
+                for label, value in usage_cells
+            ],
+            *[_blank_cell(cell_width) for _ in range(max(0, 6 - (2 + len(usage_cells))))],
+        ],
     )
-    print(
-        f"  {ansi.c('cyan', 'throughput')} "
-        f"{updates_per_s:.2f} upd/s  "
-        f"{samples_per_s:.0f} samples/s  "
-        f"{epochs_per_h:.2f} epoch/h  "
-        f"{_fmt_duration(s_per_epoch)}/epoch  "
-        f"ETA {_fmt_duration(eta_s)}",
-        flush=True,
+    row(
+        "weights",
+        "cyan",
+        [
+            _stat_cell("stft", f"{effective_lambda_stft(step, cfg):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("sem", f"{cfg.lambda_semantic:.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("vq", f"{cfg.lambda_vq * float(metrics.get('phase_vq_mult', 1.0)):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("adv", f"{cfg.lambda_adv * float(metrics.get('phase_gan_mult', 0.0)):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("marginal", f"{effective_lambda_marginal(step, cfg) * float(metrics.get('phase_marginal_mult', 1.0)):.4f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("bal", cfg.loss_balancer, ansi, value_color="cyan", value_width=9, total_width=cell_width),
+        ],
     )
+    if float(cfg.lambda_semantic) > 0:
+        row(
+            "ssl",
+            "green",
+            [
+                _stat_cell("cos", f"{100.0 * float(metrics.get('semantic_cos', 0.0)):.1f}%", ansi, value_width=9, total_width=cell_width),
+                _stat_cell("subset", f"{int(metrics.get('semantic_items', 0))}", ansi, value_width=9, total_width=cell_width),
+                _blank_cell(cell_width),
+                _blank_cell(cell_width),
+                _blank_cell(cell_width),
+                _blank_cell(cell_width),
+            ],
+        )
+    if float(metrics.get("phase_gan_mult", 0.0)) > 0 or float(cfg.lambda_adv) > 0:
+        row(
+            "gan",
+            "red",
+            [
+                _stat_cell("g", f"{float(torch.as_tensor(metrics.get('adv_g', 0.0)).float().item()):.4f}", ansi, value_color="red", value_width=9, total_width=cell_width),
+                _stat_cell("d_fake", f"{float(torch.as_tensor(metrics.get('disc_fake', 0.0)).float().item()):.4f}", ansi, value_color="red", value_width=9, total_width=cell_width),
+                _blank_cell(cell_width),
+                _blank_cell(cell_width),
+                _blank_cell(cell_width),
+                _blank_cell(cell_width),
+            ],
+        )
+    row(
+        "speed",
+        "cyan",
+        [
+            _stat_cell("epoch/h", f"{epochs_per_h:.2f}", ansi, value_width=9, total_width=cell_width),
+            _stat_cell("epoch", _fmt_duration(s_per_epoch), ansi, value_width=9, total_width=cell_width),
+            _blank_cell(cell_width),
+            _blank_cell(cell_width),
+            _blank_cell(cell_width),
+            _blank_cell(cell_width),
+        ],
+    )
+    sys.stdout.flush()
+    _emit("")
 
 
 def _count_params(model: torch.nn.Module) -> int:
@@ -602,6 +1024,8 @@ def _prepare_run_layout(cfg: Config, *, continue_ckpt: Path | None) -> dict[str,
         "run_dir": run_dir,
         "checkpoints": run_dir / "checkpoints",
         "inference": run_dir / "inference",
+        "logs_txt": run_dir / "logs.txt",
+        "logs_csv": run_dir / "logs.csv",
         "log_tsv": run_dir / "log_mlx.tsv",
         "results_tsv": run_dir / "results.tsv",
         "meta_json": run_dir / "train_config.json",
@@ -635,6 +1059,8 @@ def _write_run_metadata(
         "paths": {
             "checkpoints": str(layout["checkpoints"]),
             "inference": str(layout["inference"]),
+            "logs_txt": str(layout["logs_txt"]),
+            "logs_csv": str(layout["logs_csv"]),
             "log_mlx_tsv": str(layout["log_tsv"]),
             "results_tsv": str(layout["results_tsv"]),
         },
@@ -841,12 +1267,38 @@ def _add_bool(p: argparse.ArgumentParser, name: str, default: bool, help: str = 
     p.add_argument(name, action=argparse.BooleanOptionalAction, default=default, help=help)
 
 
+def _load_json_config_defaults(path_str: str) -> tuple[dict[str, object], Path]:
+    path = Path(path_str).expanduser().resolve()
+    if not path.is_file():
+        raise SystemExit(f"--config file not found: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--config invalid JSON at {path}: {e}") from e
+    if not isinstance(raw, dict):
+        raise SystemExit(f"--config root must be a JSON object: {path}")
+    if "train" in raw:
+        nested = raw["train"]
+        if not isinstance(nested, dict):
+            raise SystemExit(f"--config key 'train' must be a JSON object: {path}")
+        raw = nested
+    return dict(raw), path
+
+
 def parse_args(argv: list[str] | None = None):
     c = Config()
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None)
+    pre_args, _ = pre.parse_known_args(argv)
+    json_defaults: dict[str, object] = {}
+    config_path: Path | None = None
+    if pre_args.config:
+        json_defaults, config_path = _load_json_config_defaults(pre_args.config)
     p = argparse.ArgumentParser(description="CUDA Karpathy-style audio codec trainer (former train_mlx CLI)")
+    p.add_argument("--config", type=str, default=None if config_path is None else str(config_path), help="Load training defaults from JSON; CLI flags override file values")
     p.add_argument("--epochs", type=int, default=1, help="Full passes over the corpus; steps = ceil(files/(batch*accum))*epochs")
     p.add_argument("--steps", type=int, default=None, help="Deprecated compatibility override: train exact optimizer steps")
-    p.add_argument("--synthetic-steps-per-epoch", type=int, default=1000, help="Epoch size when using --no-librispeech synthetic batches")
+    p.add_argument("--synthetic-steps-per-epoch", type=int, default=1000, help="Internal synthetic fallback epoch size; not used for normal dataset training")
     p.add_argument("--batch", type=int, default=c.batch)
     p.add_argument("--grad-accum-steps", type=int, default=c.grad_accum_steps)
     p.add_argument("--load-audio-threads", type=int, default=c.load_audio_threads)
@@ -912,11 +1364,20 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--loss-balancer", choices=["off", "grad"], default=c.loss_balancer, help="Balance reconstruction losses by gradient ratio wrt y_hat")
     p.add_argument("--loss-balancer-eps", type=float, default=c.loss_balancer_eps)
     p.add_argument("--loss-balancer-max-scale", type=float, default=c.loss_balancer_max_scale)
-    _add_bool(p, "--curriculum", c.curriculum, "A=AE warmup, B=RVQ ramp, D=full fine-tune; no GAN phase")
+    p.add_argument("--lambda-semantic", type=float, default=c.lambda_semantic, help="Frozen SSL semantic feature loss weight")
+    p.add_argument("--semantic-model", type=str, default=c.semantic_model, help="torchaudio.pipelines bundle name, e.g. HUBERT_BASE")
+    p.add_argument("--semantic-layers", type=str, default=",".join(str(x) for x in c.semantic_layers), help="1-based SSL feature layers, comma-separated")
+    p.add_argument("--semantic-batch-items", type=int, default=c.semantic_batch_items, help="How many batch items per update go through the SSL teacher")
+    p.add_argument("--semantic-every", type=int, default=c.semantic_every, help="Apply semantic loss every N optimizer updates")
+    p.add_argument("--lambda-adv", type=float, default=c.lambda_adv, help="Waveform GAN generator weight; >0 enables discriminator training")
+    p.add_argument("--disc-lr", type=float, default=c.disc_lr, help="Discriminator AdamW learning rate")
+    _add_bool(p, "--curriculum", c.curriculum, "A=AE warmup, B=RVQ ramp, optional C=GAN ramp, D=full fine-tune")
     p.add_argument("--curriculum-ae-frac", type=float, default=c.curriculum_ae_frac)
     p.add_argument("--curriculum-vq-ramp-frac", type=float, default=c.curriculum_vq_ramp_frac)
+    p.add_argument("--curriculum-gan-frac", type=float, default=c.curriculum_gan_frac)
     p.add_argument("--curriculum-vq-start", type=float, default=c.curriculum_vq_start)
     p.add_argument("--curriculum-entropy-start", type=float, default=c.curriculum_entropy_start)
+    p.add_argument("--curriculum-adv-start", type=float, default=c.curriculum_adv_start)
     p.add_argument("--activation", choices=["gelu", "snake", "snake_beta"], default=c.activation)
     p.add_argument("--rvq-code-dim", type=int, default=c.rvq_code_dim)
     p.add_argument("--vq-ema-decay", type=float, default=c.vq_ema_decay)
@@ -932,9 +1393,11 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--log-mlx-tsv", type=str, default=c.log_mlx_tsv)
     p.add_argument("--results-tsv", type=str, default=c.results_tsv_path)
     p.add_argument("--adaptive-mode", choices=["none", "bwe_stub", "fps_stub"], default=c.adaptive_mode)
-    p.add_argument("--data-dir", type=str, default=None)
-    p.add_argument("--librispeech", action=argparse.BooleanOptionalAction, default=c.use_librispeech)
-    p.add_argument("--logs-per-epoch", type=int, default=20, help="How many progress logs to print per epoch")
+    p.add_argument("--dataset", choices=DATASET_CHOICES, default=None, help="Training dataset under ./data")
+    p.add_argument("--data-dir", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--librispeech", dest="legacy_librispeech", action="store_true", default=False, help=argparse.SUPPRESS)
+    p.add_argument("--no-librispeech", dest="legacy_no_librispeech", action="store_true", default=False, help=argparse.SUPPRESS)
+    p.add_argument("--logs-per-epoch", type=int, default=5, help="How many progress logs to print per epoch")
     p.add_argument("--log-every", type=int, default=None, help="Deprecated override: exact optimizer-step logging interval")
     p.add_argument("--log-cos-ema-beta", type=float, default=c.log_cos_ema_beta)
     p.add_argument("--viz-per-epoch", type=int, default=1, help="Run reconstruction inference + PNG/WAV export N times per epoch")
@@ -948,6 +1411,12 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--resume", nargs="?", const="__latest__", default=None, help=argparse.SUPPRESS)
     p.add_argument("--profile", action="store_true")
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="ANSI colors in logs")
+    valid_dests = {a.dest for a in p._actions}
+    unknown_keys = sorted(str(k) for k in json_defaults.keys() if str(k) not in valid_dests)
+    if unknown_keys:
+        raise SystemExit(f"--config has unknown keys: {', '.join(unknown_keys)}")
+    if json_defaults:
+        p.set_defaults(**json_defaults)
     args, unknown = p.parse_known_args(argv)
     if unknown:
         print(f"[warn] ignored old/unknown train_mlx args: {' '.join(unknown)}", file=sys.stderr)
@@ -955,8 +1424,6 @@ def parse_args(argv: list[str] | None = None):
 
 
 def config_from_args(args) -> Config:
-    if not args.data_dir and args.librispeech:
-        args.data_dir = str(Path("data") / "cv-corpus")
     try:
         enc_ch = tuple(int(x.strip()) for x in args.enc_channels.split(",") if x.strip())
     except ValueError:
@@ -964,13 +1431,21 @@ def config_from_args(args) -> Config:
     if len(enc_ch) < 1:
         raise SystemExit("--enc-channels must list at least one width")
     codebook_sizes = parse_codebook_sizes_arg(args.codebook_sizes) if args.codebook_sizes else None
+    try:
+        semantic_layers = parse_positive_int_list_arg(args.semantic_layers)
+    except ValueError as e:
+        raise SystemExit(f"--semantic-layers: {e}")
     if codebook_sizes is not None and len(codebook_sizes) != args.n_codebooks:
         raise SystemExit(f"--codebook-sizes: expected {args.n_codebooks} values, got {len(codebook_sizes)}")
     stft_scales = DEFAULT_STFT_SCALES if args.fast else parse_stft_scales_arg(args.stft_scales)
     stft_weights = parse_stft_scale_weights_arg(args.stft_scale_weights) if args.stft_scale_weights else None
     if stft_weights is not None and len(stft_weights) != len(stft_scales):
         raise SystemExit("--stft-scale-weights must have one value per STFT scale")
+    if args.dataset is None:
+        raise SystemExit(f"--dataset is required ({', '.join(DATASET_CHOICES)})")
+    data_dir = resolve_dataset_dir(args.dataset)
     return Config(
+        dataset=args.dataset,
         steps=int(args.steps) if args.steps is not None else 0,
         batch=args.batch,
         load_audio_threads=args.load_audio_threads,
@@ -1033,11 +1508,20 @@ def config_from_args(args) -> Config:
         loss_balancer=args.loss_balancer,
         loss_balancer_eps=args.loss_balancer_eps,
         loss_balancer_max_scale=args.loss_balancer_max_scale,
+        lambda_semantic=args.lambda_semantic,
+        semantic_model=args.semantic_model,
+        semantic_layers=semantic_layers,
+        semantic_batch_items=args.semantic_batch_items,
+        semantic_every=args.semantic_every,
+        lambda_adv=args.lambda_adv,
+        disc_lr=args.disc_lr,
         curriculum=bool(args.curriculum),
         curriculum_ae_frac=args.curriculum_ae_frac,
         curriculum_vq_ramp_frac=args.curriculum_vq_ramp_frac,
+        curriculum_gan_frac=args.curriculum_gan_frac,
         curriculum_vq_start=args.curriculum_vq_start,
         curriculum_entropy_start=args.curriculum_entropy_start,
+        curriculum_adv_start=args.curriculum_adv_start,
         lambda_sc=args.lambda_sc,
         lambda_complex_stft=args.lambda_complex_stft,
         log_every=int(args.log_every) if args.log_every is not None else Config().log_every,
@@ -1048,8 +1532,8 @@ def config_from_args(args) -> Config:
         spectrogram_seconds=args.spectrogram_seconds,
         checkpoint_every=int(args.checkpoint_every) if args.checkpoint_every is not None else 0,
         checkpoint_dir=args.checkpoint_dir,
-        data_dir=Path(args.data_dir) if args.data_dir else None,
-        use_librispeech=bool(args.librispeech),
+        data_dir=data_dir,
+        use_librispeech=bool(args.dataset in {"train-clean-100", "train-clean-360"}),
         lambda_mag_l1=args.lambda_mag_l1,
         activation=args.activation,
         rvq_code_dim=args.rvq_code_dim,
@@ -1090,6 +1574,12 @@ def main(argv: list[str] | None = None) -> None:
         except TypeError as e:
             raise SystemExit(f"--continue incompatible checkpoint config: {e}")
     else:
+        if args.data_dir is not None:
+            raise SystemExit(f"use --dataset {'|'.join(DATASET_CHOICES)} instead of --data-dir")
+        if args.legacy_librispeech or args.legacy_no_librispeech:
+            raise SystemExit(f"use --dataset {'|'.join(DATASET_CHOICES)} instead of legacy --librispeech/--no-librispeech")
+        if args.dataset is None:
+            raise SystemExit(f"--dataset is required ({', '.join(DATASET_CHOICES)})")
         cfg = config_from_args(args)
     if (args.steps is not None and args.steps < 0) or cfg.batch < 1 or cfg.grad_accum_steps < 1:
         raise SystemExit("--steps must be >=0 and --batch/--grad-accum-steps must be >=1")
@@ -1103,7 +1593,24 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--loss-balancer-eps must be > 0")
     if args.loss_balancer_max_scale <= 0:
         raise SystemExit("--loss-balancer-max-scale must be > 0")
-    for name in ("curriculum_ae_frac", "curriculum_vq_ramp_frac", "curriculum_vq_start", "curriculum_entropy_start"):
+    if args.lambda_semantic < 0:
+        raise SystemExit("--lambda-semantic must be >= 0")
+    if args.semantic_batch_items < 1:
+        raise SystemExit("--semantic-batch-items must be >= 1")
+    if args.semantic_every < 1:
+        raise SystemExit("--semantic-every must be >= 1")
+    if args.lambda_adv < 0:
+        raise SystemExit("--lambda-adv must be >= 0")
+    if args.disc_lr <= 0:
+        raise SystemExit("--disc-lr must be > 0")
+    for name in (
+        "curriculum_ae_frac",
+        "curriculum_vq_ramp_frac",
+        "curriculum_gan_frac",
+        "curriculum_vq_start",
+        "curriculum_entropy_start",
+        "curriculum_adv_start",
+    ):
         if getattr(args, name) < 0:
             raise SystemExit(f"--{name.replace('_', '-')} must be >= 0")
     if args.eval_clips < 1:
@@ -1119,11 +1626,11 @@ def main(argv: list[str] | None = None) -> None:
 
     audio_paths: list[Path] | None = None
     if cfg.data_dir is not None:
-        if args.librispeech and not cfg.data_dir.is_dir():
-            raise SystemExit(f"Dataset dir missing: {cfg.data_dir}")
+        if not cfg.data_dir.is_dir():
+            raise SystemExit(f"Dataset dir missing for {cfg.dataset or 'dataset'}: {cfg.data_dir}")
         audio_paths = collect_audio_paths(cfg.data_dir)
         if not audio_paths:
-            raise SystemExit(f"No audio files under {cfg.data_dir}")
+            raise SystemExit(f"No audio files under {cfg.data_dir} for dataset {cfg.dataset or 'unknown'}")
 
     if resume_blob is not None:
         total_steps = int(resume_blob.get("total_steps", cfg.steps))
@@ -1169,6 +1676,7 @@ def main(argv: list[str] | None = None) -> None:
             data_off=0,
             resumed=False,
         )
+    _open_text_log(layout["logs_txt"])
 
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
@@ -1185,8 +1693,24 @@ def main(argv: list[str] | None = None) -> None:
     model = CUDACodec(cfg).to(device)
     if cfg.use_bf16 and device.type == "cuda":
         model = model.to(dtype=torch.bfloat16)
+    semantic_teacher: FrozenSemanticTeacher | None = None
+    if float(cfg.lambda_semantic) > 0:
+        try:
+            semantic_teacher = FrozenSemanticTeacher(
+                bundle_name=cfg.semantic_model,
+                layers=cfg.semantic_layers,
+                sample_rate=cfg.sample_rate,
+                device=device,
+            )
+        except Exception as e:
+            raise SystemExit(f"failed to initialize semantic teacher {cfg.semantic_model}: {e}")
+    discriminator: MultiScaleWaveDiscriminator | None = None
+    if float(cfg.lambda_adv) > 0:
+        discriminator = MultiScaleWaveDiscriminator().to(device)
+        if cfg.use_bf16 and device.type == "cuda":
+            discriminator = discriminator.to(dtype=torch.bfloat16)
     if args.torch_compile and cfg.curriculum:
-        print_event(ansi, "warn", "torch.compile disabled with --curriculum because AE/RVQ phase toggles model control flow", color="yellow")
+        print_event(ansi, "warn", "torch.compile disabled with --curriculum because phase toggles change training control flow", color="yellow")
     elif args.torch_compile:
         try:
             model = torch.compile(model)  # type: ignore[assignment]
@@ -1201,6 +1725,11 @@ def main(argv: list[str] | None = None) -> None:
         ck_path = continue_ckpt
         ck = resume_blob if device.type == "cpu" else torch.load(ck_path, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"], strict=True)
+        if discriminator is not None:
+            disc_state = ck.get("discriminator")
+            if disc_state is None:
+                raise SystemExit(f"--continue checkpoint missing discriminator state: {ck_path}")
+            discriminator.load_state_dict(disc_state, strict=True)
         start_step = int(ck.get("step", -1)) + 1
         data_off = int(ck.get("data_off", start_step * cfg.batch * cfg.grad_accum_steps))
         print_event(ansi, "resume", f"{ck_path} -> train steps {start_step}..{cfg.steps - 1}", color="cyan")
@@ -1215,16 +1744,23 @@ def main(argv: list[str] | None = None) -> None:
         )
         if start_step >= cfg.steps:
             print_event(ansi, "done", f"checkpoint already reached target: step {start_step - 1} >= total steps {cfg.steps - 1}", color="green")
+            _close_text_log()
             return
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     sched = build_lr_scheduler(opt, cfg, start_step)
+    disc_opt = torch.optim.AdamW(discriminator.parameters(), lr=cfg.disc_lr) if discriminator is not None else None
+    disc_sched = build_lr_scheduler(disc_opt, cfg, start_step) if disc_opt is not None else None
     if ck_path is not None:
         ck = resume_blob if (resume_blob is not None and device.type == "cpu") else torch.load(ck_path, map_location=device, weights_only=False)
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
         if sched is not None and "scheduler" in ck and ck["scheduler"] is not None:
             sched.load_state_dict(ck["scheduler"])
+        if disc_opt is not None and "disc_optimizer" in ck and ck["disc_optimizer"] is not None:
+            disc_opt.load_state_dict(ck["disc_optimizer"])
+        if disc_sched is not None and "disc_scheduler" in ck and ck["disc_scheduler"] is not None:
+            disc_sched.load_state_dict(ck["disc_scheduler"])
 
     mel_fb = None
     if cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0:
@@ -1283,6 +1819,7 @@ def main(argv: list[str] | None = None) -> None:
     ema_cos_pct: float | None = None
     last_metrics = None
     last_batch = None
+    last_fake_for_disc = None
     for step in range(start_step, cfg.steps):
         opt.zero_grad(set_to_none=True)
         loss_total = 0.0
@@ -1302,12 +1839,22 @@ def main(argv: list[str] | None = None) -> None:
             prof_t = profiler.add_since("data", prof_t)
             if cfg.use_bf16 and device.type == "cuda":
                 batch = batch.to(torch.bfloat16)
-            loss, metrics = compute_loss(model, cfg, batch, step, mel_fb)
+            _set_requires_grad(discriminator, False)
+            loss, metrics = compute_loss(
+                model,
+                cfg,
+                batch,
+                step,
+                mel_fb,
+                discriminator=discriminator,
+                semantic_teacher=semantic_teacher,
+            )
             (loss / acm).backward()
             profiler.add_since("train", prof_t)
             loss_total += float(loss.detach().float().item())
             last_metrics = metrics
             last_batch = batch
+            last_fake_for_disc = metrics["y_hat"].detach()
 
         prof_t = profiler.mark()
         if not math.isfinite(loss_total):
@@ -1325,9 +1872,29 @@ def main(argv: list[str] | None = None) -> None:
         profiler.add_since("opt", prof_t)
 
         prof_t = profiler.mark()
+        curr_after = curriculum_state(step, cfg)
+        if (
+            discriminator is not None
+            and disc_opt is not None
+            and last_batch is not None
+            and last_fake_for_disc is not None
+            and curr_after.gan_mult > 0
+        ):
+            _set_requires_grad(discriminator, True)
+            disc_opt.zero_grad(set_to_none=True)
+            d_loss, d_real, d_fake = _gan_discriminator_loss(discriminator, last_batch.detach(), last_fake_for_disc)
+            d_loss.backward()
+            disc_opt.step()
+            if disc_sched is not None:
+                disc_sched.step()
+            if last_metrics is not None:
+                last_metrics["disc_loss"] = d_loss.detach()
+                last_metrics["disc_real"] = d_real.detach()
+                last_metrics["disc_fake"] = d_fake.detach()
+        else:
+            _set_requires_grad(discriminator, True)
         if 0.0 < float(cfg.vq_ema_decay) < 1.0 and last_batch is not None:
             update_vq_ema_codebooks(model, last_batch, cfg)
-        curr_after = curriculum_state(step, cfg)
         if cfg.vq_reset_every > 0 and curr_after.reset_enabled and not cfg.ae_only and step > 0 and step % cfg.vq_reset_every == 0 and last_batch is not None:
             n_reset, per_st = vq_reset_dead_codes(model, last_batch, cfg)
             if n_reset > 0 and (cfg.vq_reset_log_every <= 0 or step % cfg.vq_reset_log_every == 0):
@@ -1339,7 +1906,7 @@ def main(argv: list[str] | None = None) -> None:
         epoch_boundary = (step + 1) % max(1, steps_per_epoch) == 0
         prof_t = profiler.mark()
         if last_metrics is not None and (
-            step % cfg.log_every == 0 or epoch_boundary or step == cfg.steps - 1
+            (step + 1) % cfg.log_every == 0 or epoch_boundary or step == cfg.steps - 1
         ):
             m = last_metrics
             cos_pct = 100.0 * float(m["cos_m"].float().item())
@@ -1350,6 +1917,25 @@ def main(argv: list[str] | None = None) -> None:
             lr_log = opt.param_groups[0]["lr"]
             print_step_log(
                 ansi=ansi,
+                step=step,
+                cfg=cfg,
+                steps_per_epoch=steps_per_epoch,
+                resolved_epochs=resolved_epochs,
+                loss_value=loss_total / acm,
+                metrics=m,
+                cos_pct=cos_pct,
+                ema_cos_pct=ema_cos_pct if cfg.log_cos_ema_beta > 0 else None,
+                util=util,
+                lr_log=lr_log,
+                ms_per_step=elapsed / (step - start_step + 1) * 1000,
+                grad_norm=float(torch.as_tensor(grad_norm).detach().float().item()),
+                samples_per_update=cfg.batch * cfg.grad_accum_steps,
+                epoch_items=len(audio_paths) if audio_paths is not None else steps_per_epoch * cfg.batch * cfg.grad_accum_steps,
+                elapsed=elapsed,
+                start_step=start_step,
+            )
+            _append_training_log_csv(
+                layout["logs_csv"],
                 step=step,
                 cfg=cfg,
                 steps_per_epoch=steps_per_epoch,
@@ -1435,8 +2021,11 @@ def main(argv: list[str] | None = None) -> None:
                 "steps_per_epoch": steps_per_epoch,
                 "data_off": data_off,
                 "model": model.state_dict(),
+                "discriminator": None if discriminator is None else discriminator.state_dict(),
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict() if sched is not None else None,
+                "disc_optimizer": disc_opt.state_dict() if disc_opt is not None else None,
+                "disc_scheduler": disc_sched.state_dict() if disc_sched is not None else None,
                 "config": cfg.__dict__,
                 "run": {
                     "run_dir": str(layout["run_dir"]),
@@ -1533,10 +2122,11 @@ def main(argv: list[str] | None = None) -> None:
         resumed=resumed_from_checkpoint,
     )
     if ran > 0:
-        print()
+        _emit("")
         print_event(ansi, "done", f"updates {start_step}..{cfg.steps - 1} ({ran} updates) in {total:.1f}s", color="green")
     else:
         print_event(ansi, "done", "0 updates", color="green")
+    _close_text_log()
 
 
 if __name__ == "__main__":
