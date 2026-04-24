@@ -212,6 +212,50 @@ class LatentTemporalStack(nn.Module):
         return x + self.layers(x)
 
 
+class WaveDiscriminator(nn.Module):
+    """Lightweight 1D discriminator for waveform hinge GAN training."""
+
+    def __init__(self, base_channels: int = 32):
+        super().__init__()
+        ch = int(base_channels)
+        widths = (ch, ch * 2, ch * 4, ch * 8, ch * 16)
+        layers: list[nn.Module] = [
+            nn.Conv1d(1, widths[0], kernel_size=15, stride=1, padding=7),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(widths[0], widths[1], kernel_size=41, stride=4, padding=20, groups=4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(widths[1], widths[2], kernel_size=41, stride=4, padding=20, groups=8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(widths[2], widths[3], kernel_size=41, stride=4, padding=20, groups=16),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(widths[3], widths[4], kernel_size=11, stride=1, padding=5),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(widths[4], 1, kernel_size=3, stride=1, padding=1),
+        ]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.net(x.transpose(1, 2))
+        return y.flatten(1)
+
+
+class MultiScaleWaveDiscriminator(nn.Module):
+    def __init__(self, n_scales: int = 3, base_channels: int = 32):
+        super().__init__()
+        self.discriminators = nn.ModuleList(WaveDiscriminator(base_channels=base_channels) for _ in range(max(1, int(n_scales))))
+        self.downsample = nn.AvgPool1d(kernel_size=4, stride=2, padding=1, count_include_pad=False)
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        cur = x
+        outs: list[torch.Tensor] = []
+        for i, disc in enumerate(self.discriminators):
+            outs.append(disc(cur))
+            if i + 1 < len(self.discriminators):
+                cur_nct = cur.transpose(1, 2)
+                cur = self.downsample(cur_nct).transpose(1, 2)
+        return outs
+
+
 class CUDACodec(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()

@@ -26,7 +26,13 @@ uv run train --epochs 1 --no-librispeech --fast
 Real corpus:
 
 ```bash
-uv run train --epochs 5 --fast --batch 256
+uv run train --dataset train-clean-100 --epochs 5 --fast --batch 256
+```
+
+Config template:
+
+```bash
+uv run train --config configs/abd.json --epochs 5
 ```
 
 Resume:
@@ -43,6 +49,8 @@ Each run creates:
 experiments/YYYYMMDD_HHMMSS/
   checkpoints/
   inference/
+  logs.txt
+  logs.csv
   log_mlx.tsv
   results.tsv
   run_state.json
@@ -52,6 +60,10 @@ experiments/YYYYMMDD_HHMMSS/
 - numbered checkpoints: every 10 epochs by default
 - `checkpoints/latest.pt`: updated every epoch
 - inference exports: one subdirectory per step under `inference/XXXXXXXX/`
+- `logs.txt`: plain-text console log mirrored to file
+- `logs.csv`: structured per-progress-step metrics for spreadsheets / analysis
+
+See [`configs/`](./configs) for ready-made curriculum templates.
 
 ## Docker
 

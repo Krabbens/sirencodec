@@ -11,6 +11,9 @@ import torch
 from ..config import Config
 
 
+DATASET_CHOICES: tuple[str, str, str] = ("cv-corpus", "train-clean-100", "train-clean-360")
+
+
 _SKIP_PATH_PARTS = frozenset({"venv", ".venv", "site-packages", "node_modules", "__pycache__", ".git", ".eggs", ".tox"})
 
 
@@ -26,6 +29,26 @@ def collect_audio_paths(root: Path) -> list[Path]:
     out = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts and not _skip_audio_path(p)]
     out.sort(key=lambda p: str(p).lower())
     return out
+
+
+def dataset_dir_candidates(dataset: str, base_dir: Path | None = None) -> tuple[Path, ...]:
+    root = (base_dir if base_dir is not None else Path("data")).expanduser()
+    if dataset == "cv-corpus":
+        return ((root / "cv-corpus").resolve(),)
+    if dataset in {"train-clean-100", "train-clean-360"}:
+        return (
+            (root / dataset).resolve(),
+            (root / "LibriSpeech" / dataset).resolve(),
+        )
+    raise ValueError(f"unknown dataset {dataset!r}")
+
+
+def resolve_dataset_dir(dataset: str, base_dir: Path | None = None) -> Path:
+    candidates = dataset_dir_candidates(dataset, base_dir=base_dir)
+    for cand in candidates:
+        if cand.is_dir():
+            return cand
+    return candidates[0]
 
 
 def synth_batch(cfg: Config, key: int, device: torch.device) -> torch.Tensor:

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Smoke / ``--fast`` preset (three scales).
@@ -11,6 +14,67 @@ FAST_STFT_SCALES: tuple[tuple[int, int], ...] = ((512, 128), (1024, 256))
 # LibriSpeech default: wide multi-scale STFT (Parallel WaveGAN-style).
 LIBRI_STFT_SCALES: tuple[tuple[int, int], ...] = ((1024, 256), (2048, 512), (4096, 1024))
 LIBRI_STFT_SCALE_WEIGHTS: tuple[float, ...] = (1.0, 1.75, 2.5)
+
+
+def _detect_physical_cpu_cores() -> int:
+    env = (sys.platform or "").lower()
+    try:
+        if env.startswith("win"):
+            proc = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            out = (proc.stdout or "").strip()
+            if out:
+                val = int(out)
+                if val > 0:
+                    return val
+        elif env == "darwin":
+            proc = subprocess.run(
+                ["sysctl", "-n", "hw.physicalcpu"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            out = (proc.stdout or "").strip()
+            if out:
+                val = int(out)
+                if val > 0:
+                    return val
+        elif env.startswith("linux"):
+            physical: set[tuple[str, str]] = set()
+            current_phys = "0"
+            current_core = ""
+            with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        if current_core:
+                            physical.add((current_phys, current_core))
+                        current_phys = "0"
+                        current_core = ""
+                        continue
+                    if ":" not in line:
+                        continue
+                    key, value = [x.strip() for x in line.split(":", 1)]
+                    if key == "physical id":
+                        current_phys = value
+                    elif key == "core id":
+                        current_core = value
+            if current_core:
+                physical.add((current_phys, current_core))
+            if physical:
+                return len(physical)
+    except Exception:
+        pass
+    return max(1, (os.cpu_count() or 1))
 
 
 @dataclass
@@ -23,7 +87,7 @@ class Config:
     # FastGAN preset: keep architecture, cut loss compute.
     batch: int = 8
     # Disk batch: concurrent ``sf.read`` per row when ``>1`` (Libri I/O often leaves GPU idle if sequential).
-    load_audio_threads: int = 12  # 0 or 1 = legacy sequential loop; else ``min(batch, threads, 32)`` workers.
+    load_audio_threads: int = field(default_factory=_detect_physical_cpu_cores)  # 0 or 1 = legacy sequential loop; else ``min(batch, threads, 32)`` workers.
     # Prefetch the next batch on a worker thread while the current step runs (only with ``--data-dir`` / Libri).
     prefetch_audio: bool = True
     # Number of ready/queued CPU batches when prefetching. >1 hides disk jitter better on Windows.
@@ -123,12 +187,23 @@ class Config:
     loss_balancer: str = "off"  # "off" | "grad"
     loss_balancer_eps: float = 1e-8
     loss_balancer_max_scale: float = 10.0
-    # Curriculum without adversarial phase: A continuous AE, B RVQ/loss ramp, D full fine-tune.
+    # Frozen SSL teacher used only during training (not part of the codec model/checkpoints at inference time).
+    lambda_semantic: float = 0.0
+    semantic_model: str = "HUBERT_BASE"
+    semantic_layers: tuple[int, ...] = (12,)
+    semantic_batch_items: int = 8
+    semantic_every: int = 16
+    # Optional waveform GAN (hinge). Generator adversarial term participates in the reconstruction loss balancer.
+    lambda_adv: float = 0.0
+    disc_lr: float = 2e-4
+    # Curriculum: A continuous AE, B RVQ/loss ramp, optional C GAN ramp, D full fine-tune.
     curriculum: bool = False
-    curriculum_ae_frac: float = 0.05
-    curriculum_vq_ramp_frac: float = 0.20
+    curriculum_ae_frac: float = 0.15
+    curriculum_vq_ramp_frac: float = 0.35
+    curriculum_gan_frac: float = 0.25
     curriculum_vq_start: float = 0.10
     curriculum_entropy_start: float = 0.0
+    curriculum_adv_start: float = 0.10
     # Logging
     log_every: int = 50
     # EMA of waveform cos % in the log line: ema ← β·ema + (1−β)·cos; 0 = print raw cos only
@@ -141,9 +216,11 @@ class Config:
     spectrogram_seconds: float = 8.0  # 0 = use training batch length for PNG/WAV
     checkpoint_every: int = 0  # 0 = trainer default (10 epochs on fresh runs); explicit CLI still means updates
     checkpoint_dir: str = "mlx_checkpoints"
-    # If True and ``data_dir`` is None, trainer resolves ``data/cv-corpus``. Set False for synthetic batches only.
-    use_librispeech: bool = True
-    # Optional data (recursive *.wav / *.flac / *.ogg / *.mp3). When None + ``use_librispeech``, local corpus is filled in main.
+    # Dataset name chosen at the CLI. Fresh training runs require ``--dataset``.
+    dataset: str | None = None
+    # Deprecated legacy field kept for old checkpoints / resumes.
+    use_librispeech: bool = False
+    # Optional data root (recursive *.wav / *.flac / *.ogg / *.mp3). Filled from ``dataset`` in the trainer.
     data_dir: Path | None = None
     # Extra mean L1 on **linear** STFT magnitudes (same scales as log-STFT; weighted by λ_stft ramp).
     # Without GAN this carries more of the absolute harmonic-amplitude shaping.
@@ -255,6 +332,20 @@ def parse_stft_scale_weights_arg(s: str) -> tuple[float, ...]:
     return tuple(out)
 
 
+def parse_positive_int_list_arg(s: str) -> tuple[int, ...]:
+    """``"6,9,12"`` -> ``(6, 9, 12)``."""
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty integer list")
+    out: list[int] = []
+    for p in parts:
+        v = int(p)
+        if v < 1:
+            raise ValueError(f"expected positive integer, got {v}")
+        out.append(v)
+    return tuple(out)
+
+
 def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]:
     """Map ``Config`` → ``ArgumentParser.set_defaults`` (CLI stays in sync with dataclass)."""
     c = dc if dc is not None else Config()
@@ -325,11 +416,20 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "loss_balancer": c.loss_balancer,
         "loss_balancer_eps": c.loss_balancer_eps,
         "loss_balancer_max_scale": c.loss_balancer_max_scale,
+        "lambda_semantic": c.lambda_semantic,
+        "semantic_model": c.semantic_model,
+        "semantic_layers": ",".join(str(x) for x in c.semantic_layers),
+        "semantic_batch_items": c.semantic_batch_items,
+        "semantic_every": c.semantic_every,
+        "lambda_adv": c.lambda_adv,
+        "disc_lr": c.disc_lr,
         "curriculum": c.curriculum,
         "curriculum_ae_frac": c.curriculum_ae_frac,
         "curriculum_vq_ramp_frac": c.curriculum_vq_ramp_frac,
+        "curriculum_gan_frac": c.curriculum_gan_frac,
         "curriculum_vq_start": c.curriculum_vq_start,
         "curriculum_entropy_start": c.curriculum_entropy_start,
+        "curriculum_adv_start": c.curriculum_adv_start,
         "lambda_mag_l1": c.lambda_mag_l1,
         "activation": c.activation,
         "rvq_code_dim": c.rvq_code_dim,
@@ -345,7 +445,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "log_mlx_tsv": c.log_mlx_tsv,
         "results_tsv": c.results_tsv_path,
         "adaptive_mode": c.adaptive_mode,
-        "librispeech": c.use_librispeech,
+        "dataset": c.dataset,
         "log_every": c.log_every,
         "log_cos_ema_beta": c.log_cos_ema_beta,
         "spectrogram_every": c.spectrogram_every,

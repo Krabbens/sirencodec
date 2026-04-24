@@ -56,6 +56,29 @@ def stoi_16k(reference, estimate) -> float | None:
         return None
 
 
+def visqol_speech_16k(reference, estimate) -> float | None:
+    """Speech MOS-LQO @ 16 kHz if a compatible ``visqol`` package is installed; else ``None``."""
+    try:
+        import numpy as np
+        from visqol import visqol_config_pb2  # type: ignore
+        from visqol import visqol_lib_py  # type: ignore
+
+        ref = np.asarray(reference, dtype=np.float64).ravel()
+        est = np.asarray(estimate, dtype=np.float64).ravel()
+        n = min(ref.size, est.size)
+        if n < 256:
+            return None
+        config = visqol_config_pb2.VisqolConfig()
+        config.audio.sample_rate = 16000
+        config.options.use_speech_scoring = True
+        api = visqol_lib_py.VisqolApi()
+        api.Create(config)
+        result = api.Measure(ref[:n], est[:n])
+        return float(result.moslqo)
+    except Exception:
+        return None
+
+
 def waveform_cosine(reference, estimate) -> float:
     import numpy as np
 
@@ -119,6 +142,7 @@ def quality_metrics_16k(reference, estimate) -> dict[str, float | None]:
         "si_sdr_db": si_sdr_db(reference, estimate),
         "pesq_wb": pesq_wb_16k(reference, estimate),
         "stoi": stoi_16k(reference, estimate),
+        "visqol_moslqo": visqol_speech_16k(reference, estimate),
         "lsd_db": log_spectral_distance_db(reference, estimate),
         "l1": waveform_l1(reference, estimate),
         "cos": waveform_cosine(reference, estimate),
