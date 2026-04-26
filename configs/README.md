@@ -57,7 +57,7 @@ Each template can include run-length and logging defaults such as:
 - `sub1k_harmonic_20.json`
   - short 20-epoch test preset for the high-frequency smear fix
   - keeps the same sub-1 kbps RVQ bitrate/codebooks as `sub1k_200.json` (`2` stages, `K=256,128`, same stride)
-  - moves through RVQ much earlier (`A=5%`, `B=25%`) and spends `40%` of the run in GAN ramp
-  - enables MPD (`disc_type=mpd`) plus discriminator feature matching to reward periodic harmonic structure
-  - adds pre-emphasized waveform L1 so the loss sees high-frequency detail even before/without adversarial pressure
-  - keeps the large `4096/8192` STFT stack but still cycles it every 4 steps for speed
+  - trains reconstruction on hard RVQ immediately after `A=5%`; only VQ/marginal weights ramp in `B=15%`
+  - enables combined MSD+MPD (`disc_type=msmpd`) plus feature matching to reward harmonic structure while suppressing broadband noise
+  - adds pre-emphasized waveform L1 and an excess log-STFT penalty so high bands do not become a smeared spectral floor
+  - runs the large `4096/8192` STFT stack every 2 steps on a 24-item spectral subset for stronger high-frequency pressure without full-batch FFT cost

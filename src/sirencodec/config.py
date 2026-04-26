@@ -152,6 +152,10 @@ class Config:
     stft_grad_time_weight: float = 0.5
     # Mean (1 − cosine) between flattened log-mag STFT(pred) and STFT(tgt) per scale (same ramp as STFT). Independent of --lambda-cos (waveform).
     lambda_stft_cos: float = 0.05
+    # Penalize log-STFT energy that rises above the target by more than this margin.
+    # This specifically fights broadband "spectral floor" smear between harmonic peaks.
+    lambda_stft_excess: float = 0.0
+    stft_excess_margin: float = 0.20
     # Spectral Convergence (Yamamoto et al. 2020): ``‖|S(ŷ)|−|S(y)|‖_F / ‖|S(y)|‖_F`` per scale.
     # Scale-invariant; emphasizes harmonic peaks — classic GAN-free high-freq pressure. Same ramp as STFT.
     lambda_sc: float = 1.0
@@ -226,6 +230,8 @@ class Config:
     curriculum_vq_start: float = 0.10
     curriculum_entropy_start: float = 0.0
     curriculum_adv_start: float = 0.10
+    # If false, phase B trains reconstruction with hard RVQ immediately while only VQ/marginal weights ramp.
+    curriculum_quantize_blend: bool = True
     # Logging
     log_every: int = 50
     # EMA of waveform cos % in the log line: ema ← β·ema + (1−β)·cos; 0 = print raw cos only
@@ -403,6 +409,8 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lambda_stft": c.lambda_stft,
         "lambda_stft_grad": c.lambda_stft_grad,
         "lambda_stft_cos": c.lambda_stft_cos,
+        "lambda_stft_excess": c.lambda_stft_excess,
+        "stft_excess_margin": c.stft_excess_margin,
         "lambda_sc": c.lambda_sc,
         "lambda_complex_stft": c.lambda_complex_stft,
         "stft_grad_freq_weight": c.stft_grad_freq_weight,
@@ -467,6 +475,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "curriculum_vq_start": c.curriculum_vq_start,
         "curriculum_entropy_start": c.curriculum_entropy_start,
         "curriculum_adv_start": c.curriculum_adv_start,
+        "curriculum_quantize_blend": c.curriculum_quantize_blend,
         "lambda_mag_l1": c.lambda_mag_l1,
         "activation": c.activation,
         "rvq_code_dim": c.rvq_code_dim,

@@ -10,6 +10,7 @@ The command stays compatible with ``tools/train_mlx.py`` so existing scripts kee
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import copy
 import json
@@ -100,6 +101,12 @@ def _close_text_log() -> None:
             _LOG_TXT_HANDLE = None
 
 
+def _amp_context(cfg: Config, device: torch.device):
+    if bool(getattr(cfg, "use_bf16", False)) and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 def effective_lambda_stft(step: int, cfg: Config) -> float:
     if cfg.stft_ramp_steps <= 0:
         return cfg.lambda_stft
@@ -166,6 +173,8 @@ def curriculum_quantize_blend(step: int, cfg: Config) -> float:
     ramp_steps = max(1, int(round(total * max(0.0, float(cfg.curriculum_vq_ramp_frac)))))
     if step < ae_steps:
         return 0.0
+    if not bool(getattr(cfg, "curriculum_quantize_blend", True)):
+        return 1.0
     if step < ae_steps + ramp_steps:
         return _smooth01((step - ae_steps + 1) / float(ramp_steps))
     return 1.0
@@ -377,7 +386,7 @@ def compute_loss(
     lt = torch.mean(torch.abs(y_hat - batch))
     y_spec, b_spec = _spectral_loss_batch(y_hat, batch, step=step, max_items=cfg.spectral_batch_items)
     stft_scales, stft_weights = _active_stft_scales(cfg, step)
-    ls, lsg, lsc, l_lin, l_sc, l_cx = multi_stft_all_terms(
+    ls, lsg, lsc, l_lin, l_sc, l_cx, l_excess = multi_stft_all_terms(
         y_spec,
         b_spec,
         stft_scales,
@@ -386,9 +395,11 @@ def compute_loss(
         with_linear=cfg.lambda_mag_l1 > 0,
         with_sc=cfg.lambda_sc > 0,
         with_complex=cfg.lambda_complex_stft > 0,
+        with_excess=getattr(cfg, "lambda_stft_excess", 0.0) > 0,
         grad_freq_weight=cfg.stft_grad_freq_weight,
         grad_time_weight=cfg.stft_grad_time_weight,
         hf_emphasis=cfg.stft_hf_emphasis,
+        excess_margin=getattr(cfg, "stft_excess_margin", 0.20),
         scale_weights=stft_weights,
     )
     cos = batch_mean_cosine(batch, y_hat)
@@ -429,6 +440,7 @@ def compute_loss(
         ("stft_cos", lsc, float(ls_w * cfg.lambda_stft_cos)),
         ("sc", l_sc, float(ls_w * cfg.lambda_sc)),
         ("complex", l_cx, float(ls_w * cfg.lambda_complex_stft)),
+        ("excess", l_excess, float(ls_w * getattr(cfg, "lambda_stft_excess", 0.0))),
         ("mel_l1", lm1, float(ls_w * cfg.lambda_mel_l1)),
         ("mel_l2", lm2, float(ls_w * cfg.lambda_mel_l2)),
         ("semantic", l_sem, float(cfg.lambda_semantic)),
@@ -467,6 +479,7 @@ def compute_loss(
         "l_lin": l_lin.detach(),
         "l_sc": l_sc.detach(),
         "l_cx": l_cx.detach(),
+        "l_excess": l_excess.detach(),
         "lm1": lm1.detach(),
         "lm2": lm2.detach(),
         "l_sisdr": l_sisdr.detach(),
@@ -606,6 +619,7 @@ def _append_training_log_csv(
         "stft",
         "sc",
         "cx",
+        "excess",
         "sgrad",
         "stft_cos",
         "mel",
@@ -657,6 +671,7 @@ def _append_training_log_csv(
         "stft": f"{float(metrics['ls'].float().item()):.6f}",
         "sc": f"{float(metrics['l_sc'].float().item()):.6f}",
         "cx": f"{float(metrics['l_cx'].float().item()):.6f}",
+        "excess": f"{float(torch.as_tensor(metrics.get('l_excess', 0.0)).float().item()):.6f}",
         "sgrad": f"{float(metrics['lsg'].float().item()):.6f}",
         "stft_cos": f"{float(metrics['lsc'].float().item()):.6f}",
         "mel": f"{float(metrics['lm1'].float().item()):.6f}",
@@ -834,7 +849,9 @@ def print_run_header(
     _emit(
         _kv(
                 "training",
-                f"balancer={cfg.loss_balancer}  curriculum={'on' if cfg.curriculum else 'off'}  sisdr={cfg.lambda_sisdr:.3f}  pre={cfg.lambda_preemph:.3f}  sem={cfg.lambda_semantic:.3f}  adv={cfg.lambda_adv:.3f}  fm={cfg.lambda_fm:.3f}",
+                f"balancer={cfg.loss_balancer}  curriculum={'on' if cfg.curriculum else 'off'}  "
+                f"qblend={'on' if cfg.curriculum_quantize_blend else 'hard'}  sisdr={cfg.lambda_sisdr:.3f}  "
+                f"pre={cfg.lambda_preemph:.3f}  sem={cfg.lambda_semantic:.3f}  adv={cfg.lambda_adv:.3f}  fm={cfg.lambda_fm:.3f}",
             ansi,
             color="white",
         )
@@ -858,7 +875,7 @@ def print_run_header(
             "stft",
             (
                 f"{len(cfg.stft_scales)} scales: {stft_nfo}  weights={stft_w}  "
-                f"hf={cfg.stft_hf_emphasis:g}  lambda={cfg.lambda_stft:g}  ramp_steps={cfg.stft_ramp_steps}"
+                f"hf={cfg.stft_hf_emphasis:g}  lambda={cfg.lambda_stft:g}  excess={cfg.lambda_stft_excess:g}@{cfg.stft_excess_margin:g}  ramp_steps={cfg.stft_ramp_steps}"
             ),
             ansi,
             color="white",
@@ -971,6 +988,7 @@ def print_step_log(
     stft_v = float(metrics["ls"].float().item())
     sc_v = float(metrics["l_sc"].float().item())
     cx_v = float(metrics["l_cx"].float().item())
+    excess_v = float(torch.as_tensor(metrics.get("l_excess", 0.0)).float().item())
     sgrad_v = float(metrics["lsg"].float().item())
     stft_cos_v = float(metrics["lsc"].float().item())
     mel_v = float(metrics["lm1"].float().item())
@@ -993,6 +1011,7 @@ def print_step_log(
     stft_color = _low_is_good_color(stft_v, green=0.50, yellow=1.50)
     sc_color = _low_is_good_color(sc_v, green=0.30, yellow=0.70)
     cx_color = _low_is_good_color(cx_v, green=0.35, yellow=0.70)
+    excess_color = _low_is_good_color(excess_v, green=0.05, yellow=0.25)
     sgrad_color = _low_is_good_color(sgrad_v, green=0.45, yellow=0.80)
     stft_cos_color = _low_is_good_color(stft_cos_v, green=0.10, yellow=0.25)
     mel_color = _low_is_good_color(mel_v, green=0.60, yellow=2.00)
@@ -1056,6 +1075,7 @@ def print_step_log(
             _stat_cell("stft", f"{stft_v:.4f}", ansi, value_color=stft_color, value_width=9, total_width=cell_width),
             _stat_cell("sc", f"{sc_v:.4f}", ansi, value_color=sc_color, value_width=9, total_width=cell_width),
             _stat_cell("cx", f"{cx_v:.4f}", ansi, value_color=cx_color, value_width=9, total_width=cell_width),
+            _stat_cell("excess", f"{excess_v:.4f}", ansi, value_color=excess_color, value_width=9, total_width=cell_width),
             _stat_cell("sgrad", f"{sgrad_v:.4f}", ansi, value_color=sgrad_color, value_width=9, total_width=cell_width),
             _stat_cell("stft_cos", f"{stft_cos_v:.4f}", ansi, value_color=stft_cos_color, value_width=9, total_width=cell_width),
             _stat_cell("mel", f"{mel_v:.4f}", ansi, value_color=mel_color, value_width=9, total_width=cell_width),
@@ -1415,9 +1435,8 @@ def run_quality_eval(
             if audio_paths is not None
             else synth_viz_clip(cfg, key + cfg.seed * 10007, n_samples, device)
         )
-        if cfg.use_bf16 and device.type == "cuda":
-            batch_eval = batch_eval.to(torch.bfloat16)
-        y_ev, _, _, _, idx_ev = forward_full_for_curriculum_step(model, cfg, batch_eval, step, deploy=True)
+        with _amp_context(cfg, device):
+            y_ev, _, _, _, idx_ev = forward_full_for_curriculum_step(model, cfg, batch_eval, step, deploy=True)
         o = batch_eval[0, :, 0].detach().float().cpu().numpy()
         r = y_ev[0, :, 0].detach().float().cpu().numpy()
         rows.append(eval_metrics_mod.quality_metrics_16k(o, r))
@@ -1593,6 +1612,8 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--lambda-stft", type=float, default=c.lambda_stft)
     p.add_argument("--lambda-stft-grad", type=float, default=c.lambda_stft_grad)
     p.add_argument("--lambda-stft-cos", type=float, default=c.lambda_stft_cos)
+    p.add_argument("--lambda-stft-excess", type=float, default=c.lambda_stft_excess, help="Penalize broadband log-STFT energy above target valleys")
+    p.add_argument("--stft-excess-margin", type=float, default=c.stft_excess_margin, help="Log-magnitude margin before --lambda-stft-excess activates")
     p.add_argument("--stft-grad-freq-weight", type=float, default=c.stft_grad_freq_weight)
     p.add_argument("--stft-grad-time-weight", type=float, default=c.stft_grad_time_weight)
     p.add_argument("--stft-ramp-steps", type=int, default=c.stft_ramp_steps)
@@ -1659,6 +1680,7 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--curriculum-vq-start", type=float, default=c.curriculum_vq_start)
     p.add_argument("--curriculum-entropy-start", type=float, default=c.curriculum_entropy_start)
     p.add_argument("--curriculum-adv-start", type=float, default=c.curriculum_adv_start)
+    _add_bool(p, "--curriculum-quantize-blend", c.curriculum_quantize_blend, "Blend continuous AE into quantized path during phase B")
     p.add_argument("--activation", choices=["gelu", "snake", "snake_beta"], default=c.activation)
     p.add_argument("--rvq-code-dim", type=int, default=c.rvq_code_dim)
     p.add_argument("--vq-ema-decay", type=float, default=c.vq_ema_decay)
@@ -1759,6 +1781,8 @@ def config_from_args(args) -> Config:
         lambda_stft=args.lambda_stft,
         lambda_stft_grad=args.lambda_stft_grad,
         lambda_stft_cos=args.lambda_stft_cos,
+        lambda_stft_excess=args.lambda_stft_excess,
+        stft_excess_margin=args.stft_excess_margin,
         stft_grad_freq_weight=args.stft_grad_freq_weight,
         stft_grad_time_weight=args.stft_grad_time_weight,
         stft_ramp_steps=args.stft_ramp_steps,
@@ -1821,6 +1845,7 @@ def config_from_args(args) -> Config:
         curriculum_vq_start=args.curriculum_vq_start,
         curriculum_entropy_start=args.curriculum_entropy_start,
         curriculum_adv_start=args.curriculum_adv_start,
+        curriculum_quantize_blend=bool(args.curriculum_quantize_blend),
         lambda_sc=args.lambda_sc,
         lambda_complex_stft=args.lambda_complex_stft,
         log_every=int(args.log_every) if args.log_every is not None else Config().log_every,
@@ -1895,6 +1920,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--stft-large-min-fft must be >= 0")
     if args.stft_large_every < 1:
         raise SystemExit("--stft-large-every must be >= 1")
+    if args.lambda_stft_excess < 0:
+        raise SystemExit("--lambda-stft-excess must be >= 0")
+    if args.stft_excess_margin < 0:
+        raise SystemExit("--stft-excess-margin must be >= 0")
     if args.loss_balancer_eps <= 0:
         raise SystemExit("--loss-balancer-eps must be > 0")
     if args.loss_balancer_max_scale <= 0:
@@ -2011,8 +2040,6 @@ def main(argv: list[str] | None = None) -> None:
         print_event(ansi, "warn", "CUDA not available; running on CPU", color="yellow")
 
     model = CUDACodec(cfg).to(device)
-    if cfg.use_bf16 and device.type == "cuda":
-        model = model.to(dtype=torch.bfloat16)
     semantic_teacher: FrozenSemanticTeacher | None = None
     if float(cfg.lambda_semantic) > 0:
         try:
@@ -2027,8 +2054,6 @@ def main(argv: list[str] | None = None) -> None:
     discriminator: torch.nn.Module | None = None
     if float(cfg.lambda_adv) > 0:
         discriminator = build_wave_discriminator(cfg).to(device)
-        if cfg.use_bf16 and device.type == "cuda":
-            discriminator = discriminator.to(dtype=torch.bfloat16)
     if args.torch_compile and cfg.curriculum:
         print_event(ansi, "warn", "torch.compile disabled with --curriculum because phase toggles change training control flow", color="yellow")
     elif args.torch_compile:
@@ -2191,18 +2216,17 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 batch = synth_batch(cfg, key=step * 1_000_003 + micro * 97 + cfg.seed * 10007, device=device)
             prof_t = profiler.add_since("data", prof_t)
-            if cfg.use_bf16 and device.type == "cuda":
-                batch = batch.to(torch.bfloat16)
             _set_requires_grad(discriminator, False)
-            loss, metrics = compute_loss(
-                model,
-                cfg,
-                batch,
-                step,
-                mel_fb,
-                discriminator=discriminator,
-                semantic_teacher=semantic_teacher,
-            )
+            with _amp_context(cfg, device):
+                loss, metrics = compute_loss(
+                    model,
+                    cfg,
+                    batch,
+                    step,
+                    mel_fb,
+                    discriminator=discriminator,
+                    semantic_teacher=semantic_teacher,
+                )
             (loss / acm).backward()
             profiler.add_since("train", prof_t)
             loss_total += float(loss.detach().float().item())
@@ -2236,7 +2260,8 @@ def main(argv: list[str] | None = None) -> None:
         ):
             _set_requires_grad(discriminator, True)
             disc_opt.zero_grad(set_to_none=True)
-            d_loss, d_real, d_fake = _gan_discriminator_loss(discriminator, last_batch.detach(), last_fake_for_disc)
+            with _amp_context(cfg, device):
+                d_loss, d_real, d_fake = _gan_discriminator_loss(discriminator, last_batch.detach(), last_fake_for_disc)
             d_loss.backward()
             disc_opt.step()
             if disc_sched is not None:
@@ -2440,9 +2465,8 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     batch_viz = last_batch
                 if batch_viz is not None:
-                    if cfg.use_bf16 and device.type == "cuda":
-                        batch_viz = batch_viz.to(torch.bfloat16)
-                    y_viz, _, _, _, _ = forward_full_for_curriculum_step(model, cfg, batch_viz, step, deploy=True)
+                    with _amp_context(cfg, device):
+                        y_viz, _, _, _, _ = forward_full_for_curriculum_step(model, cfg, batch_viz, step, deploy=True)
                     step_dir = Path(cfg.spectrogram_dir) / f"{step:08d}"
                     out = step_dir / "spectrogram.png"
                     if save_spectrogram_png(batch_viz[0, :, 0], y_viz[0, :, 0], cfg.sample_rate, out, step):

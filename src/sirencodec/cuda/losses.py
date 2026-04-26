@@ -63,6 +63,16 @@ def _weighted_mean_abs(diff: torch.Tensor, hf_gamma: float) -> torch.Tensor:
     return (diff.abs() * w).sum() / (w1.sum() * diff.shape[0] * diff.shape[2])
 
 
+def _weighted_mean_positive(value: torch.Tensor, hf_gamma: float) -> torch.Tensor:
+    g = float(hf_gamma)
+    if g <= 0 or value.shape[1] <= 1:
+        return value.mean()
+    f = torch.linspace(0.0, 1.0, value.shape[1], device=value.device, dtype=value.dtype)
+    w1 = 1.0 + g * (f * f)
+    w = w1.view(1, -1, 1)
+    return (value * w).sum() / (w1.sum() * value.shape[0] * value.shape[2])
+
+
 def _scale_weights(scales: tuple[tuple[int, int], ...], weights: tuple[float, ...] | None) -> list[float]:
     ws = [1.0] * len(scales) if weights is None else [float(w) for w in weights]
     if len(ws) != len(scales):
@@ -143,15 +153,17 @@ def multi_stft_all_terms(
     with_linear: bool,
     with_sc: bool,
     with_complex: bool,
+    with_excess: bool = False,
     grad_freq_weight: float = 1.0,
     grad_time_weight: float = 1.0,
     hf_emphasis: float = 0.0,
+    excess_margin: float = 0.20,
     scale_weights: tuple[float, ...] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute all multi-STFT losses from one STFT pair per scale."""
     if not scales:
         z = pred.new_zeros(())
-        return z, z, z, z, z, z
+        return z, z, z, z, z, z, z
     ws = _scale_weights(scales, scale_weights)
     total_mag = pred.new_zeros((), dtype=torch.float32)
     total_grad = pred.new_zeros((), dtype=torch.float32)
@@ -159,6 +171,7 @@ def multi_stft_all_terms(
     total_linear = pred.new_zeros((), dtype=torch.float32)
     total_sc = pred.new_zeros((), dtype=torch.float32)
     total_complex = pred.new_zeros((), dtype=torch.float32)
+    total_excess = pred.new_zeros((), dtype=torch.float32)
     for (n_fft, hop), w in zip(scales, ws):
         sp, sq = _stft_pair(pred, tgt, n_fft, hop)
         sp_abs = sp.abs()
@@ -186,8 +199,19 @@ def multi_stft_all_terms(
         if with_complex:
             l1 = 0.5 * ((sp.real - sq.real).abs().mean() + (sp.imag - sq.imag).abs().mean())
             total_complex = total_complex + ww * l1
+        if with_excess:
+            excess = torch.relu(lp - lq - float(excess_margin))
+            total_excess = total_excess + ww * _weighted_mean_positive(excess, hf_emphasis)
     den = float(sum(ws))
-    return total_mag / den, total_grad / den, total_cos / den, total_linear / den, total_sc / den, total_complex / den
+    return (
+        total_mag / den,
+        total_grad / den,
+        total_cos / den,
+        total_linear / den,
+        total_sc / den,
+        total_complex / den,
+        total_excess / den,
+    )
 
 
 def multi_stft_mag_l1_linear(pred: torch.Tensor, tgt: torch.Tensor, scales: tuple[tuple[int, int], ...], *, hf_emphasis: float = 0.0, scale_weights: tuple[float, ...] | None = None) -> torch.Tensor:
