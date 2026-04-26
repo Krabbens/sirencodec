@@ -54,6 +54,13 @@ Each template can include run-length and logging defaults such as:
   - fixed validation clips and best-checkpoint saving make late-run drift easier to avoid
   - default `dataset=train-clean-360`, `epochs=200`, `logs_per_epoch=1`
 
+- `sub1k_5090_stable_200.json`
+  - long RTX 5090-oriented stable run for the observed failure mode where RVQ code usage recovers but quantized reconstruction drifts and GAN/fm hurts late quality
+  - keeps the same sub-1 kbps topology as `sub1k_200.json` (`2` RVQ stages, `K=256,128`, stride `256x`) but uses a 200-epoch curriculum with `A=8%`, `B=72%`, `D=20%`
+  - disables GAN for the main run; use the resulting checkpoint for a separate short adversarial fine-tune only after SI-SDR/cosine are stable
+  - lowers VQ/marginal pressure, enables quantization blending, and strengthens waveform/AE anchors so RVQ learns to follow the good AE path instead of overpowering reconstruction
+  - spends extra 5090 compute on spectral quality (`32` spectral items, large FFTs every `2` steps, mild excess/high-frequency losses) while keeping the effective batch at `256` for comparable update count
+
 - `sub1k_harmonic_20.json`
   - short 20-epoch test preset for the high-frequency smear fix
   - keeps the same sub-1 kbps RVQ bitrate/codebooks as `sub1k_200.json` (`2` stages, `K=256,128`, same stride)
