@@ -70,14 +70,24 @@ See [`configs/`](./configs) for ready-made curriculum templates.
 Build:
 
 ```bash
-docker build -t sirencodec .
+docker build -t sirencodec:git .
 ```
 
 Run with NVIDIA runtime:
 
 ```bash
-docker run --rm --gpus all -it -v $(pwd)/data:/workspace/data sirencodec \
+docker run --rm --gpus all -it -v $(pwd)/data:/workspace/data sirencodec:git \
   uv run train --epochs 5 --fast --batch 256
+```
+
+The image contains the repository `.git` directory and two container helpers:
+
+```bash
+# Fetch, optionally switch branch, pull, then refresh uv dependencies.
+sirencodec-sync models/13b
+
+# Download and extract LibriSpeech train-clean-360 to /workspace/data/train-clean-360.
+download-train-clean-360
 ```
 
 The container requires NVIDIA Container Toolkit on the host.
