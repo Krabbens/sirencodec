@@ -238,6 +238,7 @@ def test_si_sdr_loss_prefers_aligned_waveform():
     x = torch.randn(3, 128, 1)
     noisy = torch.roll(x, shifts=3, dims=1)
     assert batch_neg_log_si_sdr(x, x) < batch_neg_log_si_sdr(x, noisy)
+    assert batch_neg_log_si_sdr(x, x) < batch_neg_log_si_sdr(x, -x)
 
 
 def test_rvq_residual_stages_all_carry_reconstruction_gradient():
@@ -323,13 +324,17 @@ def test_sub1k_template_avoids_factorized_rvq_cold_start():
     assert data["batch"] == 128
     assert data["grad_accum_steps"] == 2
     assert data["loss_balancer"] == "off"
+    assert data["enc_channels"] == "56,80,112,160,224,320,448,640"
+    assert data["latent_dim"] == 512
     assert data["stft_scales"] == "512,128;1024,256;2048,512;4096,1024;8192,2048"
     assert data["stft_scale_weights"] == "0.5,1,1.5,2,3"
     assert data["spectral_batch_items"] == 16
     assert data["stft_large_min_fft"] == 4096
     assert data["stft_large_every"] == 4
-    assert data["curriculum_ae_frac"] >= 0.30
-    assert data["curriculum_vq_ramp_frac"] <= 0.55
+    assert data["curriculum_ae_frac"] <= 0.05
+    assert data["curriculum_vq_ramp_frac"] >= 0.65
+    assert data["curriculum_vq_start"] >= 0.25
+    assert data["curriculum_entropy_start"] >= 0.25
     assert data["lambda_stft"] >= 0.5
     assert data["stft_ramp_steps"] == 0
     assert data["stft_hf_emphasis"] >= 1.0
@@ -355,6 +360,8 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
     cfg_path = ROOT / "configs" / "sub1k_200.json"
     args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
     cfg = config_from_args(args)
+    assert cfg.enc_channels == (56, 80, 112, 160, 224, 320, 448, 640)
+    assert cfg.latent_dim == 512
     assert cfg.stft_scales == ((512, 128), (1024, 256), (2048, 512), (4096, 1024), (8192, 2048))
     assert cfg.stft_scale_weights == (0.5, 1.0, 1.5, 2.0, 3.0)
     assert cfg.spectral_batch_items == 16
@@ -363,11 +370,26 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
     assert cfg.lambda_stft == pytest.approx(0.65)
     assert cfg.stft_ramp_steps == 0
     assert cfg.stft_hf_emphasis == pytest.approx(1.5)
-    assert cfg.curriculum_ae_frac == pytest.approx(0.30)
+    assert cfg.curriculum_ae_frac == pytest.approx(0.05)
+    assert cfg.curriculum_vq_ramp_frac == pytest.approx(0.65)
+    assert cfg.curriculum_vq_start == pytest.approx(0.25)
+    assert cfg.curriculum_entropy_start == pytest.approx(0.25)
     assert cfg.lambda_sisdr == pytest.approx(0.75)
     assert cfg.lambda_ae_anchor_time == pytest.approx(0.50)
     assert cfg.lambda_ae_anchor_cos == pytest.approx(0.10)
     assert cfg.loss_balancer == "off"
+    base_cfg = Config(
+        n_codebooks=cfg.n_codebooks,
+        codebook_size=cfg.codebook_size,
+        codebook_sizes=cfg.codebook_sizes,
+        rvq_code_dim=cfg.rvq_code_dim,
+        latent_temporal_post_depth=cfg.latent_temporal_post_depth,
+        pre_vq_layernorm=cfg.pre_vq_layernorm,
+    )
+    assert effective_codebook_sizes(cfg) == effective_codebook_sizes(base_cfg)
+    base_params = sum(p.numel() for p in CUDACodec(base_cfg).parameters())
+    wide_params = sum(p.numel() for p in CUDACodec(cfg).parameters())
+    assert wide_params / base_params == pytest.approx(2.93, rel=0.03)
 
 
 def test_spectral_loss_batch_limits_large_fft_work_and_wraps():

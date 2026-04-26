@@ -196,7 +196,7 @@ def batch_mean_cosine(orig: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
 
 
 def batch_neg_log_si_sdr(orig: torch.Tensor, recon: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Negative log SI-SDR power ratio; lower is better and directly rewards waveform alignment."""
+    """Negative log SI-SDR power ratio with a same-polarity gate."""
     o = orig.reshape(orig.shape[0], -1).float()
     r = recon.reshape(recon.shape[0], -1).float()
     o = o - o.mean(dim=1, keepdim=True)
@@ -205,7 +205,9 @@ def batch_neg_log_si_sdr(orig: torch.Tensor, recon: torch.Tensor, eps: float = 1
     target = dot * o / (o.square().sum(dim=1, keepdim=True) + eps)
     noise = r - target
     ratio = (target.square().sum(dim=1) + eps) / (noise.square().sum(dim=1) + eps)
-    return -torch.log(ratio.clamp_min(eps)).mean()
+    cos = F.cosine_similarity(o, r, dim=1, eps=eps)
+    polarity_gate = torch.sigmoid(8.0 * cos).clamp_min(eps)
+    return -(torch.log(ratio.clamp_min(eps)) + torch.log(polarity_gate)).mean()
 
 
 def _balanced_reconstruction_loss(
