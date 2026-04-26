@@ -136,6 +136,13 @@ class Config:
     stft_scales: tuple[tuple[int, int], ...] = LIBRI_STFT_SCALES
     # Per-scale weights (same count as stft_scales); emphasize larger FFTs for fine harmonics.
     stft_scale_weights: tuple[float, ...] | None = LIBRI_STFT_SCALE_WEIGHTS
+    # Limit expensive spectral losses to N batch items per micro-batch (0 = all items).
+    # Waveform, RVQ, and adversarial/semantic terms still see the full micro-batch.
+    spectral_batch_items: int = 0
+    # Run scales with n_fft >= this threshold only every N optimizer steps (1 = every step).
+    # This keeps 4096/8192 FFT pressure without paying their full cost on every update.
+    stft_large_min_fft: int = 0
+    stft_large_every: int = 1
     # Extra emphasis on high-frequency bins in log-mag L1: weight ∝ 1 + γ·(f/F_max)² (0 = uniform mean)
     stft_hf_emphasis: float = 1.0
     # Differentiable "sharpness": L1 on finite differences of log-mag STFT (freq + time). Uses same λ ramp as STFT.
@@ -183,6 +190,12 @@ class Config:
     lambda_cos: float = 0.15  # adds λ·(1 − cos); pushes toward cos → 1
     cos_hinge: float = 0.0  # adds w·max(0, cos_target − cos); use to chase e.g. 90%+
     cos_target: float = 0.9
+    # Differentiable negative log SI-SDR ratio on waveform. Cheap phase/waveform anchor for mag-heavy STFT presets.
+    lambda_sisdr: float = 0.0
+    # During RVQ phases, keep a continuous z->decoder reconstruction anchor alive.
+    # This prevents the encoder/decoder path learned in A from drifting while hard RVQ is optimized.
+    lambda_ae_anchor_time: float = 0.0
+    lambda_ae_anchor_cos: float = 0.0
     # Reconstruction loss balancer: off = raw lambdas, grad = EnCodec-style gradient-ratio balancing wrt y_hat.
     loss_balancer: str = "off"  # "off" | "grad"
     loss_balancer_eps: float = 1e-8
@@ -245,6 +258,8 @@ class Config:
     eval_every: int = 5000
     eval_clips: int = 4
     eval_seconds: float = 3.0
+    # Fixed validation clip seed. Keeping this independent of step makes eval rows comparable.
+    eval_seed: int = 0
     log_mlx_tsv: str = "log_mlx.tsv"
     results_tsv_path: str = "results.tsv"
     # Adaptive / BWE stubs (see ``sirencodec.adaptive``): ``none`` | ``bwe_stub`` | ``fps_stub``.
@@ -387,6 +402,9 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "stft_ramp_start": c.stft_ramp_start_frac,
         "stft_scales": stft_s,
         "stft_scale_weights": stft_w,
+        "spectral_batch_items": c.spectral_batch_items,
+        "stft_large_min_fft": c.stft_large_min_fft,
+        "stft_large_every": c.stft_large_every,
         "stft_hf_emphasis": c.stft_hf_emphasis,
         "mel_n_fft": c.mel_n_fft,
         "mel_hop": c.mel_hop,
@@ -413,6 +431,9 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lambda_cos": c.lambda_cos,
         "cos_hinge": c.cos_hinge,
         "cos_target": c.cos_target,
+        "lambda_sisdr": c.lambda_sisdr,
+        "lambda_ae_anchor_time": c.lambda_ae_anchor_time,
+        "lambda_ae_anchor_cos": c.lambda_ae_anchor_cos,
         "loss_balancer": c.loss_balancer,
         "loss_balancer_eps": c.loss_balancer_eps,
         "loss_balancer_max_scale": c.loss_balancer_max_scale,
@@ -442,6 +463,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "eval_every": c.eval_every,
         "eval_clips": c.eval_clips,
         "eval_seconds": c.eval_seconds,
+        "eval_seed": c.eval_seed,
         "log_mlx_tsv": c.log_mlx_tsv,
         "results_tsv": c.results_tsv_path,
         "adaptive_mode": c.adaptive_mode,

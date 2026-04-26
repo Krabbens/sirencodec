@@ -147,7 +147,8 @@ class ResidualVectorQuantizer(nn.Module):
         total_marg = z.new_zeros(())
         indices: list[torch.Tensor] = []
         for stage in self.stages:
-            residual = z - quantized
+            # Previous straight-through stages would otherwise cancel the residual gradient.
+            residual = z - quantized.detach()
             z_i, lvq, dist, idx = stage(residual)
             quantized = quantized + z_i
             total_vq = total_vq + lvq
@@ -283,16 +284,38 @@ class CUDACodec(nn.Module):
             z = self.latent_pre(z)
         return z
 
-    def forward_full(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor] | None]:
+    def forward_full(
+        self,
+        x: torch.Tensor,
+        *,
+        quantize_blend: float = 1.0,
+        return_continuous: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor] | None] | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        list[torch.Tensor] | None,
+        torch.Tensor,
+    ]:
         tlen = x.shape[1]
         z = self.latent_before_rvq(x)
         if self.cfg.ae_only:
             z0 = z.new_zeros(())
-            return self.decoder(z, tlen), z0, z0, z0, None
+            y_cont = self.decoder(z, tlen)
+            if return_continuous:
+                return y_cont, z0, z0, z0, None, y_cont
+            return y_cont, z0, z0, z0, None
         z_q, vq_loss, ent_pos, marg_ent, indices = self.rvq(z)
         if self.latent_post is not None:
             z_q = self.latent_post(z_q)
-        return self.decoder(z_q, tlen), vq_loss, ent_pos, marg_ent, indices
+        q = min(1.0, max(0.0, float(quantize_blend)))
+        if q < 1.0:
+            z_q = z + q * (z_q - z)
+        y_hat = self.decoder(z_q, tlen)
+        if return_continuous:
+            return y_hat, vq_loss, ent_pos, marg_ent, indices, self.decoder(z, tlen)
+        return y_hat, vq_loss, ent_pos, marg_ent, indices
 
     def forward_reconstruction_only(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_full(x)[0]
