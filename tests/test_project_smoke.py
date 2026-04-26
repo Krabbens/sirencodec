@@ -159,6 +159,20 @@ def test_curriculum_quantize_blend_ramps_through_phase_b():
     assert curriculum_quantize_blend(80, cfg) == pytest.approx(1.0)
 
 
+def test_curriculum_quantize_blend_can_train_hard_rvq_immediately():
+    cfg = Config(
+        steps=100,
+        curriculum=True,
+        curriculum_ae_frac=0.10,
+        curriculum_vq_ramp_frac=0.40,
+        curriculum_quantize_blend=False,
+        lambda_adv=0.0,
+    )
+    assert curriculum_quantize_blend(0, cfg) == pytest.approx(0.0)
+    assert curriculum_quantize_blend(10, cfg) == pytest.approx(1.0)
+    assert curriculum_quantize_blend(20, cfg) == pytest.approx(1.0)
+
+
 def test_curriculum_forward_helper_uses_ae_only_phase_without_sticking():
     cfg = Config(
         batch=1,
@@ -444,12 +458,15 @@ def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
     assert data["epochs"] == 20
     assert data["n_codebooks"] == 2
     assert data["codebook_sizes"] == "256,128"
-    assert data["disc_type"] == "mpd"
+    assert data["disc_type"] == "msmpd"
     assert data["lambda_adv"] > 0.0
     assert data["lambda_fm"] > 0.0
     assert data["lambda_preemph"] > 0.0
     assert data["curriculum_ae_frac"] == pytest.approx(0.05)
-    assert data["curriculum_vq_ramp_frac"] <= 0.25
+    assert data["curriculum_vq_ramp_frac"] <= 0.15
+    assert data["curriculum_quantize_blend"] is False
+    assert data["lambda_stft_excess"] > 0.0
+    assert data["stft_large_every"] <= 2
 
     args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
     cfg = config_from_args(args)
@@ -459,6 +476,8 @@ def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
     assert encoder_time_stride(cfg) == encoder_time_stride(ref_cfg)
     assert nominal_rvq_kbps(cfg) == pytest.approx(nominal_rvq_kbps(ref_cfg))
     assert cfg.disc_periods == (2, 3, 5, 7, 11)
+    assert cfg.curriculum_quantize_blend is False
+    assert cfg.lambda_stft_excess > 0.0
 
 
 def test_spectral_loss_batch_limits_large_fft_work_and_wraps():
