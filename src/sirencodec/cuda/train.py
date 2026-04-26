@@ -44,7 +44,7 @@ from ..config import (
     parse_stft_scales_arg,
     parse_stft_scale_weights_arg,
 )
-from .codec import CUDACodec, MultiScaleWaveDiscriminator, VectorQuantizerStage
+from .codec import CUDACodec, VectorQuantizerStage, build_wave_discriminator
 from .data import (
     DATASET_CHOICES,
     collect_audio_paths,
@@ -210,6 +210,15 @@ def batch_neg_log_si_sdr(orig: torch.Tensor, recon: torch.Tensor, eps: float = 1
     return -(torch.log(ratio.clamp_min(eps)) + torch.log(polarity_gate)).mean()
 
 
+def batch_preemph_l1(orig: torch.Tensor, recon: torch.Tensor, coef: float = 0.97) -> torch.Tensor:
+    if orig.shape[1] < 2 or recon.shape[1] < 2:
+        return recon.new_zeros(())
+    c = float(coef)
+    orig_hp = orig[:, 1:, :] - c * orig[:, :-1, :]
+    recon_hp = recon[:, 1:, :] - c * recon[:, :-1, :]
+    return torch.mean(torch.abs(recon_hp - orig_hp))
+
+
 def _balanced_reconstruction_loss(
     terms: list[tuple[str, torch.Tensor, float]],
     y_hat: torch.Tensor,
@@ -245,19 +254,45 @@ def _balanced_reconstruction_loss(
     return total, scales
 
 
-def _gan_generator_loss(discriminator: MultiScaleWaveDiscriminator, fake: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    fake_scores = discriminator(fake)
+def _disc_forward_features(discriminator: torch.nn.Module, x: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
+    if hasattr(discriminator, "forward_features"):
+        scores, feats = discriminator.forward_features(x)  # type: ignore[attr-defined]
+        if isinstance(scores, torch.Tensor):
+            return [scores], [feats]
+        return scores, feats
+    scores = discriminator(x)
+    if isinstance(scores, torch.Tensor):
+        return [scores], [[]]
+    return scores, [[] for _ in scores]
+
+
+def _gan_generator_loss(
+    discriminator: torch.nn.Module,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fake_scores, fake_feats = _disc_forward_features(discriminator, fake)
+    with torch.no_grad():
+        _, real_feats = _disc_forward_features(discriminator, real)
     adv = fake.new_zeros(())
     fake_mean = fake.new_zeros(())
     for score in fake_scores:
         adv = adv - score.mean()
         fake_mean = fake_mean + score.mean()
     n = float(max(1, len(fake_scores)))
-    return adv / n, fake_mean / n
+    fm = fake.new_zeros(())
+    n_fm = 0
+    for real_group, fake_group in zip(real_feats, fake_feats):
+        for real_layer, fake_layer in zip(real_group, fake_group):
+            fm = fm + torch.mean(torch.abs(fake_layer.float() - real_layer.detach().float()))
+            n_fm += 1
+    if n_fm > 0:
+        fm = fm / float(n_fm)
+    return adv / n, fake_mean / n, fm
 
 
 def _gan_discriminator_loss(
-    discriminator: MultiScaleWaveDiscriminator,
+    discriminator: torch.nn.Module,
     real: torch.Tensor,
     fake: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -325,7 +360,7 @@ def compute_loss(
     batch: torch.Tensor,
     step: int,
     mel_fb: torch.Tensor | None,
-    discriminator: MultiScaleWaveDiscriminator | None = None,
+    discriminator: torch.nn.Module | None = None,
     semantic_teacher: FrozenSemanticTeacher | None = None,
 ):
     curr = curriculum_state(step, cfg)
@@ -358,6 +393,7 @@ def compute_loss(
     )
     cos = batch_mean_cosine(batch, y_hat)
     l_sisdr = batch_neg_log_si_sdr(batch, y_hat) if cfg.lambda_sisdr > 0 else batch.new_zeros(())
+    l_preemph = batch_preemph_l1(batch, y_hat, cfg.preemph_coef) if cfg.lambda_preemph > 0 else batch.new_zeros(())
     ls_w = effective_lambda_stft(step, cfg)
     lm1 = batch.new_zeros(())
     lm2 = batch.new_zeros(())
@@ -382,8 +418,9 @@ def compute_loss(
         sem_items = sem_info.subset_items
     adv_g = batch.new_zeros(())
     disc_fake = batch.new_zeros(())
+    fm = batch.new_zeros(())
     if discriminator is not None and float(cfg.lambda_adv) > 0 and curr.gan_mult > 0:
-        adv_g, disc_fake = _gan_generator_loss(discriminator, y_hat)
+        adv_g, disc_fake, fm = _gan_generator_loss(discriminator, batch, y_hat)
     recon_terms = [
         ("time", lt, float(cfg.lambda_time)),
         ("stft", ls, float(ls_w)),
@@ -397,7 +434,9 @@ def compute_loss(
         ("semantic", l_sem, float(cfg.lambda_semantic)),
         ("wave_cos", 1.0 - cos, float(cfg.lambda_cos)),
         ("sisdr", l_sisdr, float(cfg.lambda_sisdr)),
+        ("preemph", l_preemph, float(cfg.lambda_preemph)),
         ("adv", adv_g, float(cfg.lambda_adv * curr.gan_mult)),
+        ("fm", fm, float(cfg.lambda_fm * curr.gan_mult)),
     ]
     recon_total, bal_scales = _balanced_reconstruction_loss(recon_terms, y_hat, cfg)
     total = recon_total + ae_anchor_total
@@ -431,6 +470,7 @@ def compute_loss(
         "lm1": lm1.detach(),
         "lm2": lm2.detach(),
         "l_sisdr": l_sisdr.detach(),
+        "l_preemph": l_preemph.detach(),
         "l_sem": l_sem.detach(),
         "semantic_cos": sem_cos,
         "semantic_items": sem_items,
@@ -439,6 +479,7 @@ def compute_loss(
         "marg_ent": marg_ent.detach(),
         "cos_m": cos.detach(),
         "adv_g": adv_g.detach(),
+        "fm": fm.detach(),
         "disc_fake": disc_fake.detach(),
         "idx": [i.detach() for i in idx] if idx is not None else None,
     }
@@ -559,6 +600,7 @@ def _append_training_log_csv(
         "loss_total",
         "l1",
         "sisdr_loss",
+        "preemph",
         "ae_l1",
         "sem",
         "stft",
@@ -582,6 +624,7 @@ def _append_training_log_csv(
         "sem_weight",
         "vq_weight",
         "adv_weight",
+        "fm_weight",
         "marginal_weight",
         "ae_anchor",
         "balancer",
@@ -608,6 +651,7 @@ def _append_training_log_csv(
         "loss_total": f"{loss_value:.6f}",
         "l1": f"{float(metrics['lt'].float().item()):.6f}",
         "sisdr_loss": f"{float(torch.as_tensor(metrics.get('l_sisdr', 0.0)).float().item()):.6f}",
+        "preemph": f"{float(torch.as_tensor(metrics.get('l_preemph', 0.0)).float().item()):.6f}",
         "ae_l1": f"{float(torch.as_tensor(metrics.get('ae_lt', 0.0)).float().item()):.6f}",
         "sem": f"{float(torch.as_tensor(metrics.get('l_sem', 0.0)).float().item()):.6f}",
         "stft": f"{float(metrics['ls'].float().item()):.6f}",
@@ -631,6 +675,7 @@ def _append_training_log_csv(
         "sem_weight": f"{cfg.lambda_semantic:.6f}",
         "vq_weight": f"{cfg.lambda_vq * float(metrics.get('phase_vq_mult', 1.0)):.6f}",
         "adv_weight": f"{cfg.lambda_adv * float(metrics.get('phase_gan_mult', 0.0)):.6f}",
+        "fm_weight": f"{cfg.lambda_fm * float(metrics.get('phase_gan_mult', 0.0)):.6f}",
         "marginal_weight": f"{effective_lambda_marginal(step, cfg) * float(metrics.get('phase_marginal_mult', 1.0)):.6f}",
         "ae_anchor": f"{float(torch.as_tensor(metrics.get('ae_anchor', 0.0)).float().item()):.6f}",
         "balancer": cfg.loss_balancer,
@@ -789,7 +834,7 @@ def print_run_header(
     _emit(
         _kv(
                 "training",
-                f"balancer={cfg.loss_balancer}  curriculum={'on' if cfg.curriculum else 'off'}  sisdr={cfg.lambda_sisdr:.3f}  sem={cfg.lambda_semantic:.3f}  adv={cfg.lambda_adv:.3f}",
+                f"balancer={cfg.loss_balancer}  curriculum={'on' if cfg.curriculum else 'off'}  sisdr={cfg.lambda_sisdr:.3f}  pre={cfg.lambda_preemph:.3f}  sem={cfg.lambda_semantic:.3f}  adv={cfg.lambda_adv:.3f}  fm={cfg.lambda_fm:.3f}",
             ansi,
             color="white",
         )
@@ -803,6 +848,9 @@ def print_run_header(
                 color="white",
             )
         )
+    if cfg.lambda_adv > 0:
+        periods = ",".join(str(x) for x in cfg.disc_periods)
+        _emit(_kv("disc", f"type={cfg.disc_type}  base={cfg.disc_base_channels}  scales={cfg.disc_scales}  periods={periods}", ansi, color="white"))
     _emit(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi, color="white"))
     stft_w = "none" if cfg.stft_scale_weights is None else ",".join(f"{float(w):g}" for w in cfg.stft_scale_weights)
     _emit(
@@ -931,6 +979,7 @@ def print_step_log(
     marg_ent_v = float(metrics["marg_ent"].float().item())
     semantic_cos_pct = 100.0 * float(metrics.get("semantic_cos", 0.0))
     adv_g_v = float(torch.as_tensor(metrics.get("adv_g", 0.0)).float().item())
+    fm_v = float(torch.as_tensor(metrics.get("fm", 0.0)).float().item())
     disc_fake_v = float(torch.as_tensor(metrics.get("disc_fake", 0.0)).float().item())
     max_ent = float(mean_log_codebook_for_entropy(cfg))
 
@@ -938,6 +987,8 @@ def print_step_log(
     l1_color = _low_is_good_color(l1_v, green=0.04, yellow=0.10)
     sisdr_loss_v = float(torch.as_tensor(metrics.get("l_sisdr", 0.0)).float().item())
     sisdr_loss_color = _low_is_good_color(sisdr_loss_v, green=0.0, yellow=1.0)
+    preemph_v = float(torch.as_tensor(metrics.get("l_preemph", 0.0)).float().item())
+    preemph_color = _low_is_good_color(preemph_v, green=0.03, yellow=0.10)
     sem_color = _low_is_good_color(sem_v, green=0.05, yellow=0.20)
     stft_color = _low_is_good_color(stft_v, green=0.50, yellow=1.50)
     sc_color = _low_is_good_color(sc_v, green=0.30, yellow=0.70)
@@ -993,8 +1044,8 @@ def print_step_log(
             _stat_cell("total", f"{loss_value:.5f}", ansi, value_color=total_color, value_width=10, total_width=cell_width),
             _stat_cell("l1", f"{l1_v:.4f}", ansi, value_color=l1_color, value_width=10, total_width=cell_width),
             _stat_cell("si", f"{sisdr_loss_v:.4f}", ansi, value_color=sisdr_loss_color, value_width=10, total_width=cell_width),
+            _stat_cell("pre", f"{preemph_v:.4f}", ansi, value_color=preemph_color, value_width=10, total_width=cell_width),
             _stat_cell("sem", f"{sem_v:.4f}", ansi, value_color=sem_color, value_width=10, total_width=cell_width),
-            _blank_cell(cell_width),
             _blank_cell(cell_width),
         ],
     )
@@ -1067,8 +1118,8 @@ def print_step_log(
             "red",
             [
                 _stat_cell("g", f"{adv_g_v:.4f}", ansi, value_color=_low_is_good_color(adv_g_v, green=1.0, yellow=3.0), value_width=9, total_width=cell_width),
+                _stat_cell("fm", f"{fm_v:.4f}", ansi, value_color=_low_is_good_color(fm_v, green=0.20, yellow=0.80), value_width=9, total_width=cell_width),
                 _stat_cell("d_fake", f"{disc_fake_v:.4f}", ansi, value_color=_neutral_zero_color(disc_fake_v, good_abs=0.5, warn_abs=2.0), value_width=9, total_width=cell_width),
-                _blank_cell(cell_width),
                 _blank_cell(cell_width),
                 _blank_cell(cell_width),
                 _blank_cell(cell_width),
@@ -1582,6 +1633,8 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--cos-hinge", type=float, default=c.cos_hinge)
     p.add_argument("--cos-target", type=float, default=c.cos_target)
     p.add_argument("--lambda-sisdr", type=float, default=c.lambda_sisdr, help="Differentiable negative log SI-SDR waveform loss weight")
+    p.add_argument("--lambda-preemph", type=float, default=c.lambda_preemph, help="Pre-emphasized waveform L1 loss weight")
+    p.add_argument("--preemph-coef", type=float, default=c.preemph_coef, help="Pre-emphasis coefficient for --lambda-preemph")
     p.add_argument("--lambda-ae-anchor-time", type=float, default=c.lambda_ae_anchor_time, help="During RVQ phases, keep continuous z->decoder time-domain reconstruction alive")
     p.add_argument("--lambda-ae-anchor-cos", type=float, default=c.lambda_ae_anchor_cos, help="During RVQ phases, keep continuous z->decoder waveform cosine high")
     p.add_argument("--loss-balancer", choices=["off", "grad"], default=c.loss_balancer, help="Balance reconstruction losses by gradient ratio wrt y_hat")
@@ -1593,7 +1646,12 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--semantic-batch-items", type=int, default=c.semantic_batch_items, help="How many batch items per update go through the SSL teacher")
     p.add_argument("--semantic-every", type=int, default=c.semantic_every, help="Apply semantic loss every N optimizer updates")
     p.add_argument("--lambda-adv", type=float, default=c.lambda_adv, help="Waveform GAN generator weight; >0 enables discriminator training")
+    p.add_argument("--lambda-fm", type=float, default=c.lambda_fm, help="Discriminator feature matching loss weight")
     p.add_argument("--disc-lr", type=float, default=c.disc_lr, help="Discriminator AdamW learning rate")
+    p.add_argument("--disc-type", choices=["msd", "mpd", "msmpd"], default=c.disc_type, help="Waveform discriminator family")
+    p.add_argument("--disc-base-channels", type=int, default=c.disc_base_channels)
+    p.add_argument("--disc-scales", type=int, default=c.disc_scales)
+    p.add_argument("--disc-periods", type=str, default=",".join(str(x) for x in c.disc_periods))
     _add_bool(p, "--curriculum", c.curriculum, "A=AE warmup, B=RVQ ramp, optional C=GAN ramp, D=full fine-tune")
     p.add_argument("--curriculum-ae-frac", type=float, default=c.curriculum_ae_frac)
     p.add_argument("--curriculum-vq-ramp-frac", type=float, default=c.curriculum_vq_ramp_frac)
@@ -1661,6 +1719,10 @@ def config_from_args(args) -> Config:
         raise SystemExit(f"--semantic-layers: {e}")
     if codebook_sizes is not None and len(codebook_sizes) != args.n_codebooks:
         raise SystemExit(f"--codebook-sizes: expected {args.n_codebooks} values, got {len(codebook_sizes)}")
+    try:
+        disc_periods = parse_positive_int_list_arg(args.disc_periods)
+    except ValueError as e:
+        raise SystemExit(f"--disc-periods: {e}")
     stft_scales = DEFAULT_STFT_SCALES if args.fast else parse_stft_scales_arg(args.stft_scales)
     stft_weights = parse_stft_scale_weights_arg(args.stft_scale_weights) if args.stft_scale_weights else None
     if stft_weights is not None and len(stft_weights) != len(stft_scales):
@@ -1733,6 +1795,8 @@ def config_from_args(args) -> Config:
         cos_hinge=args.cos_hinge,
         cos_target=args.cos_target,
         lambda_sisdr=args.lambda_sisdr,
+        lambda_preemph=args.lambda_preemph,
+        preemph_coef=args.preemph_coef,
         lambda_ae_anchor_time=args.lambda_ae_anchor_time,
         lambda_ae_anchor_cos=args.lambda_ae_anchor_cos,
         loss_balancer=args.loss_balancer,
@@ -1744,7 +1808,12 @@ def config_from_args(args) -> Config:
         semantic_batch_items=args.semantic_batch_items,
         semantic_every=args.semantic_every,
         lambda_adv=args.lambda_adv,
+        lambda_fm=args.lambda_fm,
         disc_lr=args.disc_lr,
+        disc_type=args.disc_type,
+        disc_base_channels=args.disc_base_channels,
+        disc_scales=args.disc_scales,
+        disc_periods=disc_periods,
         curriculum=bool(args.curriculum),
         curriculum_ae_frac=args.curriculum_ae_frac,
         curriculum_vq_ramp_frac=args.curriculum_vq_ramp_frac,
@@ -1832,6 +1901,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--loss-balancer-max-scale must be > 0")
     if args.lambda_sisdr < 0:
         raise SystemExit("--lambda-sisdr must be >= 0")
+    if args.lambda_preemph < 0:
+        raise SystemExit("--lambda-preemph must be >= 0")
+    if not (0.0 <= args.preemph_coef < 1.0):
+        raise SystemExit("--preemph-coef must be >= 0 and < 1")
     if args.lambda_ae_anchor_time < 0 or args.lambda_ae_anchor_cos < 0:
         raise SystemExit("--lambda-ae-anchor-time/cos must be >= 0")
     if args.lambda_semantic < 0:
@@ -1842,8 +1915,14 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--semantic-every must be >= 1")
     if args.lambda_adv < 0:
         raise SystemExit("--lambda-adv must be >= 0")
+    if args.lambda_fm < 0:
+        raise SystemExit("--lambda-fm must be >= 0")
     if args.disc_lr <= 0:
         raise SystemExit("--disc-lr must be > 0")
+    if args.disc_base_channels < 1:
+        raise SystemExit("--disc-base-channels must be >= 1")
+    if args.disc_scales < 1:
+        raise SystemExit("--disc-scales must be >= 1")
     for name in (
         "curriculum_ae_frac",
         "curriculum_vq_ramp_frac",
@@ -1945,9 +2024,9 @@ def main(argv: list[str] | None = None) -> None:
             )
         except Exception as e:
             raise SystemExit(f"failed to initialize semantic teacher {cfg.semantic_model}: {e}")
-    discriminator: MultiScaleWaveDiscriminator | None = None
+    discriminator: torch.nn.Module | None = None
     if float(cfg.lambda_adv) > 0:
-        discriminator = MultiScaleWaveDiscriminator().to(device)
+        discriminator = build_wave_discriminator(cfg).to(device)
         if cfg.use_bf16 and device.type == "cuda":
             discriminator = discriminator.to(dtype=torch.bfloat16)
     if args.torch_compile and cfg.curriculum:

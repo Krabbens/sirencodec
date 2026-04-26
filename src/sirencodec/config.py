@@ -192,6 +192,9 @@ class Config:
     cos_target: float = 0.9
     # Differentiable negative log SI-SDR ratio on waveform. Cheap phase/waveform anchor for mag-heavy STFT presets.
     lambda_sisdr: float = 0.0
+    # High-pass waveform anchor: L1 after pre-emphasis, useful when high harmonics smear under mag-only losses.
+    lambda_preemph: float = 0.0
+    preemph_coef: float = 0.97
     # During RVQ phases, keep a continuous z->decoder reconstruction anchor alive.
     # This prevents the encoder/decoder path learned in A from drifting while hard RVQ is optimized.
     lambda_ae_anchor_time: float = 0.0
@@ -208,7 +211,13 @@ class Config:
     semantic_every: int = 16
     # Optional waveform GAN (hinge). Generator adversarial term participates in the reconstruction loss balancer.
     lambda_adv: float = 0.0
+    # Discriminator feature matching. Strongly stabilizes MPD/MSD GAN starts.
+    lambda_fm: float = 0.0
     disc_lr: float = 2e-4
+    disc_type: str = "msd"  # "msd" | "mpd" | "msmpd"
+    disc_base_channels: int = 32
+    disc_scales: int = 3
+    disc_periods: tuple[int, ...] = (2, 3, 5, 7, 11)
     # Curriculum: A continuous AE, B RVQ/loss ramp, optional C GAN ramp, D full fine-tune.
     curriculum: bool = False
     curriculum_ae_frac: float = 0.15
@@ -432,6 +441,8 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "cos_hinge": c.cos_hinge,
         "cos_target": c.cos_target,
         "lambda_sisdr": c.lambda_sisdr,
+        "lambda_preemph": c.lambda_preemph,
+        "preemph_coef": c.preemph_coef,
         "lambda_ae_anchor_time": c.lambda_ae_anchor_time,
         "lambda_ae_anchor_cos": c.lambda_ae_anchor_cos,
         "loss_balancer": c.loss_balancer,
@@ -443,7 +454,12 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "semantic_batch_items": c.semantic_batch_items,
         "semantic_every": c.semantic_every,
         "lambda_adv": c.lambda_adv,
+        "lambda_fm": c.lambda_fm,
         "disc_lr": c.disc_lr,
+        "disc_type": c.disc_type,
+        "disc_base_channels": c.disc_base_channels,
+        "disc_scales": c.disc_scales,
+        "disc_periods": ",".join(str(x) for x in c.disc_periods),
         "curriculum": c.curriculum,
         "curriculum_ae_frac": c.curriculum_ae_frac,
         "curriculum_vq_ramp_frac": c.curriculum_vq_ramp_frac,

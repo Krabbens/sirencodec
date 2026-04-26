@@ -235,9 +235,63 @@ class WaveDiscriminator(nn.Module):
         ]
         self.net = nn.Sequential(*layers)
 
+    def forward_features(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        y = x.transpose(1, 2)
+        feats: list[torch.Tensor] = []
+        for layer in self.net:
+            y = layer(y)
+            if isinstance(layer, nn.Conv1d):
+                feats.append(y)
+        return y.flatten(1), feats
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.net(x.transpose(1, 2))
-        return y.flatten(1)
+        return self.forward_features(x)[0]
+
+
+class PeriodDiscriminator(nn.Module):
+    """HiFi-GAN style period discriminator; focuses on pitch-period structure."""
+
+    def __init__(self, period: int, base_channels: int = 16):
+        super().__init__()
+        self.period = int(period)
+        ch = int(base_channels)
+        widths = (ch, ch * 2, ch * 4, ch * 8, ch * 16)
+        self.layers = nn.ModuleList(
+            [
+                nn.Conv2d(1, widths[0], kernel_size=(5, 1), stride=(3, 1), padding=(2, 0)),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(widths[0], widths[1], kernel_size=(5, 1), stride=(3, 1), padding=(2, 0)),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(widths[1], widths[2], kernel_size=(5, 1), stride=(3, 1), padding=(2, 0)),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(widths[2], widths[3], kernel_size=(5, 1), stride=(3, 1), padding=(2, 0)),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(widths[3], widths[4], kernel_size=(5, 1), stride=(1, 1), padding=(2, 0)),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(widths[4], 1, kernel_size=(3, 1), stride=(1, 1), padding=(1, 0)),
+            ]
+        )
+
+    def _reshape_period(self, x: torch.Tensor) -> torch.Tensor:
+        y = x.transpose(1, 2)
+        t = int(y.shape[-1])
+        pad = (self.period - (t % self.period)) % self.period
+        if pad > 0:
+            y = F.pad(y, (0, pad), mode="reflect")
+            t += pad
+        return y.reshape(y.shape[0], 1, t // self.period, self.period)
+
+    def forward_features(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        y = self._reshape_period(x)
+        feats: list[torch.Tensor] = []
+        for layer in self.layers:
+            y = layer(y)
+            if isinstance(layer, nn.Conv2d):
+                feats.append(y)
+        return y.flatten(1), feats
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_features(x)[0]
 
 
 class MultiScaleWaveDiscriminator(nn.Module):
@@ -246,15 +300,76 @@ class MultiScaleWaveDiscriminator(nn.Module):
         self.discriminators = nn.ModuleList(WaveDiscriminator(base_channels=base_channels) for _ in range(max(1, int(n_scales))))
         self.downsample = nn.AvgPool1d(kernel_size=4, stride=2, padding=1, count_include_pad=False)
 
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+    def forward_features(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
         cur = x
         outs: list[torch.Tensor] = []
+        feats: list[list[torch.Tensor]] = []
         for i, disc in enumerate(self.discriminators):
-            outs.append(disc(cur))
+            score, fm = disc.forward_features(cur)
+            outs.append(score)
+            feats.append(fm)
             if i + 1 < len(self.discriminators):
                 cur_nct = cur.transpose(1, 2)
                 cur = self.downsample(cur_nct).transpose(1, 2)
-        return outs
+        return outs, feats
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return self.forward_features(x)[0]
+
+
+class MultiPeriodWaveDiscriminator(nn.Module):
+    def __init__(self, periods: tuple[int, ...] = (2, 3, 5, 7, 11), base_channels: int = 16):
+        super().__init__()
+        self.discriminators = nn.ModuleList(
+            PeriodDiscriminator(period=int(period), base_channels=base_channels) for period in periods
+        )
+
+    def forward_features(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
+        outs: list[torch.Tensor] = []
+        feats: list[list[torch.Tensor]] = []
+        for disc in self.discriminators:
+            score, fm = disc.forward_features(x)
+            outs.append(score)
+            feats.append(fm)
+        return outs, feats
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return self.forward_features(x)[0]
+
+
+class MultiScaleMultiPeriodWaveDiscriminator(nn.Module):
+    def __init__(
+        self,
+        *,
+        n_scales: int = 3,
+        periods: tuple[int, ...] = (2, 3, 5, 7, 11),
+        base_channels: int = 16,
+    ):
+        super().__init__()
+        self.msd = MultiScaleWaveDiscriminator(n_scales=n_scales, base_channels=base_channels)
+        self.mpd = MultiPeriodWaveDiscriminator(periods=periods, base_channels=base_channels)
+
+    def forward_features(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
+        ms_scores, ms_feats = self.msd.forward_features(x)
+        mp_scores, mp_feats = self.mpd.forward_features(x)
+        return ms_scores + mp_scores, ms_feats + mp_feats
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return self.forward_features(x)[0]
+
+
+def build_wave_discriminator(cfg: Config) -> nn.Module:
+    kind = str(getattr(cfg, "disc_type", "msd") or "msd").strip().lower()
+    base = int(getattr(cfg, "disc_base_channels", 32))
+    scales = int(getattr(cfg, "disc_scales", 3))
+    periods = tuple(int(p) for p in getattr(cfg, "disc_periods", (2, 3, 5, 7, 11)))
+    if kind == "msd":
+        return MultiScaleWaveDiscriminator(n_scales=scales, base_channels=base)
+    if kind == "mpd":
+        return MultiPeriodWaveDiscriminator(periods=periods, base_channels=base)
+    if kind == "msmpd":
+        return MultiScaleMultiPeriodWaveDiscriminator(n_scales=scales, periods=periods, base_channels=base)
+    raise ValueError(f"unknown disc_type={kind!r}")
 
 
 class CUDACodec(nn.Module):

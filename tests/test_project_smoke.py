@@ -21,12 +21,19 @@ from sirencodec.config import (
     parse_stft_scale_weights_arg,
     parse_stft_scales_arg,
 )
-from sirencodec.cuda.codec import CUDACodec, MultiScaleWaveDiscriminator, ResidualVectorQuantizer
+from sirencodec.cuda.codec import (
+    CUDACodec,
+    MultiPeriodWaveDiscriminator,
+    MultiScaleWaveDiscriminator,
+    ResidualVectorQuantizer,
+    build_wave_discriminator,
+)
 from sirencodec.cuda.data import dataset_dir_candidates
 from sirencodec.cuda.train import (
     _codec_eval_score,
     _active_stft_scales,
     _spectral_loss_batch,
+    batch_preemph_l1,
     batch_neg_log_si_sdr,
     compute_loss,
     config_from_args,
@@ -61,6 +68,8 @@ def test_config_defaults_are_coherent():
     assert cfg.semantic_batch_items >= 1
     assert cfg.semantic_every >= 1
     assert isinstance(cfg.eval_seed, int)
+    assert cfg.disc_type in {"msd", "mpd", "msmpd"}
+    assert all(p > 0 for p in cfg.disc_periods)
 
 
 def test_argparse_defaults_cover_current_config():
@@ -70,6 +79,9 @@ def test_argparse_defaults_cover_current_config():
     assert defaults["dataset"] == Config().dataset
     assert defaults["semantic_model"] == Config().semantic_model
     assert defaults["semantic_every"] == Config().semantic_every
+    assert defaults["lambda_preemph"] == Config().lambda_preemph
+    assert defaults["lambda_fm"] == Config().lambda_fm
+    assert defaults["disc_periods"] == ",".join(str(x) for x in Config().disc_periods)
 
 
 def test_stft_parsers_accept_valid_values_and_reject_bad_ones():
@@ -241,6 +253,14 @@ def test_si_sdr_loss_prefers_aligned_waveform():
     assert batch_neg_log_si_sdr(x, x) < batch_neg_log_si_sdr(x, -x)
 
 
+def test_preemphasis_loss_penalizes_high_frequency_error():
+    x = torch.zeros(2, 32, 1)
+    y = x.clone()
+    y[:, ::2, :] = 0.1
+    assert batch_preemph_l1(x, x) == pytest.approx(0.0)
+    assert float(batch_preemph_l1(x, y, 0.97)) > 0.0
+
+
 def test_rvq_residual_stages_all_carry_reconstruction_gradient():
     cfg = Config(
         latent_dim=4,
@@ -276,6 +296,24 @@ def test_multiscale_wave_discriminator_returns_one_logits_tensor_per_scale():
     assert all(t.shape[0] == 2 for t in outs)
 
 
+def test_multiperiod_wave_discriminator_returns_logits_and_features():
+    disc = MultiPeriodWaveDiscriminator(periods=(2, 3), base_channels=4)
+    x = torch.randn(2, 513, 1)
+    outs, feats = disc.forward_features(x)
+    assert len(outs) == 2
+    assert len(feats) == 2
+    assert all(t.ndim == 2 for t in outs)
+    assert all(t.shape[0] == 2 for t in outs)
+    assert all(group for group in feats)
+
+
+def test_discriminator_builder_accepts_mpd_config():
+    cfg = Config(disc_type="mpd", disc_base_channels=4, disc_periods=(2, 3))
+    disc = build_wave_discriminator(cfg)
+    outs = disc(torch.randn(1, 257, 1))
+    assert len(outs) == 2
+
+
 def test_dataset_dir_candidates_cover_supported_datasets():
     assert dataset_dir_candidates("cv-corpus")[0].as_posix().endswith("data/cv-corpus")
     libri = dataset_dir_candidates("train-clean-100")
@@ -295,6 +333,10 @@ def test_train_parser_accepts_json_config_and_cli_overrides(tmp_path: Path):
                 "batch": 7,
                 "curriculum": True,
                 "lambda_adv": 0.03,
+                "lambda_fm": 0.7,
+                "disc_type": "mpd",
+                "disc_base_channels": 8,
+                "disc_periods": "2,5",
                 "eval_seed": 123,
             }
         ),
@@ -306,6 +348,10 @@ def test_train_parser_accepts_json_config_and_cli_overrides(tmp_path: Path):
     assert cfg.batch == 9
     assert cfg.curriculum is True
     assert cfg.lambda_adv == pytest.approx(0.03)
+    assert cfg.lambda_fm == pytest.approx(0.7)
+    assert cfg.disc_type == "mpd"
+    assert cfg.disc_base_channels == 8
+    assert cfg.disc_periods == (2, 5)
     assert cfg.eval_seed == 123
 
 
@@ -390,6 +436,29 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
     base_params = sum(p.numel() for p in CUDACodec(base_cfg).parameters())
     wide_params = sum(p.numel() for p in CUDACodec(cfg).parameters())
     assert wide_params / base_params == pytest.approx(2.93, rel=0.03)
+
+
+def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
+    cfg_path = ROOT / "configs" / "sub1k_harmonic_20.json"
+    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert data["epochs"] == 20
+    assert data["n_codebooks"] == 2
+    assert data["codebook_sizes"] == "256,128"
+    assert data["disc_type"] == "mpd"
+    assert data["lambda_adv"] > 0.0
+    assert data["lambda_fm"] > 0.0
+    assert data["lambda_preemph"] > 0.0
+    assert data["curriculum_ae_frac"] == pytest.approx(0.05)
+    assert data["curriculum_vq_ramp_frac"] <= 0.25
+
+    args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
+    cfg = config_from_args(args)
+    ref_args = parse_args(["--config", str(ROOT / "configs" / "sub1k_200.json"), "--steps", "1", "--batch", "1"])
+    ref_cfg = config_from_args(ref_args)
+    assert effective_codebook_sizes(cfg) == effective_codebook_sizes(ref_cfg)
+    assert encoder_time_stride(cfg) == encoder_time_stride(ref_cfg)
+    assert nominal_rvq_kbps(cfg) == pytest.approx(nominal_rvq_kbps(ref_cfg))
+    assert cfg.disc_periods == (2, 3, 5, 7, 11)
 
 
 def test_spectral_loss_batch_limits_large_fft_work_and_wraps():

@@ -53,3 +53,11 @@ Each template can include run-length and logging defaults such as:
   - uses a long quantization blend ramp and stronger marginal entropy to avoid low-bitrate index collapse
   - fixed validation clips and best-checkpoint saving make late-run drift easier to avoid
   - default `dataset=train-clean-360`, `epochs=200`, `logs_per_epoch=1`
+
+- `sub1k_harmonic_20.json`
+  - short 20-epoch test preset for the high-frequency smear fix
+  - keeps the same sub-1 kbps RVQ bitrate/codebooks as `sub1k_200.json` (`2` stages, `K=256,128`, same stride)
+  - moves through RVQ much earlier (`A=5%`, `B=25%`) and spends `40%` of the run in GAN ramp
+  - enables MPD (`disc_type=mpd`) plus discriminator feature matching to reward periodic harmonic structure
+  - adds pre-emphasized waveform L1 so the loss sees high-frequency detail even before/without adversarial pressure
+  - keeps the large `4096/8192` STFT stack but still cycles it every 4 steps for speed
