@@ -391,6 +391,7 @@ def test_sub1k_template_avoids_factorized_rvq_cold_start():
     assert data["spectral_batch_items"] == 16
     assert data["stft_large_min_fft"] == 4096
     assert data["stft_large_every"] == 4
+    assert data.get("curriculum", False) is False
     assert data["curriculum_ae_frac"] <= 0.05
     assert data["curriculum_vq_ramp_frac"] >= 0.65
     assert data["curriculum_vq_start"] >= 0.25
@@ -420,6 +421,7 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
     cfg_path = ROOT / "configs" / "sub1k_200.json"
     args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
     cfg = config_from_args(args)
+    assert cfg.curriculum is False
     assert cfg.enc_channels == (56, 80, 112, 160, 224, 320, 448, 640)
     assert cfg.latent_dim == 512
     assert cfg.stft_scales == ((512, 128), (1024, 256), (2048, 512), (4096, 1024), (8192, 2048))
@@ -455,6 +457,7 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
 def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
     cfg_path = ROOT / "configs" / "sub1k_harmonic_20.json"
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert data.get("curriculum", False) is False
     assert data["epochs"] == 20
     assert data["n_codebooks"] == 2
     assert data["codebook_sizes"] == "256,128"
@@ -470,6 +473,7 @@ def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
 
     args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
     cfg = config_from_args(args)
+    assert cfg.curriculum is False
     ref_args = parse_args(["--config", str(ROOT / "configs" / "sub1k_200.json"), "--steps", "1", "--batch", "1"])
     ref_cfg = config_from_args(ref_args)
     assert effective_codebook_sizes(cfg) == effective_codebook_sizes(ref_cfg)
