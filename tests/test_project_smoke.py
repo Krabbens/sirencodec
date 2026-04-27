@@ -40,6 +40,7 @@ from sirencodec.cuda.train import (
     curriculum_quantize_blend,
     curriculum_state,
     forward_full_for_curriculum_step,
+    main,
     parse_args,
 )
 
@@ -452,6 +453,104 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
     base_params = sum(p.numel() for p in CUDACodec(base_cfg).parameters())
     wide_params = sum(p.numel() for p in CUDACodec(cfg).parameters())
     assert wide_params / base_params == pytest.approx(2.93, rel=0.03)
+
+
+def test_sub1k_semantic_ft_30_template_matches_trunk_plus_semantic():
+    cfg_path = ROOT / "configs" / "sub1k_semantic_ft_30.json"
+    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert data["epochs"] == 30
+    assert data["lr"] == pytest.approx(2e-5)
+    assert data["lr_warmup_steps"] == 400
+    assert data["lr_plateau_patience"] == 800
+    assert data["lr_plateau_cooldown"] == 250
+    assert data["lr_min_ratio"] == pytest.approx(0.20)
+    assert data["lambda_semantic"] == pytest.approx(0.5)
+    assert data["semantic_model"] == "HUBERT_BASE"
+    assert data["semantic_layers"] == "9"
+    assert data["semantic_batch_items"] == 16
+    assert data["semantic_every"] == 4
+    assert data["lambda_marginal"] == pytest.approx(0.10)
+    assert data["marginal_boost_steps"] == 0
+    assert data["curriculum"] is False
+    assert data["enc_channels"] == "56,80,112,160,224,320,448,640"
+    assert data["codebook_sizes"] == "256,128"
+
+    args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
+    cfg = config_from_args(args)
+    assert cfg.lambda_semantic == pytest.approx(0.5)
+    assert cfg.semantic_layers == (9,)
+    assert cfg.semantic_batch_items == 16
+    assert cfg.semantic_every == 4
+    assert cfg.lambda_marginal == pytest.approx(0.10)
+    assert cfg.marginal_boost_steps == 0
+
+
+def test_init_from_rejects_continue():
+    cfg_path = ROOT / "configs" / "sub1k_semantic_ft_30.json"
+    with pytest.raises(SystemExit, match="use either --continue or --init-from"):
+        main(["--config", str(cfg_path), "--continue", "dummy.pt", "--init-from", "other.pt"])
+
+
+def test_init_from_missing_checkpoint_exits():
+    cfg_path = ROOT / "configs" / "sub1k_semantic_ft_30.json"
+    with pytest.raises(SystemExit, match="--init-from checkpoint not found"):
+        main(["--config", str(cfg_path), "--init-from", str(ROOT / "this_checkpoint_does_not_exist_12345.pt")])
+
+
+def test_init_from_warm_start_runs_one_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import numpy as np
+    import soundfile as sf
+
+    monkeypatch.chdir(tmp_path)
+    audio_dir = tmp_path / "data" / "train-clean-360"
+    audio_dir.mkdir(parents=True)
+    wav = (0.1 * np.sin(2 * np.pi * 440.0 * np.linspace(0, 1, 16000, endpoint=False))).astype(np.float32)
+    sf.write(str(audio_dir / "one.wav"), wav, 16000)
+
+    cfg_path = ROOT / "configs" / "sub1k_semantic_ft_30.json"
+    seed_path = tmp_path / "seed_weights.pt"
+    seed_args = parse_args(
+        [
+            "--config",
+            str(cfg_path),
+            "--steps",
+            "1",
+            "--batch",
+            "2",
+            "--lambda-semantic",
+            "0",
+            "--no-bf16",
+            "--eval-every",
+            "0",
+        ]
+    )
+    seed_cfg = config_from_args(seed_args)
+    torch.save({"model": CUDACodec(seed_cfg).state_dict()}, seed_path)
+
+    main(
+        [
+            "--config",
+            str(cfg_path),
+            "--init-from",
+            str(seed_path),
+            "--steps",
+            "1",
+            "--batch",
+            "2",
+            "--lambda-semantic",
+            "0",
+            "--no-bf16",
+            "--eval-every",
+            "0",
+        ]
+    )
+    exp = tmp_path / "experiments"
+    assert exp.is_dir()
+    runs = list(exp.iterdir())
+    assert len(runs) == 1
+    meta = json.loads((runs[0] / "train_config.json").read_text(encoding="utf-8"))
+    assert meta.get("init_from") == str(seed_path.resolve())
+    assert meta.get("resume_from") is None
 
 
 def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
