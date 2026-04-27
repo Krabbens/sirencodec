@@ -167,7 +167,7 @@ class Config:
     n_mels: int = 80
     mel_fmin: float = 0.0
     mel_fmax: float | None = None  # None → Nyquist (sample_rate / 2)
-    lambda_mel_l1: float = 0.06
+    lambda_mel_l1: float = 0.12
     lambda_mel_l2: float = 0.0
     # Per-position softmax entropy (can be ~log(K) while hard indices collapse); 0 = off
     lambda_entropy: float = 0.0

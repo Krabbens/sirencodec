@@ -3,7 +3,7 @@
 train_mlx.py — Karpathy-style single-file MLX neural audio codec (Apple Silicon).
 
 Inlined stack: SEANet-ish encoder → **residual VQ** (EnCodec-style) → decoder,
-time + **multi-scale** log-STFT loss + default **log-mel bin L1** only (``λ_mel_L1=0.06``, ``λ_mel_L2=0``); set ``--lambda-mel-l1 0`` to disable mel, optional WAV batches. No PyTorch / sirencodec.
+time + **multi-scale** log-STFT loss + default **log-mel bin L1** only (``λ_mel_L1=0.12``, ``λ_mel_L2=0``); set ``--lambda-mel-l1 0`` to disable mel, optional WAV batches. No PyTorch / sirencodec.
 
   uv sync --extra mlx
   uv run python tools/train_mlx.py --steps 500 --data-dir data/mlx_smoke
@@ -1022,9 +1022,9 @@ def main() -> None:
     p.add_argument(
         "--lambda-mel-l1",
         type=float,
-        default=0.06,
+        default=0.12,
         metavar="W",
-        help="add W·λ_stft_eff·mean|Δlog mel| (0=off). Default 0.06 (L1-only mel); lower if recon smears",
+        help="add W·λ_stft_eff·mean|Δlog mel| (0=off). Default 0.12 (L1-only mel); lower if recon smears",
     )
     p.add_argument(
         "--lambda-mel-l2",
