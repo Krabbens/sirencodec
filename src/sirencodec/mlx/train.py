@@ -3,7 +3,7 @@
 train_mlx.py — Karpathy-style single-file MLX neural audio codec (Apple Silicon).
 
 Inlined stack: SEANet-ish encoder → **residual VQ** (EnCodec-style) → decoder,
-time + **multi-scale** log-STFT loss + default **log-mel bin L1** only (``λ_mel_L1=0.03``, ``λ_mel_L2=0``); set ``--lambda-mel-l1 0`` to disable mel, optional WAV batches. No PyTorch / sirencodec.
+time + **multi-scale** log-STFT loss + default **log-mel bin L1** only (``λ_mel_L1=0.06``, ``λ_mel_L2=0``); set ``--lambda-mel-l1 0`` to disable mel, optional WAV batches. No PyTorch / sirencodec.
 
   uv sync --extra mlx
   uv run python tools/train_mlx.py --steps 500 --data-dir data/mlx_smoke
@@ -20,7 +20,7 @@ time + **multi-scale** log-STFT loss + default **log-mel bin L1** only (``λ_mel
   **Spectrogram length:** default ``--spectrogram-seconds 8`` for PNG/WAV (set ``0`` to use the training batch length).
   **Checkpoints:** ``--checkpoint-every 10000`` (default) writes ``codec_step{N}.npz`` under ``--checkpoint-dir``.
   **Resume:** ``--resume`` loads weights; continues from step ``N+1``. Adam moments re-init; **LR schedule** uses global step ``N+1`` (no restart of cosine). ``--lr-schedule none`` keeps constant ``--lr``.
-  **Step time:** single codec forward/backward per micro-batch + multi-scale STFT losses (SC, complex L1, log-mag L1, optional gradient/cosine). **Throughput:** ``--load-audio-threads T`` parallelizes per-sample disk decode (``T≈8–16`` on Libri); ``--prefetch-audio`` overlaps the next micro-batch load (off when ``--grad-accum-steps`` > 1). **Gradient accumulation:** ``--grad-accum-steps K`` + small ``--batch`` = ``K`` backward passes per optimizer step, gradient average = effective batch ``B·K`` (Libri offset matches ``B·K`` samples per step). Mitigations: ``--fast`` / fewer ``--stft-scales``, lower ``--lambda-stft-grad`` or 0, ``--lambda-mel-l1 0``, smaller ``--batch``. Heavy: ``--vq-reset-every`` (CPU), long PNG/WAV every ``--spectrogram-every``.
+  **Step time:** single codec forward/backward per micro-batch + multi-scale STFT losses (SC, complex L1, log-mag L1, optional gradient/cosine). **Throughput:** ``--load-audio-threads T`` parallelizes per-sample disk decode (``T≈8–16`` on Libri); ``--prefetch-audio`` overlaps the next micro-batch load (off when ``--grad-accum-steps`` > 1). **Gradient accumulation:** ``--grad-accum-steps K`` + small ``--batch`` = ``K`` backward passes per optimizer step, gradient average = effective batch ``B·K`` (Libri offset matches ``B·K`` samples per step). Mitigations: ``--fast`` / fewer ``--stft-scales``, lower ``--lambda-stft-grad`` or 0, ``--lambda-mel-l1 0`` (or lower), smaller ``--batch``. Heavy: ``--vq-reset-every`` (CPU), long PNG/WAV every ``--spectrogram-every``.
   **Architecture:** 8 stride-2 stages (256× time), default **latent_dim 512**; default **3× residual VQ** with **K=32** → **15 bits/latent-frame** × **62.5 Hz** ≈ **938 b/s** indices (<1 kb/s) @ 16 kHz. Optional ``--codebook-sizes`` / ``--codebook-size``. Optional ``--stride1-blocks-per-scale``.
   **Latent temporal context:** ``--latent-temporal-depth N`` adds N residual dilated Conv1d blocks **before** RVQ; ``--latent-temporal-post-depth M`` adds M blocks **after** RVQ (before decoder).
   **Spectral (GAN-free):** high-quality recipe without a discriminator. Combine log-mag L1 (``--lambda-stft``) with **Spectral Convergence** (``--lambda-sc``; Parallel WaveGAN) and **Complex STFT L1** (``--lambda-complex-stft``; captures phase). Optional sharpness terms: ``--lambda-stft-grad`` (∂/∂f, ∂/∂t log-mag) and ``--lambda-stft-cos`` (spectral cosine). Multi-scale via ``--stft-scales`` / ``--stft-scale-weights``.
@@ -1022,9 +1022,9 @@ def main() -> None:
     p.add_argument(
         "--lambda-mel-l1",
         type=float,
-        default=0.03,
+        default=0.06,
         metavar="W",
-        help="add W·λ_stft_eff·mean|Δlog mel| (0=off). Default 0.03 (L1-only mel); lower if recon smears",
+        help="add W·λ_stft_eff·mean|Δlog mel| (0=off). Default 0.06 (L1-only mel); lower if recon smears",
     )
     p.add_argument(
         "--lambda-mel-l2",
