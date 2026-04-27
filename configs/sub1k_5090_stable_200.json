@@ -71,7 +71,7 @@
   "stft_grad_time_weight": 0.60,
   "mel_n_fft": 2048,
   "mel_hop": 512,
-  "lambda_mel_l1": 0.03,
+  "lambda_mel_l1": 0.12,
   "lambda_mel_l2": 0.0,
   "lambda_time": 2.50,
   "lambda_cos": 0.45,
