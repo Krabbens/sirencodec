@@ -19,7 +19,7 @@ time + **multi-scale** log-STFT loss + default **log-mel bin L1** only (``λ_mel
   **Spectral cosine:** ``--lambda-stft-cos W`` adds ``W·λ_stft_eff`` times the mean ``(1−cos)`` between flattened log-mag STFTs (per scale, then averaged). Waveform cosine is ``--lambda-cos`` (separate).
   **Spectrogram length:** default ``--spectrogram-seconds 8`` for PNG/WAV (set ``0`` to use the training batch length).
   **Checkpoints:** ``--checkpoint-every 10000`` (default) writes ``codec_step{N}.npz`` under ``--checkpoint-dir``.
-  **Resume:** ``--resume`` loads weights; continues from step ``N+1``. Adam moments re-init; **LR schedule** uses global step ``N+1`` (no restart of cosine). ``--lr-schedule none`` keeps constant ``--lr``.
+  **Resume:** ``--resume`` loads weights; continues from step ``N+1``. Full ``.safetensors`` resume restores optimizer + optional ``lr_plateau`` meta. ``--lr-schedule none`` keeps constant ``--lr``; ``plateau`` reduces LR when EMA train loss stalls; ``cosine`` decays by step.
   **Step time:** single codec forward/backward per micro-batch + multi-scale STFT losses (SC, complex L1, log-mag L1, optional gradient/cosine). **Throughput:** ``--load-audio-threads T`` parallelizes per-sample disk decode (``T≈8–16`` on Libri); ``--prefetch-audio`` overlaps the next micro-batch load (off when ``--grad-accum-steps`` > 1). **Gradient accumulation:** ``--grad-accum-steps K`` + small ``--batch`` = ``K`` backward passes per optimizer step, gradient average = effective batch ``B·K`` (Libri offset matches ``B·K`` samples per step). Mitigations: ``--fast`` / fewer ``--stft-scales``, lower ``--lambda-stft-grad`` or 0, ``--lambda-mel-l1 0`` (or lower), smaller ``--batch``. Heavy: ``--vq-reset-every`` (CPU), long PNG/WAV every ``--spectrogram-every``.
   **Architecture:** 8 stride-2 stages (256× time), default **latent_dim 512**; default **3× residual VQ** with **K=32** → **15 bits/latent-frame** × **62.5 Hz** ≈ **938 b/s** indices (<1 kb/s) @ 16 kHz. Optional ``--codebook-sizes`` / ``--codebook-size``. Optional ``--stride1-blocks-per-scale``.
   **Latent temporal context:** ``--latent-temporal-depth N`` adds N residual dilated Conv1d blocks **before** RVQ; ``--latent-temporal-post-depth M`` adds M blocks **after** RVQ (before decoder).
@@ -758,6 +758,7 @@ def save_full_checkpoint(
     data_off: int,
     model: nn.Module,
     opt: Adam,
+    lr_plateau_state: dict | None = None,
 ) -> None:
     """Single-safetensors checkpoint with model weights + Adam state. No disc / no EMA (GAN-free recipe)."""
     flat: dict[str, mx.array] = {}
@@ -766,7 +767,10 @@ def save_full_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(path), flat)
     meta_path = path.with_suffix(".meta.json")
-    meta_path.write_text(json.dumps({"step": step, "data_off": data_off}, indent=0) + "\n")
+    meta: dict = {"step": step, "data_off": data_off}
+    if lr_plateau_state is not None:
+        meta["lr_plateau"] = lr_plateau_state
+    meta_path.write_text(json.dumps(meta, indent=0) + "\n")
 
 
 def load_full_checkpoint_into(
@@ -786,19 +790,128 @@ def _cast_module_floats(module: nn.Module, dtype) -> None:
         module.load_weights(flat)
 
 
-def build_lr_schedule(
-    cfg: Config, *, lr_scale: float = 1.0
-) -> float | Callable[[mx.array], mx.array]:
-    """Return constant LR or an MLX scheduler callable (``step`` = optimizer step counter).
+class PlateauLRSchedule:
+    """ReduceLROnPlateau-style LR: drop ``_lr`` when EMA(train loss) stops improving (after warmup).
 
-    ``lr_scale`` scales the peak (and cosine floor).
+    MLX ``Adam`` takes ``lr(step)``; this object is callable and holds mutable ``_lr``. Call
+    ``observe(loss)`` once per optimizer step after ``opt.update`` (warmup steps skipped).
+    """
+
+    __slots__ = (
+        "peak",
+        "min_lr",
+        "wu",
+        "factor",
+        "patience",
+        "threshold",
+        "ema_beta",
+        "cooldown",
+        "_lr",
+        "best",
+        "bad",
+        "ema",
+        "_cool_left",
+    )
+
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        lr_scale: float = 1.0,
+        resume: dict | None = None,
+    ) -> None:
+        self.peak = float(cfg.lr) * float(lr_scale)
+        self.min_lr = self.peak * float(cfg.lr_min_ratio)
+        self.wu = max(0, int(cfg.lr_warmup_steps))
+        self.factor = float(cfg.lr_plateau_factor)
+        self.patience = max(1, int(cfg.lr_plateau_patience))
+        self.threshold = max(0.0, float(cfg.lr_plateau_threshold))
+        self.ema_beta = float(cfg.lr_plateau_ema)
+        self.cooldown = max(0, int(cfg.lr_plateau_cooldown))
+        self._lr = self.peak
+        self.best = float("inf")
+        self.bad = 0
+        self.ema: float | None = None
+        self._cool_left = 0
+        if resume:
+            self.load_state(resume)
+
+    def load_state(self, d: dict) -> None:
+        self._lr = float(d.get("lr", self._lr))
+        b = d.get("best")
+        self.best = float("inf") if b is None else float(b)
+        self.bad = int(d.get("bad", 0))
+        e = d.get("ema")
+        self.ema = None if e is None else float(e)
+        self._cool_left = int(d.get("cool_left", 0))
+
+    def state_dict(self) -> dict:
+        return {
+            "lr": self._lr,
+            "best": None if self.best == float("inf") else self.best,
+            "bad": self.bad,
+            "ema": self.ema,
+            "cool_left": self._cool_left,
+        }
+
+    def observe(self, loss: float) -> None:
+        lf = float(loss)
+        if not math.isfinite(lf):
+            return
+        beta = self.ema_beta
+        if not (0.0 <= beta < 1.0):
+            beta = 0.0
+        if self.ema is None:
+            self.ema = lf
+        else:
+            self.ema = beta * float(self.ema) + (1.0 - beta) * lf
+        m = float(self.ema)
+        if self._cool_left > 0:
+            self._cool_left -= 1
+            return
+        if self.best == float("inf") or m < self.best * (1.0 - self.threshold):
+            self.best = m
+            self.bad = 0
+            return
+        self.bad += 1
+        if self.bad > self.patience:
+            new_lr = max(self._lr * self.factor, self.min_lr)
+            if new_lr < self._lr - 1e-15:
+                old = self._lr
+                self._lr = new_lr
+                print(
+                    f"  [lr-plateau] lr {old:.2e} → {self._lr:.2e}  "
+                    f"(ema_loss={m:.5f} best={self.best:.5f})",
+                    flush=True,
+                )
+            self.bad = 0
+            self._cool_left = self.cooldown
+
+    def __call__(self, step_mx: mx.array) -> mx.array:
+        s = int(step_mx.item())
+        if self.wu > 0 and s < self.wu:
+            return mx.array(self.peak * float(s + 1) / float(self.wu), dtype=mx.float32)
+        return mx.array(max(self._lr, self.min_lr), dtype=mx.float32)
+
+
+def build_lr_schedule(
+    cfg: Config,
+    *,
+    lr_scale: float = 1.0,
+    plateau_resume: dict | None = None,
+) -> float | Callable[[mx.array], mx.array] | PlateauLRSchedule:
+    """Return constant LR, cosine schedule, or a :class:`PlateauLRSchedule` instance.
+
+    ``lr_scale`` scales the peak (and cosine floor / plateau min).
     """
     scale = float(lr_scale)
     mode = (cfg.lr_schedule or "none").strip().lower()
     if mode in ("none", "constant", "off"):
         return float(cfg.lr) * scale
+    if mode == "plateau":
+        return PlateauLRSchedule(cfg, lr_scale=scale, resume=plateau_resume)
     if mode != "cosine":
-        raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule!r} (use none or cosine)")
+        raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule!r} (use none, cosine, or plateau)")
     peak = float(cfg.lr) * scale
     end = peak * float(cfg.lr_min_ratio)
     total = max(1, int(cfg.steps))
@@ -844,27 +957,62 @@ def main() -> None:
         help="While the GPU runs step t, load batch t+1 on a side thread (only with --data-dir / --librispeech)",
     )
     p.add_argument("--segment", type=int, default=16384, help="Waveform length per sample (more latent frames helps RVQ)")
-    p.add_argument("--lr", type=float, default=5e-4, help="Adam peak LR (cosine) or constant LR (--lr-schedule none)")
+    p.add_argument("--lr", type=float, default=5e-4, help="Adam peak LR (warmup/plateau/cosine) or constant (--lr-schedule none)")
     p.add_argument(
         "--lr-schedule",
         type=str,
-        default="cosine",
-        choices=("none", "cosine"),
-        help="LR schedule: cosine decay to --lr×--lr-min-ratio by final step, or none (constant --lr)",
+        default="plateau",
+        choices=("none", "cosine", "plateau"),
+        help="LR: plateau=ReduceLROnPlateau on EMA train loss; cosine=decay to --lr×--lr-min-ratio; none=constant",
     )
     p.add_argument(
         "--lr-min-ratio",
         type=float,
         default=0.1,
         metavar="R",
-        help="Cosine floor = --lr × R (only for cosine schedule; use 0 for decay to 0)",
+        help="Cosine floor or plateau minimum lr = --lr × R",
     )
     p.add_argument(
         "--lr-warmup-steps",
         type=int,
         default=0,
         metavar="W",
-        help="Linear warmup steps 0→--lr before cosine (0 = off)",
+        help="Linear warmup steps 0→--lr before cosine/plateau monitoring (0 = off)",
+    )
+    p.add_argument(
+        "--lr-plateau-factor",
+        type=float,
+        default=0.25,
+        metavar="F",
+        help="Plateau: multiply lr by F when patience exceeded (try 0.2–0.35 for fast ramp down)",
+    )
+    p.add_argument(
+        "--lr-plateau-patience",
+        type=int,
+        default=1200,
+        metavar="P",
+        help="Plateau: optimizer steps without relative improvement before lr drop",
+    )
+    p.add_argument(
+        "--lr-plateau-threshold",
+        type=float,
+        default=0.002,
+        metavar="T",
+        help="Plateau: rel improvement if ema_loss < best × (1−T)",
+    )
+    p.add_argument(
+        "--lr-plateau-ema",
+        type=float,
+        default=0.985,
+        metavar="B",
+        help="Plateau: EMA decay on train loss for monitoring (0 = raw loss; use <1)",
+    )
+    p.add_argument(
+        "--lr-plateau-cooldown",
+        type=int,
+        default=300,
+        metavar="C",
+        help="Plateau: steps after an lr drop before patience counts again",
     )
     p.add_argument(
         "--grad-clip",
@@ -1319,6 +1467,21 @@ def main() -> None:
     if args.lr_warmup_steps < 0:
         print("--lr-warmup-steps must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if not (0.0 < args.lr_plateau_factor < 1.0):
+        print("--lr-plateau-factor must be in (0, 1)", file=sys.stderr)
+        sys.exit(1)
+    if args.lr_plateau_patience < 1:
+        print("--lr-plateau-patience must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.lr_plateau_threshold < 0.0:
+        print("--lr-plateau-threshold must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if not (0.0 <= args.lr_plateau_ema < 1.0):
+        print("--lr-plateau-ema must be in [0, 1)", file=sys.stderr)
+        sys.exit(1)
+    if args.lr_plateau_cooldown < 0:
+        print("--lr-plateau-cooldown must be >= 0", file=sys.stderr)
+        sys.exit(1)
 
     if args.n_codebooks < 1 and not args.ae_only:
         print("--n-codebooks must be >= 1 unless --ae-only", file=sys.stderr)
@@ -1442,6 +1605,11 @@ def main() -> None:
         lr_schedule=args.lr_schedule,
         lr_min_ratio=args.lr_min_ratio,
         lr_warmup_steps=args.lr_warmup_steps,
+        lr_plateau_factor=args.lr_plateau_factor,
+        lr_plateau_patience=args.lr_plateau_patience,
+        lr_plateau_threshold=args.lr_plateau_threshold,
+        lr_plateau_ema=args.lr_plateau_ema,
+        lr_plateau_cooldown=args.lr_plateau_cooldown,
         grad_clip_norm=args.grad_clip,
         grad_accum_steps=args.grad_accum_steps,
         seed=args.seed,
@@ -1526,6 +1694,7 @@ def main() -> None:
     res_ck_n: int | None = None
     resume_flat: dict[str, mx.array] | None = None
     resume_data_off: int | None = None
+    resume_meta: dict | None = None
     if args.resume is not None:
         if args.resume == "__latest__":
             ck_dir = Path(args.checkpoint_dir).expanduser().resolve()
@@ -1549,9 +1718,9 @@ def main() -> None:
                 sys.exit(1)
             meta_path = ck_path.with_suffix(".meta.json")
             if meta_path.is_file():
-                meta = json.loads(meta_path.read_text())
-                res_ck_n = int(meta.get("step", _parse_full_checkpoint_step(ck_path) or 0))
-                resume_data_off = int(meta.get("data_off", 0))
+                resume_meta = json.loads(meta_path.read_text())
+                res_ck_n = int(resume_meta.get("step", _parse_full_checkpoint_step(ck_path) or 0))
+                resume_data_off = int(resume_meta.get("data_off", 0))
             else:
                 res_ck_n = _parse_full_checkpoint_step(ck_path)
                 if res_ck_n is None:
@@ -1602,7 +1771,9 @@ def main() -> None:
             flush=True,
         )
 
-    lr_spec = build_lr_schedule(cfg)
+    plateau_resume = resume_meta.get("lr_plateau") if resume_meta else None
+    lr_spec = build_lr_schedule(cfg, plateau_resume=None)
+    plateau_schedule = lr_spec if isinstance(lr_spec, PlateauLRSchedule) else None
     opt = Adam(lr_spec)
     opt.init(model.parameters())
     if start_step > 0:
@@ -1613,6 +1784,9 @@ def main() -> None:
         load_full_checkpoint_into(resume_flat, model=model, opt=opt)
         mx.eval(model.parameters(), opt.state)
         print("[resume] loaded full safetensors (weights + optimizer state)", flush=True)
+        if plateau_schedule is not None and plateau_resume is not None:
+            plateau_schedule.load_state(plateau_resume)
+            _refresh_optimizer_schedules(opt)
 
     compiled_multi_stft: Callable[[mx.array, mx.array], mx.array] | None = None
     if cfg.use_compile and cfg.lambda_stft_grad <= 0 and cfg.lambda_stft_cos <= 0:
@@ -1647,8 +1821,16 @@ def main() -> None:
     stft_w_info = ""
     if cfg.stft_scale_weights is not None:
         stft_w_info = "  stft_w=" + ",".join(f"{w:g}" for w in cfg.stft_scale_weights)
-    if (cfg.lr_schedule or "").lower() in ("none", "constant", "off", ""):
+    _ls = (cfg.lr_schedule or "").lower()
+    if _ls in ("none", "constant", "off", ""):
         lr_info = f"lr={cfg.lr} (const)"
+    elif _ls == "plateau":
+        lr_info = (
+            f"lr plateau: peak={cfg.lr} min={cfg.lr * cfg.lr_min_ratio:g}  "
+            f"factor={cfg.lr_plateau_factor} patience={cfg.lr_plateau_patience}  "
+            f"thr={cfg.lr_plateau_threshold} ema={cfg.lr_plateau_ema} cd={cfg.lr_plateau_cooldown}  "
+            f"warmup={cfg.lr_warmup_steps}"
+        )
     else:
         lr_info = (
             f"lr {cfg.lr_schedule}: peak={cfg.lr} → min={cfg.lr * cfg.lr_min_ratio:g}  "
@@ -1938,6 +2120,8 @@ def main() -> None:
         _t_opt = _ptic()
         opt.update(model, grads)
         _ptoc("optim", _t_opt)
+        if plateau_schedule is not None and step >= cfg.lr_warmup_steps:
+            plateau_schedule.observe(lv0)
 
         if 0.0 < float(cfg.vq_ema_decay) < 1.0 and not cfg.ae_only:
             _t_vqe = _ptic()
@@ -2015,6 +2199,9 @@ def main() -> None:
                         data_off=data_off,
                         model=model,
                         opt=opt,
+                        lr_plateau_state=(
+                            plateau_schedule.state_dict() if plateau_schedule is not None else None
+                        ),
                     )
                     print(f"  [checkpoint] {full_p}", flush=True)
                 if cfg.results_tsv_path:

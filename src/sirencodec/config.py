@@ -94,10 +94,17 @@ class Config:
     prefetch_audio_batches: int = 2
     steps: int = 250_000
     lr: float = 8e-5
-    # Adam LR: cosine decay to lr×lr_min_ratio by last step, or none = constant --lr.
-    lr_schedule: str = "cosine"  # "none" | "cosine"
-    lr_min_ratio: float = 0.25  # cosine floor = lr * ratio (0 = hard zero at end)
+    # Adam LR: ``none`` = constant; ``cosine`` = decay to lr×lr_min_ratio by last step;
+    # ``plateau`` = ReduceLROnPlateau on EMA train loss (after optional warmup).
+    lr_schedule: str = "plateau"  # "none" | "cosine" | "plateau"
+    lr_min_ratio: float = 0.25  # cosine floor or plateau minimum lr = lr * ratio
     lr_warmup_steps: int = 0  # 0 = off; else linear 0→lr for this many optimizer steps first
+    # Plateau schedule (``lr_schedule == "plateau"``): multiply lr when EMA loss stalls vs best.
+    lr_plateau_factor: float = 0.25  # each drop: lr *= factor (fast ramp down: try 0.2–0.35)
+    lr_plateau_patience: int = 1200  # optimizer steps without relative improvement before drop
+    lr_plateau_threshold: float = 0.002  # rel mode: new best if m < best * (1 - threshold)
+    lr_plateau_ema: float = 0.985  # EMA decay on monitored loss (higher = smoother)
+    lr_plateau_cooldown: int = 300  # steps after a drop before patience counts again
     # Global L2 grad clip before Adam (0 = off). Helps deeper stride1 stacks + sharp marginal softmax.
     grad_clip_norm: float = 5.0
     # Micro-batch ``batch`` × ``grad_accum_steps`` optimizer updates = average gradient (effective larger batch).
@@ -396,6 +403,11 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lr_schedule": c.lr_schedule,
         "lr_min_ratio": c.lr_min_ratio,
         "lr_warmup_steps": c.lr_warmup_steps,
+        "lr_plateau_factor": c.lr_plateau_factor,
+        "lr_plateau_patience": c.lr_plateau_patience,
+        "lr_plateau_threshold": c.lr_plateau_threshold,
+        "lr_plateau_ema": c.lr_plateau_ema,
+        "lr_plateau_cooldown": c.lr_plateau_cooldown,
         "grad_clip": c.grad_clip_norm,
         "seed": c.seed,
         "stride1_blocks_per_scale": c.stride1_blocks_per_scale,

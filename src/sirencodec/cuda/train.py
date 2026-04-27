@@ -1380,9 +1380,63 @@ def _write_run_state(
     layout["state_json"].write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def build_lr_scheduler(opt: torch.optim.Optimizer, cfg: Config, start_step: int):
-    if (cfg.lr_schedule or "").lower() in ("none", "constant", "off", ""):
+class WarmupThenPlateau:
+    """Linear LR warmup, then ``ReduceLROnPlateau`` on the training loss each step."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer, cfg: Config):
+        self.optimizer = optimizer
+        self.wu = max(0, int(cfg.lr_warmup_steps))
+        self.peak = float(cfg.lr)
+        self.min_lr = self.peak * float(cfg.lr_min_ratio)
+        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(cfg.lr_plateau_factor),
+            patience=int(cfg.lr_plateau_patience),
+            threshold=float(cfg.lr_plateau_threshold),
+            threshold_mode="rel",
+            min_lr=self.min_lr,
+            cooldown=int(cfg.lr_plateau_cooldown),
+        )
+
+    def step(self, step: int, loss: float | None) -> None:
+        if self.wu > 0 and step < self.wu:
+            lr = self.peak * float(step + 1) / float(self.wu)
+            for g in self.optimizer.param_groups:
+                g["lr"] = lr
+            return
+        if loss is not None and math.isfinite(loss):
+            old_lr = self.optimizer.param_groups[0]["lr"]
+            self.plateau.step(loss)
+            new_lr = self.optimizer.param_groups[0]["lr"]
+            if new_lr < old_lr - 1e-18:
+                print(
+                    f"  [lr-plateau] lr {old_lr:.2e} → {new_lr:.2e}  (monitored_loss={loss:.5f})",
+                    flush=True,
+                )
+
+    def state_dict(self) -> dict:
+        return {"plateau": self.plateau.state_dict(), "wu": self.wu, "peak": self.peak}
+
+    def load_state_dict(self, state: dict) -> None:
+        if "plateau" in state and isinstance(state["plateau"], dict):
+            self.plateau.load_state_dict(state["plateau"])
+
+
+def build_lr_scheduler(
+    opt: torch.optim.Optimizer,
+    cfg: Config,
+    start_step: int,
+    *,
+    force_cosine: bool = False,
+):
+    mode = (cfg.lr_schedule or "").lower()
+    if force_cosine:
+        mode = "cosine"
+    if mode in ("none", "constant", "off", ""):
         return None
+    if mode == "plateau":
+        return WarmupThenPlateau(opt, cfg)
 
     def lr_lambda(step: int) -> float:
         if cfg.lr_warmup_steps > 0 and step < cfg.lr_warmup_steps:
@@ -1593,9 +1647,19 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--prefetch-audio-batches", type=int, default=c.prefetch_audio_batches, help="CPU audio batches queued ahead of GPU training")
     p.add_argument("--segment", type=int, default=c.segment)
     p.add_argument("--lr", type=float, default=c.lr)
-    p.add_argument("--lr-schedule", choices=["none", "cosine"], default=c.lr_schedule)
+    p.add_argument("--lr-schedule", choices=["none", "cosine", "plateau"], default=c.lr_schedule)
     p.add_argument("--lr-min-ratio", type=float, default=c.lr_min_ratio)
     p.add_argument("--lr-warmup-steps", type=int, default=c.lr_warmup_steps)
+    p.add_argument(
+        "--lr-plateau-factor",
+        type=float,
+        default=c.lr_plateau_factor,
+        help="Plateau: multiply lr by this when patience exceeded",
+    )
+    p.add_argument("--lr-plateau-patience", type=int, default=c.lr_plateau_patience)
+    p.add_argument("--lr-plateau-threshold", type=float, default=c.lr_plateau_threshold)
+    p.add_argument("--lr-plateau-ema", type=float, default=c.lr_plateau_ema, help="Ignored on CUDA; plateau uses raw step loss")
+    p.add_argument("--lr-plateau-cooldown", type=int, default=c.lr_plateau_cooldown)
     p.add_argument("--grad-clip", type=float, default=c.grad_clip_norm)
     p.add_argument("--seed", type=int, default=c.seed)
     p.add_argument("--ae-only", action="store_true", default=c.ae_only)
@@ -1751,6 +1815,16 @@ def config_from_args(args) -> Config:
         raise SystemExit("--stft-scale-weights must have one value per STFT scale")
     if args.dataset is None:
         raise SystemExit(f"--dataset is required ({', '.join(DATASET_CHOICES)})")
+    if not (0.0 < args.lr_plateau_factor < 1.0):
+        raise SystemExit("--lr-plateau-factor must be in (0, 1)")
+    if args.lr_plateau_patience < 1:
+        raise SystemExit("--lr-plateau-patience must be >= 1")
+    if args.lr_plateau_threshold < 0.0:
+        raise SystemExit("--lr-plateau-threshold must be >= 0")
+    if not (0.0 <= args.lr_plateau_ema < 1.0):
+        raise SystemExit("--lr-plateau-ema must be in [0, 1)")
+    if args.lr_plateau_cooldown < 0:
+        raise SystemExit("--lr-plateau-cooldown must be >= 0")
     data_dir = resolve_dataset_dir(args.dataset)
     return Config(
         dataset=args.dataset,
@@ -1764,6 +1838,11 @@ def config_from_args(args) -> Config:
         lr_schedule=args.lr_schedule,
         lr_min_ratio=args.lr_min_ratio,
         lr_warmup_steps=args.lr_warmup_steps,
+        lr_plateau_factor=args.lr_plateau_factor,
+        lr_plateau_patience=args.lr_plateau_patience,
+        lr_plateau_threshold=args.lr_plateau_threshold,
+        lr_plateau_ema=args.lr_plateau_ema,
+        lr_plateau_cooldown=args.lr_plateau_cooldown,
         grad_clip_norm=args.grad_clip,
         grad_accum_steps=args.grad_accum_steps,
         seed=args.seed,
@@ -2093,15 +2172,25 @@ def main(argv: list[str] | None = None) -> None:
             return
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    sched = build_lr_scheduler(opt, cfg, start_step)
+    sched = build_lr_scheduler(opt, cfg, start_step, force_cosine=False)
     disc_opt = torch.optim.AdamW(discriminator.parameters(), lr=cfg.disc_lr) if discriminator is not None else None
-    disc_sched = build_lr_scheduler(disc_opt, cfg, start_step) if disc_opt is not None else None
+    disc_sched = (
+        build_lr_scheduler(disc_opt, cfg, start_step, force_cosine=True) if disc_opt is not None else None
+    )
     if ck_path is not None:
         ck = resume_blob if (resume_blob is not None and device.type == "cpu") else torch.load(ck_path, map_location=device, weights_only=False)
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
         if sched is not None and "scheduler" in ck and ck["scheduler"] is not None:
-            sched.load_state_dict(ck["scheduler"])
+            try:
+                sched.load_state_dict(ck["scheduler"])
+            except Exception as e:
+                print_event(
+                    ansi,
+                    "warn",
+                    f"generator scheduler state not restored ({e}); using fresh scheduler counters",
+                    color="yellow",
+                )
         if disc_opt is not None and "disc_optimizer" in ck and ck["disc_optimizer"] is not None:
             disc_opt.load_state_dict(ck["disc_optimizer"])
         if disc_sched is not None and "disc_scheduler" in ck and ck["disc_scheduler"] is not None:
@@ -2245,8 +2334,12 @@ def main(argv: list[str] | None = None) -> None:
             opt.zero_grad(set_to_none=True)
             continue
         opt.step()
+        mean_loss = loss_total / float(acm)
         if sched is not None:
-            sched.step()
+            if isinstance(sched, WarmupThenPlateau):
+                sched.step(step, mean_loss)
+            else:
+                sched.step()
         profiler.add_since("opt", prof_t)
 
         prof_t = profiler.mark()
