@@ -6,7 +6,7 @@
   "grad_accum_steps": 1,
   "logs_per_epoch": 5,
   "viz_per_epoch": 1,
-  "curriculum": true,
+  "curriculum": false,
   "lambda_adv": 0.0,
   "curriculum_ae_frac": 0.15,
   "curriculum_vq_ramp_frac": 0.35,
