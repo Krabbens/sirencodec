@@ -68,3 +68,18 @@ Each template can include run-length and logging defaults such as:
   - enables combined MSD+MPD (`disc_type=msmpd`) plus feature matching to reward harmonic structure while suppressing broadband noise
   - adds pre-emphasized waveform L1 and an excess log-STFT penalty so high bands do not become a smeared spectral floor
   - runs the large `4096/8192` STFT stack every 2 steps on a 24-item spectral subset for stronger high-frequency pressure without full-batch FFT cost
+
+- `sub1k_semantic_ft_30.json`
+  - 30-epoch HuBERT semantic distillation fine-tune on top of a converged `sub1k_5090_stable_200` trunk (same width / RVQ / STFT stack as that preset)
+  - **Why `--init-from`:** `--continue` rebuilds `cfg` from the checkpoint blob, so you cannot turn on `lambda_semantic` on a run that was saved with `lambda_semantic=0`. Use `--init-from <codec_stepN.pt>` to load **generator weights only** and train with this JSON (fresh optimizer, scheduler, step counter, LR warmup)
+  - `lambda_semantic=0.5`, `semantic_layers=9` (1-based HuBERT layer), `semantic_batch_items=16`, `semantic_every=4`; softer `lambda_marginal=0.10` and `marginal_boost_steps=0` because codebooks are already healthy after the trunk run
+  - `lr=2e-5`, `lr_warmup_steps=400`, tighter plateau (`patience=800`, `cooldown=250`, `lr_min_ratio=0.20`)
+  - **5090 full run:** after copying the finished trunk checkpoint into the workspace, run:
+
+```powershell
+uv run train --config configs/sub1k_semantic_ft_30.json --init-from /workspace/experiments/20260427_073203/checkpoints/codec_step162599.pt
+```
+
+  - Convenience wrapper (override checkpoint with `INIT_FROM=.../codec_stepN.pt`): [scripts/run_semantic_ft_5090.sh](../scripts/run_semantic_ft_5090.sh)
+
+  - **What to watch in `logs.csv`:** `sem` (raw `1−cos` on the teacher layer) should fall over the first few epochs; keep `cos_pct` within ~1.5 points of the trunk final; if `u0` drops below `230/256`, raise `lambda_marginal` toward `0.18` in a follow-up config. After ~5 epochs, if `sem` has not dropped ~20% from its start, try `lambda_semantic=0.75`. If `mel_l1` / `stft_cos` regress, lower `lambda_semantic` or set `semantic_every` to `8`

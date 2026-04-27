@@ -1327,6 +1327,7 @@ def _write_run_metadata(
     epoch_source: str,
     audio_paths: list[Path] | None,
     continue_ckpt: Path | None,
+    init_from_ckpt: Path | None = None,
 ) -> None:
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -1341,6 +1342,7 @@ def _write_run_metadata(
             "results_tsv": str(layout["results_tsv"]),
         },
         "resume_from": None if continue_ckpt is None else str(continue_ckpt),
+        "init_from": None if init_from_ckpt is None else str(init_from_ckpt),
         "args": _jsonable(vars(args)),
         "config": _jsonable(copy.deepcopy(cfg.__dict__)),
         "training": {
@@ -1776,6 +1778,13 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--checkpoint-every", type=int, default=None, help="Numbered checkpoint interval in optimizer updates; omitted => every 10 epochs")
     p.add_argument("--checkpoint-dir", type=str, default=c.checkpoint_dir)
     p.add_argument("--continue", dest="continue_path", type=str, default=None, help="Resume full training state from checkpoint path or run dir")
+    p.add_argument(
+        "--init-from",
+        dest="init_from",
+        type=str,
+        default=None,
+        help="Warm-start: load generator model weights only; fresh cfg/optimizer/scheduler/step (mutually exclusive with --continue)",
+    )
     p.add_argument("--resume", nargs="?", const="__latest__", default=None, help=argparse.SUPPRESS)
     p.add_argument("--profile", action="store_true")
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="ANSI colors in logs")
@@ -1966,7 +1975,14 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit("legacy --resume without path is no longer supported; use --continue <run_dir> or --continue <checkpoint>")
         args.continue_path = args.resume
         print_event(ansi, "warn", "--resume is deprecated; use --continue <run_dir/checkpoint>", color="yellow")
+    if args.init_from is not None and args.continue_path is not None:
+        raise SystemExit("use either --continue or --init-from, not both")
     continue_ckpt = _resolve_continue_checkpoint(args.continue_path) if args.continue_path is not None else None
+    init_from_ckpt: Path | None = None
+    if args.init_from is not None:
+        init_from_ckpt = Path(args.init_from).expanduser().resolve()
+        if not init_from_ckpt.is_file():
+            raise SystemExit(f"--init-from checkpoint not found: {init_from_ckpt}")
     resume_blob: dict | None = None
     resumed_from_checkpoint = continue_ckpt is not None
     if continue_ckpt is not None:
@@ -2093,6 +2109,7 @@ def main(argv: list[str] | None = None) -> None:
         epoch_source=epoch_source,
         audio_paths=audio_paths,
         continue_ckpt=continue_ckpt,
+        init_from_ckpt=init_from_ckpt,
     )
     if resume_blob is None:
         _write_run_state(
@@ -2119,6 +2136,12 @@ def main(argv: list[str] | None = None) -> None:
         print_event(ansi, "warn", "CUDA not available; running on CPU", color="yellow")
 
     model = CUDACodec(cfg).to(device)
+    if init_from_ckpt is not None:
+        init_blob = torch.load(init_from_ckpt, map_location=device, weights_only=False)
+        if "model" not in init_blob:
+            raise SystemExit(f"--init-from checkpoint missing model state: {init_from_ckpt}")
+        model.load_state_dict(init_blob["model"], strict=True)
+        print_event(ansi, "init", f"warm-started weights from {init_from_ckpt}", color="cyan")
     semantic_teacher: FrozenSemanticTeacher | None = None
     if float(cfg.lambda_semantic) > 0:
         try:
