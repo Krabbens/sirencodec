@@ -25,6 +25,7 @@ from sirencodec.cuda.codec import (
     CUDACodec,
     MultiPeriodWaveDiscriminator,
     MultiScaleWaveDiscriminator,
+    NLCFullWidthConv2d,
     ResidualVectorQuantizer,
     build_wave_discriminator,
 )
@@ -220,6 +221,30 @@ def test_forward_full_can_return_continuous_anchor():
     assert y.shape == x.shape
     assert y_cont.shape == x.shape
     assert idx is not None
+
+
+def test_codec_uses_conv2d_only_at_waveform_edges():
+    cfg = Config(
+        batch=1,
+        segment=128,
+        enc_channels=(4, 8, 12, 16),
+        latent_dim=8,
+        latent_temporal_depth=0,
+        latent_temporal_post_depth=0,
+        n_codebooks=1,
+        codebook_size=8,
+        rvq_code_dim=0,
+    )
+    model = CUDACodec(cfg)
+    encoder_2d_layers = [layer for layer in model.encoder.layers if isinstance(layer, NLCFullWidthConv2d)]
+    decoder_2d_layers = [layer for layer in model.decoder.layers if isinstance(layer, NLCFullWidthConv2d)]
+
+    assert len(encoder_2d_layers) == 1
+    assert len(decoder_2d_layers) == 1
+    assert isinstance(model.encoder.layers[0], NLCFullWidthConv2d)
+    assert not isinstance(model.encoder.layers[2], NLCFullWidthConv2d)
+    assert isinstance(model.decoder.layers[-1], NLCFullWidthConv2d)
+    assert model(torch.randn(1, 128, 1)).shape == (1, 128, 1)
 
 
 def test_ae_anchor_loss_is_only_active_during_rvq_phase():

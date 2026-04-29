@@ -8,7 +8,9 @@ from ..config import Config, effective_codebook_sizes
 from .. import streaming as streaming_mod
 from .losses import entropy_from_logits, marginal_code_entropy_from_dist
 
-def _enc_conv(cfg: Config, cin: int, cout: int, stride: int) -> nn.Module:
+def _enc_conv(cfg: Config, cin: int, cout: int, stride: int, *, use_2d: bool = False) -> nn.Module:
+    if use_2d:
+        return NLCFullWidthConv2d(cin, cout, 7, stride=stride, causal=cfg.causal)
     if cfg.causal:
         return streaming_mod.CausalConv1d(cin, cout, 7, stride=stride)
     return nn.Conv1d(cin, cout, 7, stride=stride, padding=3)
@@ -34,13 +36,33 @@ class SnakeBeta(nn.Module):
         return x + (1.0 / (a + 1e-8)) * (mx.sin(a * x) ** 2)
 
 
+class NLCFullWidthConv2d(nn.Module):
+    """Conv2d over the time x channel grid, returning NLC layout."""
+
+    def __init__(self, cin: int, cout: int, kernel: int, *, stride: int = 1, causal: bool = False):
+        super().__init__()
+        self.cin = int(cin)
+        self.causal = bool(causal)
+        self.kernel = int(kernel)
+        pad = 0 if self.causal else self.kernel // 2
+        self.conv = nn.Conv2d(1, cout, kernel_size=(self.kernel, self.cin), stride=(stride, 1), padding=(pad, 0))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if int(x.shape[-1]) != self.cin:
+            raise ValueError(f"expected {self.cin} input channels, got {int(x.shape[-1])}")
+        y = x[:, :, :, None]
+        if self.causal:
+            y = mx.pad(y, [(0, 0), (self.kernel - 1, 0), (0, 0), (0, 0)])
+        return self.conv(y)[:, :, 0, :]
+
+
 class UpsampleRepeatConv(nn.Module):
     """2× time via sample repetition + smoothing Conv1d (NLC)."""
 
-    def __init__(self, cin: int, cout: int, k: int = 7):
+    def __init__(self, cin: int, cout: int, k: int = 7, *, use_2d: bool = False):
         super().__init__()
         pad = max(0, k // 2)
-        self.conv = nn.Conv1d(cin, cout, k, stride=1, padding=pad)
+        self.conv = NLCFullWidthConv2d(cin, cout, k, stride=1) if use_2d else nn.Conv1d(cin, cout, k, stride=1, padding=pad)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = mx.repeat(x, 2, axis=1)
@@ -59,7 +81,7 @@ class Encoder(nn.Module):
             for _ in range(n1):
                 self.layers.append(_enc_conv(cfg, ch[i], ch[i], 1))
                 self.layers.append(_act_module(cfg, ch[i]))
-            self.layers.append(_enc_conv(cfg, ch[i], ch[i + 1], 2))
+            self.layers.append(_enc_conv(cfg, ch[i], ch[i + 1], 2, use_2d=i == 0))
             self.layers.append(_act_module(cfg, ch[i + 1]))
         self.out = (
             streaming_mod.CausalConv1d(cfg.enc_channels[-1], cfg.latent_dim, 3, stride=1)
@@ -206,9 +228,9 @@ class Decoder(nn.Module):
                 )
                 self.layers.append(_act_module(cfg, c[i + 1]))
         self.out = (
-            streaming_mod.CausalConv1d(c[-1], 1, 7, stride=1)
+            NLCFullWidthConv2d(c[-1], 1, 7, stride=1, causal=True)
             if cfg.causal
-            else nn.Conv1d(c[-1], 1, 7, padding=3)
+            else NLCFullWidthConv2d(c[-1], 1, 7, stride=1)
         )
         for i, layer in enumerate(self.layers):
             setattr(self, f"_d{i}", layer)
