@@ -217,6 +217,40 @@ class LatentTemporalStack(nn.Module):
         return x + self.layers(x)
 
 
+class Latent2dBottleneck(nn.Module):
+    """Residual Conv2d stack over latent time x feature-band grid."""
+
+    def __init__(self, dim: int, depth: int, *, bands: int = 16, kernel_size: int = 3):
+        super().__init__()
+        self.dim = int(dim)
+        self.depth = max(0, int(depth))
+        requested_bands = max(1, int(bands))
+        self.bands = min(requested_bands, self.dim)
+        while self.dim % self.bands != 0:
+            self.bands -= 1
+        self.width = self.dim // self.bands
+        k = max(1, int(kernel_size))
+        pad = k // 2
+        self.blocks = nn.ModuleList()
+        for _ in range(self.depth):
+            depthwise = nn.Conv2d(self.width, self.width, kernel_size=k, padding=pad, groups=self.width)
+            pointwise = nn.Conv2d(self.width, self.width, kernel_size=1)
+            nn.init.zeros_(pointwise.weight)
+            nn.init.zeros_(pointwise.bias)
+            self.blocks.append(nn.Sequential(depthwise, nn.GELU(), pointwise))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if len(self.blocks) == 0:
+            return x
+        b, t, c = x.shape
+        if int(c) != self.dim:
+            raise ValueError(f"expected latent dim {self.dim}, got {int(c)}")
+        y = x.reshape(b, t, self.bands, self.width).permute(0, 3, 1, 2).contiguous()
+        for block in self.blocks:
+            y = y + block(y)
+        return y.permute(0, 2, 3, 1).contiguous().reshape(b, t, c)
+
+
 class WaveDiscriminator(nn.Module):
     """Lightweight 1D discriminator for waveform hinge GAN training."""
 
@@ -384,6 +418,16 @@ class CUDACodec(nn.Module):
         self.rvq = ResidualVectorQuantizer(cfg)
         self.decoder = Decoder(cfg)
         self.pre_vq_ln = nn.LayerNorm(cfg.latent_dim) if cfg.pre_vq_layernorm else None
+        self.latent_2d = (
+            Latent2dBottleneck(
+                cfg.latent_dim,
+                getattr(cfg, "latent_2d_depth", 0),
+                bands=getattr(cfg, "latent_2d_bands", 16),
+                kernel_size=getattr(cfg, "latent_2d_kernel_size", 3),
+            )
+            if getattr(cfg, "latent_2d_depth", 0) > 0
+            else None
+        )
         self.latent_pre = (
             LatentTemporalStack(cfg.latent_dim, cfg.latent_temporal_depth, activation=cfg.activation)
             if cfg.latent_temporal_depth > 0
@@ -399,6 +443,8 @@ class CUDACodec(nn.Module):
         z = self.encoder(x)
         if self.pre_vq_ln is not None:
             z = self.pre_vq_ln(z)
+        if self.latent_2d is not None:
+            z = self.latent_2d(z)
         if self.latent_pre is not None:
             z = self.latent_pre(z)
         return z

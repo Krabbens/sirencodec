@@ -45,6 +45,7 @@ Each template can include run-length and logging defaults such as:
   - early RVQ split `A=5%`, `B=65%`, `D=30%`; RVQ and marginal entropy start at 25% strength as soon as B begins
   - no waveform GAN by default; late adversarial fine-tuning was too noisy on the observed run
   - roughly triples AE capacity with wider encoder/decoder channels while keeping full-latent 256/128 RVQ codebooks unchanged (`~0.94 kbps`)
+  - adds a small identity-initialized Conv2d bottleneck over latent time × feature bands
   - avoids factorized RVQ `out_proj` and post-RVQ stack cold-start after the AE warmup
   - uses a large STFT stack (`512/1024/2048/4096/8192`) for harmonic detail, but keeps it moderated so magnitude matching does not overpower waveform phase
   - adds a cheap SI-SDR waveform term; this protects stage A from the mag-STFT-only failure mode without paying the full grad-balancer cost

@@ -900,6 +900,25 @@ def main() -> None:
         help="LayerNorm on encoder output before RVQ (default: off)",
     )
     p.add_argument(
+        "--latent-2d-depth",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Residual Conv2d bottleneck blocks over latent time x feature bands (0=off)",
+    )
+    p.add_argument(
+        "--latent-2d-bands",
+        type=int,
+        default=16,
+        help="Feature-band count for --latent-2d-depth; must divide --latent-dim",
+    )
+    p.add_argument(
+        "--latent-2d-kernel-size",
+        type=int,
+        default=3,
+        help="Conv2d kernel size for latent bottleneck blocks",
+    )
+    p.add_argument(
         "--latent-temporal-depth",
         type=int,
         default=0,
@@ -1383,6 +1402,15 @@ def main() -> None:
     if args.latent_temporal_depth < 0 or args.latent_temporal_post_depth < 0:
         print("--latent-temporal-depth and --latent-temporal-post-depth must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.latent_2d_depth < 0:
+        print("--latent-2d-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.latent_2d_bands < 1 or args.latent_2d_kernel_size < 1:
+        print("--latent-2d-bands and --latent-2d-kernel-size must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.latent_dim % args.latent_2d_bands != 0:
+        print("--latent-2d-bands must divide --latent-dim", file=sys.stderr)
+        sys.exit(1)
     if args.lambda_sc < 0:
         print("--lambda-sc must be >= 0", file=sys.stderr)
         sys.exit(1)
@@ -1450,6 +1478,9 @@ def main() -> None:
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
         latent_dim=args.latent_dim,
         pre_vq_layernorm=args.pre_vq_layernorm,
+        latent_2d_depth=args.latent_2d_depth,
+        latent_2d_bands=args.latent_2d_bands,
+        latent_2d_kernel_size=args.latent_2d_kernel_size,
         latent_temporal_depth=args.latent_temporal_depth,
         latent_temporal_post_depth=args.latent_temporal_post_depth,
         n_codebooks=args.n_codebooks,
@@ -1679,7 +1710,7 @@ def main() -> None:
             f"  mel=nfft{cfg.mel_n_fft}/hop{cfg.mel_hop} M={cfg.n_mels} "
             f"[{cfg.mel_fmin:g}-{fmax_mel:g}]Hz  λ_mel_L1={cfg.lambda_mel_l1}  λ_mel_L2={cfg.lambda_mel_l2}"
         )
-    lt_pre_post = f"lat_tmp={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}"
+    lt_pre_post = f"lat_tmp={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}  lat2d={cfg.latent_2d_depth}x{cfg.latent_2d_bands if cfg.latent_2d_depth > 0 else 0}"
     sc_info = f"  λ_sc={cfg.lambda_sc:g}" if cfg.lambda_sc > 0 else ""
     cx_info = f"  λ_cx={cfg.lambda_complex_stft:g}" if cfg.lambda_complex_stft > 0 else ""
     _acm_p = max(1, int(cfg.grad_accum_steps))
