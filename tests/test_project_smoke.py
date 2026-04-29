@@ -23,6 +23,7 @@ from sirencodec.config import (
 )
 from sirencodec.cuda.codec import (
     CUDACodec,
+    Latent2dBottleneck,
     MultiPeriodWaveDiscriminator,
     MultiScaleWaveDiscriminator,
     ResidualVectorQuantizer,
@@ -82,6 +83,8 @@ def test_argparse_defaults_cover_current_config():
     assert defaults["lambda_preemph"] == Config().lambda_preemph
     assert defaults["lambda_fm"] == Config().lambda_fm
     assert defaults["disc_periods"] == ",".join(str(x) for x in Config().disc_periods)
+    assert defaults["latent_2d_depth"] == Config().latent_2d_depth
+    assert defaults["latent_2d_bands"] == Config().latent_2d_bands
 
 
 def test_stft_parsers_accept_valid_values_and_reject_bad_ones():
@@ -220,6 +223,14 @@ def test_forward_full_can_return_continuous_anchor():
     assert y.shape == x.shape
     assert y_cont.shape == x.shape
     assert idx is not None
+
+
+def test_latent_2d_bottleneck_preserves_shape_and_starts_as_identity():
+    layer = Latent2dBottleneck(16, depth=2, bands=4)
+    x = torch.randn(2, 7, 16)
+    y = layer(x)
+    assert y.shape == x.shape
+    assert torch.allclose(y, x)
 
 
 def test_ae_anchor_loss_is_only_active_during_rvq_phase():

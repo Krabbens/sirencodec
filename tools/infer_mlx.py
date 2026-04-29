@@ -361,6 +361,9 @@ def main() -> None:
         default=dcfg.pre_vq_layernorm,
         help="Must match training (--pre-vq-layernorm / --no-pre-vq-layernorm)",
     )
+    p.add_argument("--latent-2d-depth", type=int, default=dcfg.latent_2d_depth, help="Must match training (Conv2d bottleneck blocks; 0=off)")
+    p.add_argument("--latent-2d-bands", type=int, default=dcfg.latent_2d_bands, help="Must match training")
+    p.add_argument("--latent-2d-kernel-size", type=int, default=dcfg.latent_2d_kernel_size, help="Must match training")
     p.add_argument("--n-codebooks", type=int, default=dcfg.n_codebooks, help="Must match training")
     p.add_argument("--codebook-size", type=int, default=dcfg.codebook_size, help="Must match training (if uniform K)")
     p.add_argument(
@@ -445,6 +448,9 @@ def main() -> None:
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
         latent_dim=args.latent_dim,
         pre_vq_layernorm=args.pre_vq_layernorm,
+        latent_2d_depth=args.latent_2d_depth,
+        latent_2d_bands=args.latent_2d_bands,
+        latent_2d_kernel_size=args.latent_2d_kernel_size,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
         codebook_sizes=cb_sizes_infer,

@@ -113,6 +113,10 @@ class Config:
     latent_dim: int = 512
     # LayerNorm on encoder output before RVQ (off by default; can interact badly with cosine RVQ early).
     pre_vq_layernorm: bool = False
+    # Residual Conv2d bottleneck over latent time x feature bands.
+    latent_2d_depth: int = 2
+    latent_2d_bands: int = 16
+    latent_2d_kernel_size: int = 3
     # Residual dilated Conv1d on latent sequence (NLC): smooths temporal VQ trajectory.
     latent_temporal_depth: int = 2  # 0 = off; applied after optional pre_vq_ln, before RVQ
     latent_temporal_post_depth: int = 2  # 0 = off; applied on quantized z_q before decoder
@@ -401,6 +405,9 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "stride1_blocks_per_scale": c.stride1_blocks_per_scale,
         "latent_dim": c.latent_dim,
         "pre_vq_layernorm": c.pre_vq_layernorm,
+        "latent_2d_depth": c.latent_2d_depth,
+        "latent_2d_bands": c.latent_2d_bands,
+        "latent_2d_kernel_size": c.latent_2d_kernel_size,
         "latent_temporal_depth": c.latent_temporal_depth,
         "latent_temporal_post_depth": c.latent_temporal_post_depth,
         "n_codebooks": c.n_codebooks,

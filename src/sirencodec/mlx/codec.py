@@ -47,6 +47,49 @@ class UpsampleRepeatConv(nn.Module):
         return self.conv(x)
 
 
+class Latent2dBottleneck(nn.Module):
+    """Residual Conv2d stack over latent time x feature-band grid."""
+
+    def __init__(self, dim: int, depth: int, *, bands: int = 16, kernel_size: int = 3):
+        super().__init__()
+        self.dim = int(dim)
+        self.depth = max(0, int(depth))
+        requested_bands = max(1, int(bands))
+        self.bands = min(requested_bands, self.dim)
+        while self.dim % self.bands != 0:
+            self.bands -= 1
+        self.width = self.dim // self.bands
+        k = max(1, int(kernel_size))
+        pad = k // 2
+        self.blocks = []
+        self.scales = []
+        for i in range(self.depth):
+            block = [
+                nn.Conv2d(self.width, self.width, kernel_size=k, padding=pad, groups=self.width),
+                nn.GELU(),
+                nn.Conv2d(self.width, self.width, kernel_size=1),
+            ]
+            self.blocks.append(block)
+            self.scales.append(mx.array(0.0, dtype=mx.float32))
+            for j, layer in enumerate(block):
+                setattr(self, f"_b{i}_{j}", layer)
+            setattr(self, f"_s{i}", self.scales[-1])
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if len(self.blocks) == 0:
+            return x
+        b, t, c = x.shape
+        if int(c) != self.dim:
+            raise ValueError(f"expected latent dim {self.dim}, got {int(c)}")
+        y = mx.reshape(x, (b, t, self.bands, self.width))
+        for block, scale in zip(self.blocks, self.scales):
+            h = y
+            for layer in block:
+                h = layer(h)
+            y = y + scale * h
+        return mx.reshape(y, (b, t, c))
+
+
 class Encoder(nn.Module):
     """Downsample by 2^len(strides) along time. Optional causal convs + Snake/GELU."""
 
@@ -265,6 +308,16 @@ class MLXCodec(nn.Module):
         self.rvq = ResidualVectorQuantizer(cfg)
         self.decoder = Decoder(cfg)
         self.pre_vq_ln = nn.LayerNorm(cfg.latent_dim) if cfg.pre_vq_layernorm else None
+        self.latent_2d = (
+            Latent2dBottleneck(
+                cfg.latent_dim,
+                getattr(cfg, "latent_2d_depth", 0),
+                bands=getattr(cfg, "latent_2d_bands", 16),
+                kernel_size=getattr(cfg, "latent_2d_kernel_size", 3),
+            )
+            if getattr(cfg, "latent_2d_depth", 0) > 0
+            else None
+        )
         self.latent_pre = (
             LatentTemporalStack(cfg.latent_dim, cfg.latent_temporal_depth, activation=cfg.activation)
             if cfg.latent_temporal_depth > 0
@@ -281,6 +334,8 @@ class MLXCodec(nn.Module):
         z = self.encoder(x)
         if self.pre_vq_ln is not None:
             z = self.pre_vq_ln(z)
+        if self.latent_2d is not None:
+            z = self.latent_2d(z)
         if self.latent_pre is not None:
             z = self.latent_pre(z)
         return z

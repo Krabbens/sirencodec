@@ -868,7 +868,8 @@ def print_run_header(
     if cfg.lambda_adv > 0:
         periods = ",".join(str(x) for x in cfg.disc_periods)
         _emit(_kv("disc", f"type={cfg.disc_type}  base={cfg.disc_base_channels}  scales={cfg.disc_scales}  periods={periods}", ansi, color="white"))
-    _emit(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi, color="white"))
+    latent_2d_info = f"latent2d={cfg.latent_2d_depth}x{cfg.latent_2d_bands}" if cfg.latent_2d_depth > 0 else "latent2d=off"
+    _emit(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  {latent_2d_info}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi, color="white"))
     stft_w = "none" if cfg.stft_scale_weights is None else ",".join(f"{float(w):g}" for w in cfg.stft_scale_weights)
     _emit(
         _kv(
@@ -1603,6 +1604,9 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--stride1-blocks-per-scale", type=int, default=c.stride1_blocks_per_scale)
     p.add_argument("--latent-dim", type=int, default=c.latent_dim)
     _add_bool(p, "--pre-vq-layernorm", c.pre_vq_layernorm)
+    p.add_argument("--latent-2d-depth", type=int, default=c.latent_2d_depth, help="Residual Conv2d bottleneck blocks over latent time x feature bands; 0 disables")
+    p.add_argument("--latent-2d-bands", type=int, default=c.latent_2d_bands, help="Feature-band count for --latent-2d-depth; must divide --latent-dim")
+    p.add_argument("--latent-2d-kernel-size", type=int, default=c.latent_2d_kernel_size)
     p.add_argument("--latent-temporal-depth", type=int, default=c.latent_temporal_depth)
     p.add_argument("--latent-temporal-post-depth", type=int, default=c.latent_temporal_post_depth)
     p.add_argument("--n-codebooks", type=int, default=c.n_codebooks)
@@ -1751,6 +1755,12 @@ def config_from_args(args) -> Config:
         raise SystemExit("--stft-scale-weights must have one value per STFT scale")
     if args.dataset is None:
         raise SystemExit(f"--dataset is required ({', '.join(DATASET_CHOICES)})")
+    if args.latent_2d_depth < 0:
+        raise SystemExit("--latent-2d-depth must be >= 0")
+    if args.latent_2d_bands < 1 or args.latent_2d_kernel_size < 1:
+        raise SystemExit("--latent-2d-bands and --latent-2d-kernel-size must be >= 1")
+    if args.latent_dim % args.latent_2d_bands != 0:
+        raise SystemExit("--latent-2d-bands must divide --latent-dim")
     data_dir = resolve_dataset_dir(args.dataset)
     return Config(
         dataset=args.dataset,
@@ -1772,6 +1782,9 @@ def config_from_args(args) -> Config:
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
         latent_dim=args.latent_dim,
         pre_vq_layernorm=args.pre_vq_layernorm,
+        latent_2d_depth=args.latent_2d_depth,
+        latent_2d_bands=args.latent_2d_bands,
+        latent_2d_kernel_size=args.latent_2d_kernel_size,
         latent_temporal_depth=args.latent_temporal_depth,
         latent_temporal_post_depth=args.latent_temporal_post_depth,
         n_codebooks=args.n_codebooks,
@@ -1895,7 +1908,10 @@ def main(argv: list[str] | None = None) -> None:
         if "config" not in resume_blob:
             raise SystemExit(f"--continue checkpoint missing config: {continue_ckpt}")
         try:
-            cfg = Config(**resume_blob["config"])
+            ck_cfg = dict(resume_blob["config"])
+            if "latent_2d_depth" not in ck_cfg:
+                ck_cfg["latent_2d_depth"] = 0
+            cfg = Config(**ck_cfg)
         except TypeError as e:
             raise SystemExit(f"--continue incompatible checkpoint config: {e}")
     else:
