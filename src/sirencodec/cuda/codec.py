@@ -32,6 +32,32 @@ class NLCConv1d(nn.Module):
         return x.transpose(1, 2)
 
 
+class NLCFullWidthConv2d(nn.Module):
+    """Conv2d over the time x channel grid, returning NLC layout."""
+
+    def __init__(self, cin: int, cout: int, kernel: int, *, stride: int = 1, padding: int = 0, causal: bool = False):
+        super().__init__()
+        self.cin = int(cin)
+        self.causal = bool(causal)
+        self.kernel = int(kernel)
+        self.conv = nn.Conv2d(
+            1,
+            cout,
+            kernel_size=(self.kernel, self.cin),
+            stride=(stride, 1),
+            padding=(0 if self.causal else padding, 0),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if int(x.shape[-1]) != self.cin:
+            raise ValueError(f"expected {self.cin} input channels, got {int(x.shape[-1])}")
+        y = x.unsqueeze(1)
+        if self.causal:
+            y = F.pad(y, (0, 0, self.kernel - 1, 0))
+        y = self.conv(y).squeeze(-1)
+        return y.transpose(1, 2)
+
+
 class NLCConvTranspose1d(nn.Module):
     def __init__(self, cin: int, cout: int, kernel: int, *, stride: int = 1, padding: int = 0):
         super().__init__()
@@ -44,9 +70,10 @@ class NLCConvTranspose1d(nn.Module):
 class UpsampleRepeatConv(nn.Module):
     """2x time via sample repetition + smoothing Conv1d, NLC layout."""
 
-    def __init__(self, cin: int, cout: int, k: int = 7):
+    def __init__(self, cin: int, cout: int, k: int = 7, *, use_2d: bool = False):
         super().__init__()
-        self.conv = NLCConv1d(cin, cout, k, padding=k // 2)
+        conv_cls = NLCFullWidthConv2d if use_2d else NLCConv1d
+        self.conv = conv_cls(cin, cout, k, padding=k // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x.repeat_interleave(2, dim=1))
@@ -81,7 +108,8 @@ class Encoder(nn.Module):
             for _ in range(n1):
                 layers.append(NLCConv1d(ch[i], ch[i], 7, stride=1, padding=3, causal=cfg.causal))
                 layers.append(_act_module(cfg, ch[i]))
-            layers.append(NLCConv1d(ch[i], ch[i + 1], 7, stride=2, padding=3, causal=cfg.causal))
+            conv_cls = NLCFullWidthConv2d if i == 0 else NLCConv1d
+            layers.append(conv_cls(ch[i], ch[i + 1], 7, stride=2, padding=3, causal=cfg.causal))
             layers.append(_act_module(cfg, ch[i + 1]))
         layers.append(NLCConv1d(cfg.enc_channels[-1], cfg.latent_dim, 3, padding=1, causal=cfg.causal))
         self.layers = nn.Sequential(*layers)
@@ -178,12 +206,16 @@ class Decoder(nn.Module):
             layers.append(NLCConv1d(c[0], c[0], 7, padding=3, causal=cfg.causal))
             layers.append(_act_module(cfg, c[0]))
         for i in range(len(c) - 1):
-            layers.append(UpsampleRepeatConv(c[i], c[i + 1]) if use_repeat else NLCConvTranspose1d(c[i], c[i + 1], 7, stride=2, padding=3))
+            layers.append(
+                UpsampleRepeatConv(c[i], c[i + 1])
+                if use_repeat
+                else NLCConvTranspose1d(c[i], c[i + 1], 7, stride=2, padding=3)
+            )
             layers.append(_act_module(cfg, c[i + 1]))
             for _ in range(n1):
                 layers.append(NLCConv1d(c[i + 1], c[i + 1], 7, padding=3, causal=cfg.causal))
                 layers.append(_act_module(cfg, c[i + 1]))
-        layers.append(NLCConv1d(c[-1], 1, 7, padding=3, causal=cfg.causal))
+        layers.append(NLCFullWidthConv2d(c[-1], 1, 7, padding=3, causal=cfg.causal))
         self.layers = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor, target_len: int) -> torch.Tensor:
