@@ -508,6 +508,31 @@ def test_sub1k_5090_stable_template_is_wide_under_20m_without_bitrate_change():
     assert 19_800_000 <= wide_params < 20_000_000
 
 
+def test_sub1k_5090_no_phases_template_starts_in_hard_rvq_mode():
+    cfg_path = ROOT / "configs" / "sub1k_5090_no_phases_200.json"
+    args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
+    cfg = config_from_args(args)
+
+    assert cfg.curriculum is False
+    assert cfg.curriculum_ae_frac == pytest.approx(0.0)
+    assert cfg.curriculum_vq_ramp_frac == pytest.approx(0.0)
+    assert cfg.curriculum_quantize_blend is False
+    assert curriculum_state(0, cfg).phase == "off"
+    assert curriculum_state(0, cfg).ae_only is False
+    assert curriculum_state(0, cfg).vq_mult == pytest.approx(1.0)
+    assert curriculum_quantize_blend(0, cfg) == pytest.approx(1.0)
+
+    assert cfg.enc_channels == (72, 104, 144, 208, 296, 424, 592, 840)
+    assert cfg.latent_dim == 512
+    assert cfg.latent_2d_depth == 2
+    assert cfg.latent_2d_bands == 16
+    assert cfg.n_codebooks == 2
+    assert cfg.codebook_sizes == (256, 128)
+    assert cfg.rvq_code_dim == 0
+    assert nominal_rvq_kbps(cfg) == pytest.approx(0.9375)
+    assert sum(p.numel() for p in CUDACodec(cfg).parameters()) == 19_917_201
+
+
 def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
     cfg_path = ROOT / "configs" / "sub1k_harmonic_20.json"
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
