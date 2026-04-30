@@ -463,6 +463,51 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
     assert wide_params / base_params == pytest.approx(2.93, rel=0.03)
 
 
+def test_sub1k_5090_stable_template_is_wide_under_20m_without_bitrate_change():
+    cfg_path = ROOT / "configs" / "sub1k_5090_stable_200.json"
+    args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
+    cfg = config_from_args(args)
+
+    old_channels = (56, 80, 112, 160, 224, 320, 448, 640)
+    new_channels = (72, 104, 144, 208, 296, 424, 592, 840)
+    assert cfg.enc_channels == new_channels
+    ratios = [new / old for new, old in zip(new_channels, old_channels, strict=True)]
+    assert min(ratios) >= 1.28
+    assert max(ratios) <= 1.33
+
+    ref_cfg = Config(
+        enc_channels=old_channels,
+        latent_dim=cfg.latent_dim,
+        latent_2d_depth=cfg.latent_2d_depth,
+        latent_2d_bands=cfg.latent_2d_bands,
+        latent_2d_kernel_size=cfg.latent_2d_kernel_size,
+        latent_temporal_depth=cfg.latent_temporal_depth,
+        latent_temporal_post_depth=cfg.latent_temporal_post_depth,
+        pre_vq_layernorm=cfg.pre_vq_layernorm,
+        activation=cfg.activation,
+        decoder_upsample=cfg.decoder_upsample,
+        causal=cfg.causal,
+        n_codebooks=cfg.n_codebooks,
+        codebook_size=cfg.codebook_size,
+        codebook_sizes=cfg.codebook_sizes,
+        rvq_code_dim=cfg.rvq_code_dim,
+    )
+    assert cfg.latent_dim == 512
+    assert cfg.latent_2d_depth == 2
+    assert cfg.latent_2d_bands == 16
+    assert cfg.n_codebooks == 2
+    assert cfg.codebook_sizes == (256, 128)
+    assert cfg.rvq_code_dim == 0
+    assert effective_codebook_sizes(cfg) == effective_codebook_sizes(ref_cfg)
+    assert encoder_time_stride(cfg) == encoder_time_stride(ref_cfg)
+    assert nominal_rvq_kbps(cfg) == pytest.approx(nominal_rvq_kbps(ref_cfg))
+
+    ref_params = sum(p.numel() for p in CUDACodec(ref_cfg).parameters())
+    wide_params = sum(p.numel() for p in CUDACodec(cfg).parameters())
+    assert wide_params / ref_params == pytest.approx(1.53, rel=0.02)
+    assert 19_800_000 <= wide_params < 20_000_000
+
+
 def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
     cfg_path = ROOT / "configs" / "sub1k_harmonic_20.json"
     data = json.loads(cfg_path.read_text(encoding="utf-8"))

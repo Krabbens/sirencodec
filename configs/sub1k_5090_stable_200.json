@@ -28,7 +28,7 @@
   "curriculum_quantize_blend": true,
   "loss_balancer": "off",
   "activation": "snake_beta",
-  "enc_channels": "56,80,112,160,224,320,448,640",
+  "enc_channels": "72,104,144,208,296,424,592,840",
   "latent_dim": 512,
   "latent_temporal_depth": 2,
   "latent_temporal_post_depth": 0,
