@@ -58,6 +58,7 @@ Each template can include run-length and logging defaults such as:
 - `sub1k_5090_stable_200.json`
   - long RTX 5090-oriented stable run for the observed failure mode where RVQ code usage recovers but quantized reconstruction drifts and GAN/fm hurts late quality
   - keeps the same sub-1 kbps topology as `sub1k_200.json` (`2` RVQ stages, `K=256,128`, stride `256x`) but uses a 200-epoch curriculum with `A=8%`, `B=72%`, `D=20%`
+  - widens encoder/decoder channels to `72,104,144,208,296,424,592,840`, raising the model from about `13.03M` to about `19.92M` parameters while keeping `latent_dim=512`, `latent_2d=2x16`, and full-latent RVQ unchanged
   - disables GAN for the main run; use the resulting checkpoint for a separate short adversarial fine-tune only after SI-SDR/cosine are stable
   - lowers VQ/marginal pressure, enables quantization blending, and strengthens waveform/AE anchors so RVQ learns to follow the good AE path instead of overpowering reconstruction
   - spends extra 5090 compute on spectral quality (`32` spectral items, large FFTs every `2` steps, mild excess/high-frequency losses) while keeping the effective batch at `256` for comparable update count
