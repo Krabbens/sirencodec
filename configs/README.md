@@ -69,11 +69,6 @@ Each template can include run-length and logging defaults such as:
   - uses slightly softer direct-RVQ pressure than the phased preset (`lambda_vq=0.25`, marginal `0.12`) plus a small continuous-path anchor as a regular loss term
   - keeps the 5090 spectral workload (`32` spectral items, large FFTs every `2` steps) with a short STFT ramp to avoid an overly sharp first few thousand updates
 
-- `sub1k_5090_no_phases_latent_post_200.json`
-  - same no-curriculum RTX 5090 setup, but moves one latent temporal block after RVQ: `latent_temporal_depth=1`, `latent_temporal_post_depth=1`
-  - keeps the parameter count effectively unchanged from `sub1k_5090_no_phases_200.json` while testing whether post-RVQ temporal smoothing helps the decoder
-  - preserves the same channel widths, `latent_dim=512`, `latent_2d=2x16`, full-latent `K=256,128` RVQ, and `~0.94 kbps` nominal bitrate
-
 - `sub1k_harmonic_20.json`
   - short 20-epoch test preset for the high-frequency smear fix
   - keeps the same sub-1 kbps RVQ bitrate/codebooks as `sub1k_200.json` (`2` stages, `K=256,128`, same stride)
