@@ -533,6 +533,33 @@ def test_sub1k_5090_no_phases_template_starts_in_hard_rvq_mode():
     assert sum(p.numel() for p in CUDACodec(cfg).parameters()) == 19_917_201
 
 
+def test_sub1k_5090_no_phases_latent_post_template_splits_temporal_stack():
+    cfg_path = ROOT / "configs" / "sub1k_5090_no_phases_latent_post_200.json"
+    args = parse_args(["--config", str(cfg_path), "--steps", "1", "--batch", "1"])
+    cfg = config_from_args(args)
+    ref_args = parse_args(["--config", str(ROOT / "configs" / "sub1k_5090_no_phases_200.json"), "--steps", "1", "--batch", "1"])
+    ref_cfg = config_from_args(ref_args)
+
+    assert cfg.curriculum is False
+    assert curriculum_state(0, cfg).phase == "off"
+    assert curriculum_quantize_blend(0, cfg) == pytest.approx(1.0)
+    assert cfg.latent_temporal_depth == 1
+    assert cfg.latent_temporal_post_depth == 1
+    assert cfg.latent_dim == ref_cfg.latent_dim == 512
+    assert cfg.latent_2d_depth == ref_cfg.latent_2d_depth == 2
+    assert cfg.latent_2d_bands == ref_cfg.latent_2d_bands == 16
+    assert cfg.n_codebooks == ref_cfg.n_codebooks == 2
+    assert cfg.codebook_sizes == ref_cfg.codebook_sizes == (256, 128)
+    assert cfg.rvq_code_dim == ref_cfg.rvq_code_dim == 0
+    assert cfg.enc_channels == ref_cfg.enc_channels
+    assert nominal_rvq_kbps(cfg) == pytest.approx(nominal_rvq_kbps(ref_cfg))
+
+    model = CUDACodec(cfg)
+    assert model.latent_pre is not None
+    assert model.latent_post is not None
+    assert sum(p.numel() for p in model.parameters()) == sum(p.numel() for p in CUDACodec(ref_cfg).parameters())
+
+
 def test_sub1k_harmonic_template_keeps_bitrate_and_enables_mpd():
     cfg_path = ROOT / "configs" / "sub1k_harmonic_20.json"
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
