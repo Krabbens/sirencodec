@@ -63,6 +63,12 @@ Each template can include run-length and logging defaults such as:
   - lowers VQ/marginal pressure, enables quantization blending, and strengthens waveform/AE anchors so RVQ learns to follow the good AE path instead of overpowering reconstruction
   - spends extra 5090 compute on spectral quality (`32` spectral items, large FFTs every `2` steps, mild excess/high-frequency losses) while keeping the effective batch at `256` for comparable update count
 
+- `sub1k_5090_no_phases_200.json`
+  - RTX 5090 preset for the same `~19.92M` model, but with curriculum disabled; training starts directly in hard-RVQ mode and logs phase `off`
+  - keeps `batch=128`, `grad_accum_steps=2`, the same channel widths, `latent_dim=512`, `latent_2d=2x16`, and `K=256,128` RVQ, so nominal bitrate stays `~0.94 kbps`
+  - uses slightly softer direct-RVQ pressure than the phased preset (`lambda_vq=0.25`, marginal `0.12`) plus a small continuous-path anchor as a regular loss term
+  - keeps the 5090 spectral workload (`32` spectral items, large FFTs every `2` steps) with a short STFT ramp to avoid an overly sharp first few thousand updates
+
 - `sub1k_harmonic_20.json`
   - short 20-epoch test preset for the high-frequency smear fix
   - keeps the same sub-1 kbps RVQ bitrate/codebooks as `sub1k_200.json` (`2` stages, `K=256,128`, same stride)
