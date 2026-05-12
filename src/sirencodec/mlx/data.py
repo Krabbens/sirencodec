@@ -92,13 +92,18 @@ def _load_audio_row_np(
             "Check --data-dir and that files are valid wav/flac/ogg/mp3."
         )
     wav = wav[:, 0].astype(np.float32)
-    if wav.size < need:
-        wav = np.pad(wav, (0, need - wav.size))
     if sr != sample_rate:
-        t_new = np.linspace(0, 1, num=need, endpoint=False)
-        wav = np.interp(t_new * wav.size, np.arange(wav.size), wav).astype(np.float32)
-    else:
-        wav = wav[:need]
+        n_out = max(1, int(round(wav.size * float(sample_rate) / float(sr))))
+        x_old = np.linspace(0.0, 1.0, num=wav.size, endpoint=False)
+        x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+        wav = np.interp(x_new, x_old, wav).astype(np.float32)
+    if wav.size > need:
+        span = wav.size - need + 1
+        seed = (int(offset) + row_i * 1000003) & 0xFFFFFFFF
+        start = int((seed * 1103515245 + 12345) % span)
+        wav = wav[start : start + need]
+    elif wav.size < need:
+        wav = np.pad(wav, (0, need - wav.size))
     m = float(np.max(np.abs(wav))) + 1e-5
     return row_i, (wav[:need] / m).astype(np.float32)
 
@@ -134,30 +139,47 @@ def _load_audio_viz_clip(cfg: Config, paths: list[Path], step: int, n_samples: i
     import soundfile as sf
 
     n = len(paths)
-    idx = (step * 7919) % n
+    # Keep the validation spectrogram comparable across checkpoints. Training batches rotate with
+    # the step, but diagnostics should use one stable crop for a given seed/run.
+    seed = int(getattr(cfg, "seed", 0) or 0)
+    idx = (seed * 7919) % n
     wav = None
     sr = None
+    n_samples = int(n_samples)
     for _ in range(min(n, 128)):
         p = paths[idx]
         try:
-            wav, sr = sf.read(str(p), always_2d=True)
-            break
+            info = sf.info(str(p))
+            if int(info.samplerate) > 0:
+                n_resampled = int(round(int(info.frames) * float(cfg.sample_rate) / float(info.samplerate)))
+                if n_resampled >= n_samples:
+                    wav, sr = sf.read(str(p), always_2d=True)
+                    break
         except Exception:
-            idx = (idx + 1) % n
+            pass
+        idx = (idx + 1) % n
+    if wav is None:
+        idx = (seed * 7919) % n
+        for _ in range(min(n, 128)):
+            p = paths[idx]
+            try:
+                wav, sr = sf.read(str(p), always_2d=True)
+                break
+            except Exception:
+                idx = (idx + 1) % n
     if wav is None:
         raise RuntimeError("Could not read any file for spectrogram viz.")
     wav = wav[:, 0].astype(np.float32)
+    if sr != cfg.sample_rate:
+        n_out = max(1, int(round(wav.size * float(cfg.sample_rate) / float(sr))))
+        x_old = np.linspace(0.0, 1.0, num=wav.size, endpoint=False)
+        x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+        wav = np.interp(x_new, x_old, wav).astype(np.float32)
     if wav.size < n_samples:
         wav = np.pad(wav, (0, n_samples - wav.size))
-    if sr != cfg.sample_rate:
-        t_new = np.linspace(0, 1, num=n_samples, endpoint=False)
-        wav = np.interp(t_new * wav.size, np.arange(wav.size), wav).astype(np.float32)
     else:
-        if wav.size > n_samples:
-            start = (step * 11003) % max(1, wav.size - n_samples + 1)
-            wav = wav[start : start + n_samples]
-        else:
-            wav = wav[:n_samples]
+        start = (seed * 11003) % max(1, wav.size - n_samples + 1)
+        wav = wav[start : start + n_samples]
     m = float(np.max(np.abs(wav))) + 1e-5
     wav = (wav[:n_samples] / m).astype(np.float32)
     return mx.array(wav.reshape(1, n_samples, 1))
@@ -173,4 +195,3 @@ def synth_viz_clip(cfg: Config, key: int, n_samples: int) -> mx.array:
     x = x + 0.05 * mx.random.normal(shape=(1, n_samples, 1))
     m = mx.max(mx.abs(x), axis=1, keepdims=True) + 1e-5
     return x / m
-

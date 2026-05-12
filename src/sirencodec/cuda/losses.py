@@ -251,6 +251,91 @@ def multi_stft_complex_l1(pred: torch.Tensor, tgt: torch.Tensor, scales: tuple[t
     return total / float(sum(ws))
 
 
+def _spectral_convergence(mp: torch.Tensor, mq: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    b = int(mp.shape[0])
+    p = mp.reshape(b, -1)
+    q = mq.reshape(b, -1)
+    num = torch.sqrt(torch.sum((p - q) * (p - q), dim=1) + eps)
+    den = torch.sqrt(torch.sum(q * q, dim=1) + eps)
+    return torch.mean(num / den)
+
+
+def high_frequency_stft_terms(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    scales: tuple[tuple[int, int], ...],
+    *,
+    sample_rate: int,
+    min_hz: float = 2500.0,
+    gate_db: float = -18.0,
+    under_margin: float = 0.05,
+    peak_mask: bool = False,
+    scale_weights: tuple[float, ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Target-gated HF under-energy and HF-only spectral convergence."""
+    if not scales:
+        z = pred.new_zeros(())
+        return z, z
+    ws = _scale_weights(scales, scale_weights)
+    total_under = pred.new_zeros((), dtype=torch.float32)
+    total_sc = pred.new_zeros((), dtype=torch.float32)
+    sr = float(sample_rate)
+    min_hz_f = max(0.0, float(min_hz))
+    gate_log = float(gate_db) * math.log(10.0) / 20.0
+    margin = max(0.0, float(under_margin))
+    for (n_fft, hop), w in zip(scales, ws):
+        sp, sq = _stft_pair(pred, tgt, n_fft, hop)
+        mp = sp.abs()
+        mq = sq.abs()
+        lp = torch.log(mp + 1e-5)
+        lq = torch.log(mq + 1e-5)
+        f_dim = int(mq.shape[1])
+        hz = torch.arange(f_dim, device=mq.device, dtype=torch.float32) * (sr / float(max(1, n_fft)))
+        hf = (hz >= min_hz_f).view(1, f_dim, 1)
+        peak = torch.amax(lq, dim=(1, 2), keepdim=True)
+        target_gate = lq >= (peak + gate_log)
+        if peak_mask and f_dim > 2:
+            left = torch.cat((lq[:, :1, :] - 1.0e9, lq[:, :-1, :]), dim=1)
+            right = torch.cat((lq[:, 1:, :], lq[:, -1:, :] - 1.0e9), dim=1)
+            target_gate = target_gate & (lq >= left) & (lq >= right)
+        mask = (hf & target_gate).to(dtype=torch.float32)
+        den = mask.sum().clamp_min(1e-8)
+        under = torch.relu(lq - lp - margin)
+        total_under = total_under + float(w) * (under * mask).sum() / den
+
+        hf_f = hf.to(dtype=torch.float32)
+        total_sc = total_sc + float(w) * _spectral_convergence(mp * hf_f, mq * hf_f)
+    den_w = float(sum(ws))
+    return total_under / den_w, total_sc / den_w
+
+
+def high_frequency_complex_stft_l1(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    scales: tuple[tuple[int, int], ...],
+    *,
+    sample_rate: int,
+    min_hz: float = 2500.0,
+    scale_weights: tuple[float, ...] | None = None,
+) -> torch.Tensor:
+    """Complex STFT L1 averaged only over high-frequency bins."""
+    if not scales:
+        return pred.new_zeros(())
+    ws = _scale_weights(scales, scale_weights)
+    total = pred.new_zeros((), dtype=torch.float32)
+    sr = float(sample_rate)
+    min_hz_f = max(0.0, float(min_hz))
+    for (n_fft, hop), w in zip(scales, ws):
+        sp, sq = _stft_pair(pred, tgt, n_fft, hop)
+        f_dim = int(sp.shape[1])
+        hz = torch.arange(f_dim, device=sp.device, dtype=torch.float32) * (sr / float(max(1, n_fft)))
+        mask = (hz >= min_hz_f).to(dtype=torch.float32).view(1, f_dim, 1)
+        d = 0.5 * ((sp.real - sq.real).abs() + (sp.imag - sq.imag).abs())
+        denom = (mask.sum() * float(int(d.shape[0]) * int(d.shape[2]))).clamp_min(1e-8)
+        total = total + float(w) * (d * mask).sum() / denom
+    return total / float(sum(ws))
+
+
 def _mel_filterbank_numpy(*, n_fft: int, n_mels: int, sample_rate: float, fmin: float, fmax: float) -> np.ndarray:
     n_freqs = n_fft // 2 + 1
     fmax = min(float(fmax), float(sample_rate) * 0.5)

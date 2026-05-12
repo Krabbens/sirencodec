@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+uv run python -m sirencodec.cuda.train \
+  --data-dir data/train-clean-100 \
+  --steps 360000 \
+  --batch 4 \
+  --grad-accum-steps 1 \
+  --segment 32768 \
+  --load-audio-threads 12 \
+  --prefetch-audio \
+  --enc-channels 40,56,80,112,160,224,320,448 \
+  --latent-dim 512 \
+  --n-codebooks 3 \
+  --codebook-sizes 32,32,32 \
+  --rvq-code-dim 0 \
+  --pre-vq-layernorm \
+  --self-attention-depth 1 \
+  --self-attention-post-depth 1 \
+  --self-attention-heads 8 \
+  --decoder-upsample transpose \
+  --decoder-refine-blocks-per-scale 1 \
+  --stft-scales '512,128;1024,256;2048,512;4096,1024;8192,2048' \
+  --stft-scale-weights '0.35,0.75,1.4,2.6,4.0' \
+  --spectral-batch-items 1 \
+  --stft-large-min-fft 4096 \
+  --stft-large-every 4 \
+  --lambda-stft 0.60 \
+  --lambda-sc 0.75 \
+  --lambda-complex-stft 0.25 \
+  --lambda-stft-grad 0.15 \
+  --stft-grad-freq-weight 5.0 \
+  --stft-grad-time-weight 0.5 \
+  --lambda-hf-under 0.80 \
+  --lambda-hf-sc 0.10 \
+  --hf-min-hz 2500 \
+  --hf-gate-db -14 \
+  --hf-under-margin 0.05 \
+  --lambda-stft-excess 0.30 \
+  --stft-excess-margin 0.20 \
+  --lambda-preemph 0.25 \
+  --lambda-sisdr 0.80 \
+  --lambda-time 2.0 \
+  --lambda-cos 0.35 \
+  --lambda-vq 0.30 \
+  --vq-beta 1.0 \
+  --vq-ema-decay 0.97 \
+  --vq-ema-every 4 \
+  --vq-loss mse \
+  --no-vq-loss-normalize \
+  --vq-reset-every 5000 \
+  --vq-reset-collapse-frac 0.25 \
+  --lambda-marginal 0.18 \
+  --marginal-boost-steps 40000 \
+  --marginal-boost-mult 1.5 \
+  --lr 1e-6 \
+  --lr-schedule none \
+  --lr-warmup-steps 0 \
+  --grad-clip 3.0 \
+  --eval-dir data/librispeech/LibriSpeech/test-clean \
+  --eval-samples 10 \
+  --eval-seconds 0 \
+  --eval-seed 0 \
+  --best-holdout-metric sisdr_db \
+  --log-loss-ema-beta 0.98 \
+  --log-every 50 \
+  --eval-every 5000 \
+  --spectrogram-every 2500 \
+  --checkpoint-every 5000 \
+  --spectrogram-seconds 8 \
+  --full-checkpoint

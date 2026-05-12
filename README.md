@@ -5,14 +5,17 @@ CUDA-first neural audio codec training repo with an optional MLX backend kept fo
 ## Layout
 
 - `src/sirencodec/cuda/` - active CUDA trainer, model, data pipeline and losses
-- `src/sirencodec/mlx/` - optional MLX backend
+- `src/sirencodec/mlx/` - optional MLX backend for Apple Silicon training
 - `src/sirencodec/` - shared config and utilities
 - `uv run train` - canonical training entrypoint
+- `uv run train-mlx` or `uv run python tools/train_mlx.py` - MLX training entrypoints
 
 ## Local setup
 
 ```bash
 uv sync
+# Apple Silicon MLX:
+uv sync --extra mlx
 ```
 
 ## Train
@@ -39,6 +42,12 @@ Resume:
 
 ```bash
 uv run train --continue experiments/<run_dir>
+```
+
+MLX smoke test on Apple Silicon:
+
+```bash
+uv run train-mlx --steps 1 --no-librispeech --batch 1 --segment 512 --fast
 ```
 
 ## Run artifacts
@@ -86,7 +95,8 @@ The image contains the repository `.git` directory and two container helpers:
 # Fetch, optionally switch branch, pull, then refresh uv dependencies.
 sirencodec-sync models/13b
 
-# Download and extract LibriSpeech train-clean-360 to /workspace/data/train-clean-360.
+# Download and extract LibriSpeech corpora.
+download-train-clean-100
 download-train-clean-360
 ```
 

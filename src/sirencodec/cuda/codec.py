@@ -1,6 +1,8 @@
 """PyTorch/CUDA codec backend for the former MLX trainer CLI."""
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -64,11 +66,68 @@ class SnakeBeta(nn.Module):
         return x + (torch.sin(a * x) ** 2) / (a + 1e-8)
 
 
-def _act_module(cfg: Config, ch: int) -> nn.Module:
-    a = (cfg.activation or "gelu").strip().lower()
+class HarmonicBeta(nn.Module):
+    """Two-scale sin² residual: x + sin²(ax)/a + w·sin²(bx)/b with b = a·exp(log_ratio)."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        c = int(channels)
+        self.log_alpha = nn.Parameter(torch.zeros(c))
+        self.log_ratio = nn.Parameter(torch.full((c,), math.log(2.0)))
+        self.log_mix = nn.Parameter(torch.zeros(c))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = torch.exp(torch.clamp(self.log_alpha, -10.0, 10.0)).view(1, 1, -1)
+        r = torch.exp(torch.clamp(self.log_ratio, -3.0, 3.0)).view(1, 1, -1)
+        b = a * r
+        w = torch.sigmoid(self.log_mix).view(1, 1, -1)
+        t1 = (torch.sin(a * x) ** 2) / (a + 1e-8)
+        t2 = (torch.sin(b * x) ** 2) / (b + 1e-8)
+        return x + t1 + w * t2
+
+
+class PeriodicGELU(nn.Module):
+    """GELU(x) + sin²(ax)/a — envelope via GELU, periodic term separate."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        c = int(channels)
+        self.log_alpha = nn.Parameter(torch.zeros(c))
+        self.gelu = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = torch.exp(torch.clamp(self.log_alpha, -10.0, 10.0)).view(1, 1, -1)
+        return self.gelu(x) + (torch.sin(a * x) ** 2) / (a + 1e-8)
+
+
+def _act_from_string(act: str, ch: int) -> nn.Module:
+    a = (act or "gelu").strip().lower()
     if a in ("snake", "snake_beta"):
         return SnakeBeta(ch)
+    if a == "harmonic_beta":
+        return HarmonicBeta(ch)
+    if a == "periodic_gelu":
+        return PeriodicGELU(ch)
     return nn.GELU()
+
+
+def _act_module(cfg: Config, ch: int) -> nn.Module:
+    return _act_from_string(cfg.activation, ch)
+
+
+def _vq_match_loss(diff: torch.Tensor, cfg: Config, ref: torch.Tensor | None = None) -> torch.Tensor:
+    if bool(getattr(cfg, "vq_loss_normalize", False)) and ref is not None:
+        eps = max(1e-8, float(getattr(cfg, "vq_loss_norm_eps", 1e-4)))
+        scale = torch.sqrt(torch.mean(ref.detach() * ref.detach(), dim=-1, keepdim=True) + eps)
+        diff = diff / scale
+    mode = str(getattr(cfg, "vq_loss", "mse") or "mse").strip().lower()
+    if mode == "huber":
+        delta = max(1e-6, float(getattr(cfg, "vq_huber_delta", 1.0)))
+        ad = diff.abs()
+        quad = torch.minimum(ad, torch.as_tensor(delta, device=diff.device, dtype=diff.dtype))
+        lin = ad - quad
+        return torch.mean(0.5 * quad * quad / delta + lin)
+    return torch.mean(diff * diff)
 
 
 class Encoder(nn.Module):
@@ -129,8 +188,8 @@ class VectorQuantizerStage(nn.Module):
             z_q_low = self.embedding(idx)
         z_q = self.out_proj(z_q_low) if self.out_proj is not None else z_q_low
         z_st = residual + (z_q - residual).detach()
-        commit = torch.mean((z_q.detach() - residual) ** 2)
-        codebook = torch.mean((z_q - residual.detach()) ** 2)
+        commit = _vq_match_loss(z_q.detach() - residual, self.cfg, residual)
+        codebook = _vq_match_loss(z_q - residual.detach(), self.cfg, residual)
         return z_st, self.beta * commit + codebook, dist, idx
 
 
@@ -169,16 +228,18 @@ class Decoder(nn.Module):
         super().__init__()
         c = list(reversed(cfg.enc_channels))
         d = cfg.latent_dim
-        n1 = max(0, int(cfg.stride1_blocks_per_scale))
+        n1 = max(0, int(cfg.stride1_blocks_per_scale)) + max(0, int(getattr(cfg, "decoder_refine_blocks_per_scale", 0)))
         use_repeat = (cfg.decoder_upsample or "transpose").lower() == "repeat_conv" or bool(cfg.causal)
+        kt = max(2, int(getattr(cfg, "decoder_transpose_kernel", 7)))
+        tp = (kt - 2) // 2 if kt % 2 == 0 else kt // 2
         layers: list[nn.Module] = []
-        layers.append(UpsampleRepeatConv(d, c[0]) if use_repeat else NLCConvTranspose1d(d, c[0], 7, stride=2, padding=3))
+        layers.append(UpsampleRepeatConv(d, c[0]) if use_repeat else NLCConvTranspose1d(d, c[0], kt, stride=2, padding=tp))
         layers.append(_act_module(cfg, c[0]))
         for _ in range(n1):
             layers.append(NLCConv1d(c[0], c[0], 7, padding=3, causal=cfg.causal))
             layers.append(_act_module(cfg, c[0]))
         for i in range(len(c) - 1):
-            layers.append(UpsampleRepeatConv(c[i], c[i + 1]) if use_repeat else NLCConvTranspose1d(c[i], c[i + 1], 7, stride=2, padding=3))
+            layers.append(UpsampleRepeatConv(c[i], c[i + 1]) if use_repeat else NLCConvTranspose1d(c[i], c[i + 1], kt, stride=2, padding=tp))
             layers.append(_act_module(cfg, c[i + 1]))
             for _ in range(n1):
                 layers.append(NLCConv1d(c[i + 1], c[i + 1], 7, padding=3, causal=cfg.causal))
@@ -204,13 +265,57 @@ class LatentTemporalStack(nn.Module):
         for i in range(max(0, int(depth))):
             d = 2 ** (i % 5)
             layers.append(NLCConv1d(dim, dim, 3, stride=1, padding=d, dilation=d))
-            layers.append(SnakeBeta(dim) if act in ("snake", "snake_beta") else nn.GELU())
+            layers.append(_act_from_string(act, dim))
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if len(self.layers) == 0:
             return x
         return x + self.layers(x)
+
+
+class SelfAttention1D(nn.Module):
+    """Residual multi-head self-attention over NLC latent sequences."""
+
+    def __init__(self, dim: int, heads: int = 8, *, causal: bool = False):
+        super().__init__()
+        self.dim = int(dim)
+        self.heads = int(heads)
+        self.causal = bool(causal)
+        if self.heads < 1:
+            raise ValueError("self_attention_heads must be >= 1")
+        if self.dim % self.heads != 0:
+            raise ValueError(f"latent_dim={self.dim} must be divisible by self_attention_heads={self.heads}")
+        self.head_dim = self.dim // self.heads
+        self.norm = nn.LayerNorm(self.dim)
+        self.qkv = nn.Linear(self.dim, 3 * self.dim)
+        self.out = nn.Linear(self.dim, self.dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).reshape(b, t, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        if self.causal:
+            mask = torch.ones((t, t), device=x.device, dtype=torch.bool).triu(1)
+            scores = scores.masked_fill(mask.view(1, 1, t, t), -torch.finfo(scores.dtype).max)
+        attn = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+        y = torch.matmul(attn, v).transpose(1, 2).reshape(b, t, c)
+        return x + self.out(y)
+
+
+class LatentSelfAttentionStack(nn.Module):
+    def __init__(self, dim: int, depth: int, *, heads: int = 8, causal: bool = False):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            SelfAttention1D(dim, heads=heads, causal=causal) for _ in range(max(0, int(depth)))
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 class WaveDiscriminator(nn.Module):
@@ -385,9 +490,29 @@ class CUDACodec(nn.Module):
             if cfg.latent_temporal_depth > 0
             else None
         )
+        self.latent_attn = (
+            LatentSelfAttentionStack(
+                cfg.latent_dim,
+                cfg.self_attention_depth,
+                heads=cfg.self_attention_heads,
+                causal=cfg.causal,
+            )
+            if cfg.self_attention_depth > 0
+            else None
+        )
         self.latent_post = (
             LatentTemporalStack(cfg.latent_dim, cfg.latent_temporal_post_depth, activation=cfg.activation)
             if cfg.latent_temporal_post_depth > 0
+            else None
+        )
+        self.latent_attn_post = (
+            LatentSelfAttentionStack(
+                cfg.latent_dim,
+                cfg.self_attention_post_depth,
+                heads=cfg.self_attention_heads,
+                causal=cfg.causal,
+            )
+            if cfg.self_attention_post_depth > 0
             else None
         )
 
@@ -397,6 +522,8 @@ class CUDACodec(nn.Module):
             z = self.pre_vq_ln(z)
         if self.latent_pre is not None:
             z = self.latent_pre(z)
+        if self.latent_attn is not None:
+            z = self.latent_attn(z)
         return z
 
     def forward_full(
@@ -424,6 +551,8 @@ class CUDACodec(nn.Module):
         z_q, vq_loss, ent_pos, marg_ent, indices = self.rvq(z)
         if self.latent_post is not None:
             z_q = self.latent_post(z_q)
+        if self.latent_attn_post is not None:
+            z_q = self.latent_attn_post(z_q)
         q = min(1.0, max(0.0, float(quantize_blend)))
         if q < 1.0:
             z_q = z + q * (z_q - z)

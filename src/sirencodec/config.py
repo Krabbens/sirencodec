@@ -116,6 +116,8 @@ class Config:
     # Per resolution: stride-1 Conv+GELU (same width) before each stride-2 down / after each stride-2 up (0 = legacy).
     # Default 0: cold start with 1 can yield all-NaN gradients (deep MLX graph + default init); use 1 after stable warmup or resume.
     stride1_blocks_per_scale: int = 0
+    # Decoder-only refinement after each upsample. Keeps encoder stride / nominal bitrate unchanged.
+    decoder_refine_blocks_per_scale: int = 0
     # Wider D at same n_q×K×f_latent → same nominal index b/s, richer codewords in R^D.
     latent_dim: int = 512
     # LayerNorm on encoder output before RVQ (off by default; can interact badly with cosine RVQ early).
@@ -123,15 +125,41 @@ class Config:
     # Residual dilated Conv1d on latent sequence (NLC): smooths temporal VQ trajectory.
     latent_temporal_depth: int = 2  # 0 = off; applied after optional pre_vq_ln, before RVQ
     latent_temporal_post_depth: int = 2  # 0 = off; applied on quantized z_q before decoder
+    # Lightweight latent SelfAttention1D. Pre-RVQ is enabled by default; post-RVQ stays opt-in.
+    self_attention_depth: int = 1
+    self_attention_post_depth: int = 0
+    self_attention_heads: int = 8
+    # FFT-convolution diagonal state-space latent mixer. Mutually exclusive with SelfAttention1D per location.
+    state_space_depth: int = 0
+    state_space_post_depth: int = 0
+    state_space_state_dim: int = 16
+    state_space_expand: int = 1
+    state_space_bidirectional: bool = True
     # Residual VQ (SoundStream / EnCodec style): each stage quantizes the remaining residual
     n_codebooks: int = 3
     codebook_size: int = 32
     # Per-stage codebook sizes (coarse→fine often uses decreasing K, e.g. 256,128,64). None = repeat ``codebook_size``.
     codebook_sizes: tuple[int, ...] | None = None
+    # Optional grouped RVQ streams over channel slices of the latent, e.g. ``5,5,5``.
+    # Sum must equal ``n_codebooks``. Keeps nominal bitrate unchanged but prevents one
+    # monolithic residual chain from spending every stage on the same dominant subspace.
+    rvq_band_splits: tuple[int, ...] | None = None
     # Cosine / spherical assignment: argmin ||r̂−ê|| with r̂,ê unit; z_q = ê·‖r‖ — same K,n_q → same nominal bitrate, often better u
     vq_cosine: bool = True
+    # TurboQuant-inspired fixed random orthogonal rotation in RVQ code space before assignment.
+    # Keeps one RVQ index per stage/frame; unlike paper-literal scalar TurboQuant, it does not multiply bitrate by D.
+    turboquant: bool = False
+    turboquant_seed: int = 1729
     vq_commitment: float = 1.35  # β on commitment (higher → less codebook collapse at low bitrate)
     lambda_vq: float = 5.0  # scale sum of VQ losses vs waveform/STFT
+    # VQ loss shape: ``mse`` preserves legacy behavior; ``huber`` bounds outlier gradients from
+    # single-crop latent spikes while still pulling residuals/codewords together.
+    vq_loss: str = "mse"  # "mse" | "huber"
+    vq_huber_delta: float = 1.0
+    # Normalize VQ residual/codebook matching by residual RMS. This makes the VQ term track
+    # relative quantization error instead of crop-dependent latent energy.
+    vq_loss_normalize: bool = False
+    vq_loss_norm_eps: float = 1e-4
     ae_only: bool = False  # if True, skip VQ (pure autoencoder)
     # Loss (STFT often dominates RVQ at 256× downsample — ramp + lower default helps)
     lambda_time: float = 1.0
@@ -146,6 +174,9 @@ class Config:
     # Limit expensive spectral losses to N batch items per micro-batch (0 = all items).
     # Waveform, RVQ, and adversarial/semantic terms still see the full micro-batch.
     spectral_batch_items: int = 0
+    # Compute the full spectral loss bundle every N optimizer steps. Active spectral steps
+    # are weighted by N, so average spectral pressure stays close while most steps stay cheap.
+    spectral_loss_every: int = 1
     # Run scales with n_fft >= this threshold only every N optimizer steps (1 = every step).
     # This keeps 4096/8192 FFT pressure without paying their full cost on every update.
     stft_large_min_fft: int = 0
@@ -163,6 +194,44 @@ class Config:
     # This specifically fights broadband "spectral floor" smear between harmonic peaks.
     lambda_stft_excess: float = 0.0
     stft_excess_margin: float = 0.20
+    # Target-gated high-band pressure: restore missing HF peaks without rewarding broadband haze.
+    lambda_hf_under: float = 0.0
+    lambda_hf_sc: float = 0.0
+    lambda_hf_complex: float = 0.0
+    hf_min_hz: float = 2500.0
+    hf_gate_db: float = -18.0
+    hf_under_margin: float = 0.05
+    # When enabled, HF-under only rewards target local maxima along frequency, not broad HF shelves.
+    hf_peak_mask: bool = False
+    # Target-peak spectral contrast: match harmonic peak-vs-neighborhood contrast in log-STFT.
+    # This rewards horizontal harmonic ridges instead of broadband HF shelves.
+    lambda_peak_contrast: float = 0.0
+    # Target-peak log-magnitude under-loss: restore energy exactly at target HF local maxima.
+    # This complements contrast loss by forcing ridge amplitude without rewarding all HF bins.
+    lambda_peak_mag: float = 0.0
+    peak_contrast_radius: int = 3
+    # Match harmonic periodicity along frequency, independent of absolute peak bin placement.
+    # This is a DSP loss, not a semantic teacher: it compares normalized frequency-axis
+    # autocorrelation of log-magnitude spectra at plausible F0 lags.
+    lambda_freq_ac: float = 0.0
+    freq_ac_min_hz: float = 300.0
+    freq_ac_lags_hz: tuple[float, ...] = (60.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 500.0)
+    # Penalize narrow horizontal spectral lines that are too stationary vs the target.
+    lambda_stationary_line: float = 0.0
+    stationary_line_min_hz: float = 1000.0
+    stationary_line_radius: int = 5
+    stationary_line_margin: float = 0.08
+    # DSP supervision for the harmonic decoder source. Target F0/voicing is estimated
+    # from waveform autocorrelation, so this stays GAN-free and teacher-free.
+    lambda_harmonic_f0: float = 0.0
+    lambda_harmonic_amp: float = 0.0
+    harmonic_f0_frame: int = 512
+    harmonic_f0_hop: int = 256
+    harmonic_f0_lags: tuple[int, ...] = (32, 36, 40, 45, 50, 56, 63, 71, 80, 90, 101, 113, 127, 143, 160, 180, 202, 226, 254)
+    harmonic_voicing_threshold: float = 0.30
+    # Delay and ramp HF pressure so early training learns timing/low bands before high-band detail.
+    hf_start_step: int = 0
+    hf_ramp_steps: int = 0
     # Spectral Convergence (Yamamoto et al. 2020): ``‖|S(ŷ)|−|S(y)|‖_F / ‖|S(y)|‖_F`` per scale.
     # Scale-invariant; emphasizes harmonic peaks — classic GAN-free high-freq pressure. Same ramp as STFT.
     lambda_sc: float = 1.0
@@ -206,6 +275,10 @@ class Config:
     # High-pass waveform anchor: L1 after pre-emphasis, useful when high harmonics smear under mag-only losses.
     lambda_preemph: float = 0.0
     preemph_coef: float = 0.97
+    # Multi-lag finite-difference waveform anchor. This gives HF a phase/time-aligned gradient
+    # without rewarding broadband spectral-floor energy.
+    lambda_multidelta: float = 0.0
+    multidelta_lags: tuple[int, ...] = (1, 2, 4, 8)
     # During RVQ phases, keep a continuous z->decoder reconstruction anchor alive.
     # This prevents the encoder/decoder path learned in A from drifting while hard RVQ is optimized.
     lambda_ae_anchor_time: float = 0.0
@@ -241,6 +314,8 @@ class Config:
     curriculum_quantize_blend: bool = True
     # Logging
     log_every: int = 50
+    # EMA of raw train loss/VQ loss for logs only. This is diagnostic, not a scheduler signal.
+    log_loss_ema_beta: float = 0.98
     # EMA of waveform cos % in the log line: ema ← β·ema + (1−β)·cos; 0 = print raw cos only
     log_cos_ema_beta: float = 0.99
     # Spectrogram PNGs (matplotlib Agg)
@@ -260,14 +335,57 @@ class Config:
     # Extra mean L1 on **linear** STFT magnitudes (same scales as log-STFT; weighted by λ_stft ramp).
     # Without GAN this carries more of the absolute harmonic-amplitude shaping.
     lambda_mag_l1: float = 0.15
-    # Encoder/decoder activation: ``gelu`` | ``snake`` | ``snake_beta`` (DAC-style sin²).
+    # Encoder/decoder activation: ``gelu`` | ``snake`` | ``snake_beta`` (DAC-style sin²) |
+    # ``harmonic_beta`` (two-scale sin² on identity) | ``periodic_gelu`` (GELU + sin² / a).
     activation: str = "snake_beta"
     # Factorized RVQ: project latent D→d before codebook (0 = use full ``latent_dim``).
     rvq_code_dim: int = 8
     # EMA codebook update decay in ``(0,1)`` (0 = disabled). Updated on CPU after each optimizer step.
     vq_ema_decay: float = 0.99
+    # Run the CPU/NumPy EMA codebook refresh every N optimizer steps. 1 preserves legacy behavior.
+    vq_ema_every: int = 1
     # Decoder upsample: ``transpose`` (ConvTranspose1d) or ``repeat_conv`` (repeat×2 + Conv1d).
     decoder_upsample: str = "repeat_conv"
+    # ConvTranspose1d kernel for decoder upsampling. Even kernels (e.g. 8 with stride 2)
+    # give even overlap and exact 2× length; legacy 7 yields 2L-1 and can checkerboard.
+    decoder_transpose_kernel: int = 7
+    # Optional fixed-filter output split: decoder predicts low/mid/high branches, each branch is
+    # zero-phase FIR filtered and summed. Encoder/RVQ/stride are unchanged, so index bitrate is unchanged.
+    decoder_band_split: bool = False
+    band_split_cutoffs_hz: tuple[float, float] = (2500.0, 5000.0)
+    band_split_taps: int = 129
+    # Extra per-band decoder heads before fixed FIR filtering. Keeps RVQ/bitrate unchanged,
+    # but gives low/mid/high separate local synthesis capacity instead of one shared output conv.
+    decoder_band_head_depth: int = 0
+    # Decode three latent channel groups through separate decoder towers, FIR-filter as
+    # low/mid/high, then sum. Requires ``decoder_band_split`` and three ``rvq_band_splits``.
+    decoder_band_latent_split: bool = False
+    # Optional source-filter branch: decoder predicts base waveform plus a voiced excitation
+    # with learnable per-sample F0 and harmonic partials. RVQ/stride/bitrate stay unchanged.
+    decoder_harmonic_source: bool = False
+    decoder_harmonic_partials: int = 6
+    decoder_harmonic_fmin_hz: float = 60.0
+    decoder_harmonic_fmax_hz: float = 450.0
+    decoder_harmonic_gain: float = 0.25
+    decoder_harmonic_amp_bias: float = -2.0
+    decoder_harmonic_rolloff: float = 1.0
+    # ``additive``: legacy harmonic source is simply added into filtered output bands.
+    # ``source_filter``: mid/high are mostly deterministic harmonic excitation with
+    # latent-predicted envelopes; generic conv residual can be attenuated per band.
+    decoder_harmonic_mode: str = "additive"
+    decoder_harmonic_control_smooth: int = 0
+    decoder_harmonic_env_bias: float = 0.0
+    decoder_harmonic_band_weights: tuple[float, float, float] = (0.0, 0.35, 1.0)
+    decoder_harmonic_residual_band_weights: tuple[float, float, float] = (1.0, 0.25, 0.05)
+    decoder_harmonic_groups: int = 0
+    decoder_harmonic_group_bias: float = -1.5
+    # Band-normalized waveform loss. Prevents low-band energy from dominating HF learning.
+    lambda_band_l1: float = 0.0
+    band_l1_weights: tuple[float, float, float] = (0.25, 1.0, 1.5)
+    band_l1_floor: float = 0.015
+    # Train each decoder branch against its own filtered target band before the branches are summed.
+    lambda_band_branch_l1: float = 0.0
+    band_branch_weights: tuple[float, float, float] = (0.10, 1.0, 2.0)
     # Causal conv encoder/decoder (left padding only); streaming-friendly.
     causal: bool = False
     # bf16 weights/activations where safe (STFT kept fp32).
@@ -280,10 +398,14 @@ class Config:
     eval_every: int = 5000
     eval_clips: int = 4
     eval_seconds: float = 3.0
+    # Optional holdout directory. When set, eval uses fixed files from here instead of the current train batch.
+    eval_dir: Path | None = None
     # Fixed validation clip seed. Keeping this independent of step makes eval rows comparable.
     eval_seed: int = 0
     log_mlx_tsv: str = "log_mlx.tsv"
     results_tsv_path: str = "results.tsv"
+    # Metric used to mark the best holdout checkpoint. Lower is better for ``lsd_db`` only.
+    best_holdout_metric: str = "sisdr_db"
     # Adaptive / BWE stubs (see ``sirencodec.adaptive``): ``none`` | ``bwe_stub`` | ``fps_stub``.
     adaptive_mode: str = "none"
 
@@ -383,6 +505,14 @@ def parse_positive_int_list_arg(s: str) -> tuple[int, ...]:
     return tuple(out)
 
 
+def parse_float_list_arg(s: str) -> tuple[float, ...]:
+    """``"0.25,1,1.5"`` -> ``(0.25, 1.0, 1.5)``."""
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty float list")
+    return tuple(float(p) for p in parts)
+
+
 def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]:
     """Map ``Config`` → ``ArgumentParser.set_defaults`` (CLI stays in sync with dataclass)."""
     c = dc if dc is not None else Config()
@@ -411,18 +541,53 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "grad_clip": c.grad_clip_norm,
         "seed": c.seed,
         "stride1_blocks_per_scale": c.stride1_blocks_per_scale,
+        "decoder_refine_blocks_per_scale": c.decoder_refine_blocks_per_scale,
         "latent_dim": c.latent_dim,
         "pre_vq_layernorm": c.pre_vq_layernorm,
         "latent_temporal_depth": c.latent_temporal_depth,
         "latent_temporal_post_depth": c.latent_temporal_post_depth,
+        "self_attention_depth": c.self_attention_depth,
+        "self_attention_post_depth": c.self_attention_post_depth,
+        "self_attention_heads": c.self_attention_heads,
+        "state_space_depth": c.state_space_depth,
+        "state_space_post_depth": c.state_space_post_depth,
+        "state_space_state_dim": c.state_space_state_dim,
+        "state_space_expand": c.state_space_expand,
+        "state_space_bidirectional": c.state_space_bidirectional,
         "n_codebooks": c.n_codebooks,
         "codebook_size": c.codebook_size,
+        "rvq_band_splits": ",".join(str(int(x)) for x in c.rvq_band_splits) if c.rvq_band_splits else None,
         "lambda_time": c.lambda_time,
         "lambda_stft": c.lambda_stft,
         "lambda_stft_grad": c.lambda_stft_grad,
         "lambda_stft_cos": c.lambda_stft_cos,
         "lambda_stft_excess": c.lambda_stft_excess,
         "stft_excess_margin": c.stft_excess_margin,
+        "lambda_hf_under": c.lambda_hf_under,
+        "lambda_hf_sc": c.lambda_hf_sc,
+        "lambda_hf_complex": c.lambda_hf_complex,
+        "hf_min_hz": c.hf_min_hz,
+        "hf_gate_db": c.hf_gate_db,
+        "hf_under_margin": c.hf_under_margin,
+        "hf_peak_mask": c.hf_peak_mask,
+        "lambda_peak_contrast": c.lambda_peak_contrast,
+        "lambda_peak_mag": c.lambda_peak_mag,
+        "peak_contrast_radius": c.peak_contrast_radius,
+        "lambda_freq_ac": c.lambda_freq_ac,
+        "freq_ac_min_hz": c.freq_ac_min_hz,
+        "freq_ac_lags_hz": ",".join(str(float(x)) for x in c.freq_ac_lags_hz),
+        "lambda_stationary_line": c.lambda_stationary_line,
+        "stationary_line_min_hz": c.stationary_line_min_hz,
+        "stationary_line_radius": c.stationary_line_radius,
+        "stationary_line_margin": c.stationary_line_margin,
+        "lambda_harmonic_f0": c.lambda_harmonic_f0,
+        "lambda_harmonic_amp": c.lambda_harmonic_amp,
+        "harmonic_f0_frame": c.harmonic_f0_frame,
+        "harmonic_f0_hop": c.harmonic_f0_hop,
+        "harmonic_f0_lags": ",".join(str(int(x)) for x in c.harmonic_f0_lags),
+        "harmonic_voicing_threshold": c.harmonic_voicing_threshold,
+        "hf_start_step": c.hf_start_step,
+        "hf_ramp_steps": c.hf_ramp_steps,
         "lambda_sc": c.lambda_sc,
         "lambda_complex_stft": c.lambda_complex_stft,
         "stft_grad_freq_weight": c.stft_grad_freq_weight,
@@ -432,6 +597,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "stft_scales": stft_s,
         "stft_scale_weights": stft_w,
         "spectral_batch_items": c.spectral_batch_items,
+        "spectral_loss_every": c.spectral_loss_every,
         "stft_large_min_fft": c.stft_large_min_fft,
         "stft_large_every": c.stft_large_every,
         "stft_hf_emphasis": c.stft_hf_emphasis,
@@ -443,6 +609,10 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lambda_mel_l1": c.lambda_mel_l1,
         "lambda_mel_l2": c.lambda_mel_l2,
         "lambda_vq": c.lambda_vq,
+        "vq_loss": c.vq_loss,
+        "vq_huber_delta": c.vq_huber_delta,
+        "vq_loss_normalize": c.vq_loss_normalize,
+        "vq_loss_norm_eps": c.vq_loss_norm_eps,
         "lambda_entropy": c.lambda_entropy,
         "lambda_marginal": c.lambda_marginal,
         "marginal_tau": c.marginal_tau,
@@ -456,6 +626,8 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "vq_reset_full_refresh_max_unique": c.vq_reset_full_refresh_max_unique,
         "vq_reset_log_every": c.vq_reset_log_every,
         "vq_cosine": c.vq_cosine,
+        "turboquant": c.turboquant,
+        "turboquant_seed": c.turboquant_seed,
         "vq_beta": c.vq_commitment,
         "lambda_cos": c.lambda_cos,
         "cos_hinge": c.cos_hinge,
@@ -463,6 +635,8 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lambda_sisdr": c.lambda_sisdr,
         "lambda_preemph": c.lambda_preemph,
         "preemph_coef": c.preemph_coef,
+        "lambda_multidelta": c.lambda_multidelta,
+        "multidelta_lags": c.multidelta_lags,
         "lambda_ae_anchor_time": c.lambda_ae_anchor_time,
         "lambda_ae_anchor_cos": c.lambda_ae_anchor_cos,
         "loss_balancer": c.loss_balancer,
@@ -492,7 +666,35 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "activation": c.activation,
         "rvq_code_dim": c.rvq_code_dim,
         "vq_ema_decay": c.vq_ema_decay,
+        "vq_ema_every": c.vq_ema_every,
         "decoder_upsample": c.decoder_upsample,
+        "decoder_transpose_kernel": c.decoder_transpose_kernel,
+        "decoder_band_split": c.decoder_band_split,
+        "band_split_cutoffs_hz": ",".join(str(float(x)) for x in c.band_split_cutoffs_hz),
+        "band_split_taps": c.band_split_taps,
+        "decoder_band_head_depth": c.decoder_band_head_depth,
+        "decoder_band_latent_split": c.decoder_band_latent_split,
+        "decoder_harmonic_source": c.decoder_harmonic_source,
+        "decoder_harmonic_partials": c.decoder_harmonic_partials,
+        "decoder_harmonic_fmin_hz": c.decoder_harmonic_fmin_hz,
+        "decoder_harmonic_fmax_hz": c.decoder_harmonic_fmax_hz,
+        "decoder_harmonic_gain": c.decoder_harmonic_gain,
+        "decoder_harmonic_amp_bias": c.decoder_harmonic_amp_bias,
+        "decoder_harmonic_rolloff": c.decoder_harmonic_rolloff,
+        "decoder_harmonic_mode": c.decoder_harmonic_mode,
+        "decoder_harmonic_control_smooth": c.decoder_harmonic_control_smooth,
+        "decoder_harmonic_env_bias": c.decoder_harmonic_env_bias,
+        "decoder_harmonic_band_weights": ",".join(str(float(x)) for x in c.decoder_harmonic_band_weights),
+        "decoder_harmonic_residual_band_weights": ",".join(
+            str(float(x)) for x in c.decoder_harmonic_residual_band_weights
+        ),
+        "decoder_harmonic_groups": c.decoder_harmonic_groups,
+        "decoder_harmonic_group_bias": c.decoder_harmonic_group_bias,
+        "lambda_band_l1": c.lambda_band_l1,
+        "band_l1_weights": ",".join(str(float(x)) for x in c.band_l1_weights),
+        "band_l1_floor": c.band_l1_floor,
+        "lambda_band_branch_l1": c.lambda_band_branch_l1,
+        "band_branch_weights": ",".join(str(float(x)) for x in c.band_branch_weights),
         "causal": c.causal,
         "bf16": c.use_bf16,
         "compile_loss": c.use_compile,
@@ -500,12 +702,14 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "eval_every": c.eval_every,
         "eval_clips": c.eval_clips,
         "eval_seconds": c.eval_seconds,
+        "eval_dir": c.eval_dir,
         "eval_seed": c.eval_seed,
         "log_mlx_tsv": c.log_mlx_tsv,
         "results_tsv": c.results_tsv_path,
         "adaptive_mode": c.adaptive_mode,
         "dataset": c.dataset,
         "log_every": c.log_every,
+        "log_loss_ema_beta": c.log_loss_ema_beta,
         "log_cos_ema_beta": c.log_cos_ema_beta,
         "spectrogram_every": c.spectrogram_every,
         "spectrogram_dir": c.spectrogram_dir,
@@ -513,5 +717,6 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "spectrogram_seconds": c.spectrogram_seconds,
         "checkpoint_every": c.checkpoint_every,
         "checkpoint_dir": c.checkpoint_dir,
+        "best_holdout_metric": c.best_holdout_metric,
     }
     return d

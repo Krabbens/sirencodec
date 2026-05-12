@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CUDA trainer entrypoint kept at the old ``train_mlx.py`` path for script compatibility."""
+"""MLX trainer entrypoint for Apple Silicon runs."""
 
 from __future__ import annotations
 
@@ -18,21 +18,29 @@ from sirencodec.config import (  # noqa: E402
     nominal_rvq_kbps,
     parse_codebook_sizes_arg,
 )
-from sirencodec.cuda.codec import CUDACodec  # noqa: E402
-from sirencodec.cuda.train import main  # noqa: E402
-
-try:  # Keep legacy MLX tests/helpers working where MLX is installed.
-    from sirencodec.mlx.codec import MLXCodec as _CompatMLXCodec  # type: ignore  # noqa: E402
-except Exception:  # pragma: no cover - expected on CUDA/Windows machines.
-    _CompatMLXCodec = CUDACodec
-
-MLXCodec = _CompatMLXCodec
+from sirencodec.mlx.codec import MLXCodec  # noqa: E402
+from sirencodec.mlx.train import (  # noqa: E402
+    _active_stft_scales,
+    _spectral_loss_batch,
+    batch_mean_cosine,
+    batch_multidelta_l1,
+    batch_neg_log_si_sdr,
+    batch_preemph_l1,
+    make_train_fn,
+    main,
+)
 
 __all__ = [
     "main",
     "Config",
-    "CUDACodec",
     "MLXCodec",
+    "batch_mean_cosine",
+    "batch_multidelta_l1",
+    "batch_neg_log_si_sdr",
+    "batch_preemph_l1",
+    "make_train_fn",
+    "_active_stft_scales",
+    "_spectral_loss_batch",
     "effective_codebook_sizes",
     "encoder_time_stride",
     "nominal_rvq_kbps",

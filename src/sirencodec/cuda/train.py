@@ -16,6 +16,7 @@ import copy
 import json
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -57,6 +58,8 @@ from .data import (
     synth_viz_clip,
 )
 from .losses import (
+    high_frequency_complex_stft_l1,
+    high_frequency_stft_terms,
     mel_filterbank_torch,
     mel_log_bin_losses,
     multi_stft_all_terms,
@@ -120,6 +123,16 @@ def effective_lambda_marginal(step: int, cfg: Config) -> float:
     m = max(1.0, float(cfg.marginal_boost_mult))
     t = min(1.0, float(step) / float(cfg.marginal_boost_steps))
     return cfg.lambda_marginal * (m + (1.0 - m) * t)
+
+
+def effective_hf_mult(step: int, cfg: Config) -> float:
+    start = max(0, int(getattr(cfg, "hf_start_step", 0)))
+    ramp = max(0, int(getattr(cfg, "hf_ramp_steps", 0)))
+    if int(step) < start:
+        return 0.0
+    if ramp <= 0:
+        return 1.0
+    return min(1.0, float(int(step) - start + 1) / float(ramp))
 
 
 class CurriculumState(NamedTuple):
@@ -402,6 +415,34 @@ def compute_loss(
         excess_margin=getattr(cfg, "stft_excess_margin", 0.20),
         scale_weights=stft_weights,
     )
+    hf_mult = effective_hf_mult(step, cfg)
+    if hf_mult > 0.0 and (float(getattr(cfg, "lambda_hf_under", 0.0)) > 0.0 or float(getattr(cfg, "lambda_hf_sc", 0.0)) > 0.0):
+        l_hf_under, l_hf_sc = high_frequency_stft_terms(
+            y_spec,
+            b_spec,
+            stft_scales,
+            sample_rate=cfg.sample_rate,
+            min_hz=getattr(cfg, "hf_min_hz", 2500.0),
+            gate_db=getattr(cfg, "hf_gate_db", -18.0),
+            under_margin=getattr(cfg, "hf_under_margin", 0.05),
+            peak_mask=bool(getattr(cfg, "hf_peak_mask", False)),
+            scale_weights=stft_weights,
+        )
+    else:
+        l_hf_under = batch.new_zeros(())
+        l_hf_sc = batch.new_zeros(())
+    l_hf_complex = (
+        high_frequency_complex_stft_l1(
+            y_spec,
+            b_spec,
+            stft_scales,
+            sample_rate=cfg.sample_rate,
+            min_hz=getattr(cfg, "hf_min_hz", 2500.0),
+            scale_weights=stft_weights,
+        )
+        if float(getattr(cfg, "lambda_hf_complex", 0.0)) > 0.0
+        else batch.new_zeros(())
+    )
     cos = batch_mean_cosine(batch, y_hat)
     l_sisdr = batch_neg_log_si_sdr(batch, y_hat) if cfg.lambda_sisdr > 0 else batch.new_zeros(())
     l_preemph = batch_preemph_l1(batch, y_hat, cfg.preemph_coef) if cfg.lambda_preemph > 0 else batch.new_zeros(())
@@ -441,6 +482,9 @@ def compute_loss(
         ("sc", l_sc, float(ls_w * cfg.lambda_sc)),
         ("complex", l_cx, float(ls_w * cfg.lambda_complex_stft)),
         ("excess", l_excess, float(ls_w * getattr(cfg, "lambda_stft_excess", 0.0))),
+        ("hf_under", l_hf_under, float(ls_w * getattr(cfg, "lambda_hf_under", 0.0) * hf_mult)),
+        ("hf_sc", l_hf_sc, float(ls_w * getattr(cfg, "lambda_hf_sc", 0.0) * hf_mult)),
+        ("hf_cx", l_hf_complex, float(ls_w * getattr(cfg, "lambda_hf_complex", 0.0))),
         ("mel_l1", lm1, float(ls_w * cfg.lambda_mel_l1)),
         ("mel_l2", lm2, float(ls_w * cfg.lambda_mel_l2)),
         ("semantic", l_sem, float(cfg.lambda_semantic)),
@@ -480,6 +524,10 @@ def compute_loss(
         "l_sc": l_sc.detach(),
         "l_cx": l_cx.detach(),
         "l_excess": l_excess.detach(),
+        "l_hf_under": l_hf_under.detach(),
+        "l_hf_sc": l_hf_sc.detach(),
+        "l_hf_complex": l_hf_complex.detach(),
+        "hf_mult": hf_mult,
         "lm1": lm1.detach(),
         "lm2": lm2.detach(),
         "l_sisdr": l_sisdr.detach(),
@@ -611,6 +659,7 @@ def _append_training_log_csv(
         "samples_per_s",
         "eta_seconds",
         "loss_total",
+        "loss_ema",
         "l1",
         "sisdr_loss",
         "preemph",
@@ -620,6 +669,10 @@ def _append_training_log_csv(
         "sc",
         "cx",
         "excess",
+        "hf_under",
+        "hf_sc",
+        "hf_cx",
+        "hf_mult",
         "sgrad",
         "stft_cos",
         "mel",
@@ -629,6 +682,7 @@ def _append_training_log_csv(
         "ema_cos_pct",
         "grad_norm",
         "vq_loss",
+        "vq_ema",
         "marg_ent",
         "u0",
         "u1",
@@ -663,6 +717,7 @@ def _append_training_log_csv(
         "samples_per_s": f"{samples_per_s:.6f}",
         "eta_seconds": f"{eta_s:.3f}",
         "loss_total": f"{loss_value:.6f}",
+        "loss_ema": "" if metrics.get("loss_ema") is None else f"{float(metrics['loss_ema']):.6f}",
         "l1": f"{float(metrics['lt'].float().item()):.6f}",
         "sisdr_loss": f"{float(torch.as_tensor(metrics.get('l_sisdr', 0.0)).float().item()):.6f}",
         "preemph": f"{float(torch.as_tensor(metrics.get('l_preemph', 0.0)).float().item()):.6f}",
@@ -672,6 +727,10 @@ def _append_training_log_csv(
         "sc": f"{float(metrics['l_sc'].float().item()):.6f}",
         "cx": f"{float(metrics['l_cx'].float().item()):.6f}",
         "excess": f"{float(torch.as_tensor(metrics.get('l_excess', 0.0)).float().item()):.6f}",
+        "hf_under": f"{float(torch.as_tensor(metrics.get('l_hf_under', 0.0)).float().item()):.6f}",
+        "hf_sc": f"{float(torch.as_tensor(metrics.get('l_hf_sc', 0.0)).float().item()):.6f}",
+        "hf_cx": f"{float(torch.as_tensor(metrics.get('l_hf_complex', 0.0)).float().item()):.6f}",
+        "hf_mult": f"{float(metrics.get('hf_mult', 0.0)):.6f}",
         "sgrad": f"{float(metrics['lsg'].float().item()):.6f}",
         "stft_cos": f"{float(metrics['lsc'].float().item()):.6f}",
         "mel": f"{float(metrics['lm1'].float().item()):.6f}",
@@ -681,6 +740,7 @@ def _append_training_log_csv(
         "ema_cos_pct": "" if ema_cos_pct is None else f"{ema_cos_pct:.4f}",
         "grad_norm": f"{grad_norm:.6f}",
         "vq_loss": f"{float(metrics['vq_l'].float().item()):.6f}",
+        "vq_ema": "" if metrics.get("vq_ema") is None else f"{float(metrics['vq_ema']):.6f}",
         "marg_ent": f"{float(metrics['marg_ent'].float().item()):.6f}",
         "u0": usage.get("u0", "-"),
         "u1": usage.get("u1", "-"),
@@ -994,6 +1054,8 @@ def print_step_log(
     mel_v = float(metrics["lm1"].float().item())
     lin_v = float(metrics["l_lin"].float().item())
     vq_loss_v = float(metrics["vq_l"].float().item())
+    loss_ema_v = metrics.get("loss_ema")
+    vq_ema_v = metrics.get("vq_ema")
     marg_ent_v = float(metrics["marg_ent"].float().item())
     semantic_cos_pct = 100.0 * float(metrics.get("semantic_cos", 0.0))
     adv_g_v = float(torch.as_tensor(metrics.get("adv_g", 0.0)).float().item())
@@ -1002,6 +1064,7 @@ def print_step_log(
     max_ent = float(mean_log_codebook_for_entropy(cfg))
 
     total_color = _low_is_good_color(float(loss_value), green=4.0, yellow=12.0)
+    loss_ema_color = "gray" if loss_ema_v is None else _low_is_good_color(float(loss_ema_v), green=4.0, yellow=12.0)
     l1_color = _low_is_good_color(l1_v, green=0.04, yellow=0.10)
     sisdr_loss_v = float(torch.as_tensor(metrics.get("l_sisdr", 0.0)).float().item())
     sisdr_loss_color = _low_is_good_color(sisdr_loss_v, green=0.0, yellow=1.0)
@@ -1020,6 +1083,7 @@ def print_step_log(
     ema_color = "gray" if ema_cos_pct is None else _high_is_good_color(float(ema_cos_pct), green=50.0, yellow=15.0)
     grad_color = _low_is_good_color(float(grad_norm), green=50.0, yellow=200.0)
     vq_loss_color = _low_is_good_color(vq_loss_v, green=1.0, yellow=5.0)
+    vq_ema_color = "gray" if vq_ema_v is None else _low_is_good_color(float(vq_ema_v), green=1.0, yellow=5.0)
     marg_color = _high_is_good_color(marg_ent_v, green=0.90 * max_ent, yellow=0.60 * max_ent)
     speed_color = _high_is_good_color(updates_per_s, green=1.5, yellow=0.75)
     samples_color = _high_is_good_color(samples_per_s, green=400.0, yellow=150.0)
@@ -1065,7 +1129,7 @@ def print_step_log(
             _stat_cell("si", f"{sisdr_loss_v:.4f}", ansi, value_color=sisdr_loss_color, value_width=10, total_width=cell_width),
             _stat_cell("pre", f"{preemph_v:.4f}", ansi, value_color=preemph_color, value_width=10, total_width=cell_width),
             _stat_cell("sem", f"{sem_v:.4f}", ansi, value_color=sem_color, value_width=10, total_width=cell_width),
-            _blank_cell(cell_width),
+            _stat_cell("ema", "-" if loss_ema_v is None else f"{float(loss_ema_v):.5f}", ansi, value_color=loss_ema_color, value_width=10, total_width=cell_width),
         ],
     )
     row(
@@ -1099,12 +1163,13 @@ def print_step_log(
         "yellow",
         [
             _stat_cell("loss", f"{vq_loss_v:.4g}", ansi, value_color=vq_loss_color, value_width=10, total_width=cell_width),
+            _stat_cell("ema", "-" if vq_ema_v is None else f"{float(vq_ema_v):.4g}", ansi, value_color=vq_ema_color, value_width=10, total_width=cell_width),
             _stat_cell("marg_ent", f"{marg_ent_v:.4f}", ansi, value_color=marg_color, value_width=10, total_width=cell_width),
             *[
                 _stat_cell(label, value, ansi, value_color=_vq_usage_color(value), value_width=14, total_width=cell_width, label_width=10)
                 for label, value in usage_cells
             ],
-            *[_blank_cell(cell_width) for _ in range(max(0, 6 - (2 + len(usage_cells))))],
+            *[_blank_cell(cell_width) for _ in range(max(0, 6 - (3 + len(usage_cells))))],
         ],
     )
     row(
@@ -1471,6 +1536,270 @@ def _codec_eval_score(eval_metrics: dict[str, float | None], idx_bps: float | No
     return score if math.isfinite(score) else None
 
 
+def _select_eval_audio_paths(paths: list[Path], cfg: Config) -> list[Path]:
+    n = max(1, int(getattr(cfg, "eval_clips", 1) or 1))
+    if len(paths) <= n:
+        return list(paths)
+    rng = random.Random(int(getattr(cfg, "eval_seed", 0) or 0))
+    idxs = sorted(rng.sample(range(len(paths)), n))
+    return [paths[i] for i in idxs]
+
+
+def _load_eval_audio_np(path: Path, cfg: Config) -> np.ndarray:
+    import soundfile as sf
+
+    wav, sr = sf.read(str(path), always_2d=True)
+    wav = wav[:, 0].astype(np.float32)
+    if wav.size < 1:
+        raise ValueError("empty audio")
+    if int(sr) != int(cfg.sample_rate):
+        n_out = max(1, int(round(wav.size * float(cfg.sample_rate) / float(sr))))
+        if wav.size == 1:
+            wav = np.repeat(wav, n_out).astype(np.float32)
+        else:
+            x_old = np.linspace(0.0, 1.0, num=wav.size, endpoint=False)
+            x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+            wav = np.interp(x_new, x_old, wav).astype(np.float32)
+    eval_seconds = float(getattr(cfg, "eval_seconds", 0.0) or 0.0)
+    if eval_seconds > 0:
+        need = max(1, int(round(eval_seconds * float(cfg.sample_rate))))
+        wav = wav[:need]
+    peak = float(np.max(np.abs(wav))) + 1e-5
+    return (wav / peak).astype(np.float32, copy=False)
+
+
+@torch.no_grad()
+def _infer_eval_waveform_np(
+    model: CUDACodec,
+    cfg: Config,
+    wav: np.ndarray,
+    device: torch.device,
+    step: int,
+) -> tuple[np.ndarray, list[list[int]] | None]:
+    seg = max(1, int(cfg.segment))
+    stride = max(1, int(encoder_time_stride(cfg)))
+    outs: list[np.ndarray] = []
+    code_rows: list[list[int]] | None = None if cfg.ae_only else [[] for _ in range(int(cfg.n_codebooks))]
+    for start in range(0, int(wav.size), seg):
+        chunk = wav[start : start + seg]
+        valid = int(chunk.size)
+        if valid < seg:
+            chunk = np.pad(chunk, (0, seg - valid))
+        x = torch.from_numpy(chunk.reshape(1, seg, 1).astype(np.float32, copy=False)).to(device)
+        with _amp_context(cfg, device):
+            y, _, _, _, idx_list = forward_full_for_curriculum_step(model, cfg, x, step, deploy=True)
+        y_np = y[0, :, 0].detach().float().cpu().numpy().astype(np.float32, copy=False)
+        outs.append(y_np[:valid])
+        if idx_list is not None and code_rows is not None:
+            valid_frames = max(1, int(math.ceil(float(valid) / float(stride))))
+            for si, ix in enumerate(idx_list):
+                if si >= len(code_rows):
+                    code_rows.append([])
+                row = ix[0].detach().cpu().reshape(-1).tolist()
+                code_rows[si].extend(int(v) for v in row[:valid_frames])
+    if not outs:
+        return np.zeros((0,), dtype=np.float32), code_rows
+    return np.concatenate(outs, axis=0).astype(np.float32, copy=False), code_rows
+
+
+def _finite_mean(vals) -> float | None:
+    xs: list[float] = []
+    for v in vals:
+        if v is None:
+            continue
+        fv = float(v)
+        if math.isfinite(fv):
+            xs.append(fv)
+    if not xs:
+        return None
+    return sum(xs) / float(len(xs))
+
+
+def _fmt_eval_metric(v: float | int | None, digits: int = 3) -> str:
+    if v is None:
+        return "na"
+    fv = float(v)
+    if not math.isfinite(fv):
+        return "na"
+    return f"{fv:.{digits}f}"
+
+
+def _rvq_entropy_summary(cfg: Config, code_rows: list[list[int]] | None) -> tuple[float | None, float | None]:
+    if not code_rows:
+        return None, None
+    sizes = effective_codebook_sizes(cfg)
+    h_stages: list[float] = []
+    for si, row in enumerate(code_rows):
+        if not row:
+            continue
+        kk = sizes[si] if si < len(sizes) else sizes[-1]
+        h_stages.append(entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(row, kk))
+    if not h_stages:
+        return None, None
+    h_mean = sum(h_stages) / float(len(h_stages))
+    fps = float(cfg.sample_rate) / float(encoder_time_stride(cfg))
+    return h_mean, h_mean * fps * float(len(h_stages))
+
+
+@torch.no_grad()
+def _holdout_eval_summary(
+    model: CUDACodec,
+    cfg: Config,
+    eval_paths: list[Path],
+    device: torch.device,
+    step: int,
+) -> dict[str, float | int | None]:
+    rows: list[dict[str, float | None]] = []
+    was_training = model.training
+    model.eval()
+    try:
+        for p in eval_paths:
+            try:
+                orig = _load_eval_audio_np(p, cfg)
+                recon, code_rows = _infer_eval_waveform_np(model, cfg, orig, device, step)
+                n = min(int(orig.size), int(recon.size))
+                if n < 256:
+                    raise ValueError("too short after load/infer")
+                m = eval_metrics_mod.quality_metrics_16k(orig[:n], recon[:n])
+                h_mean, idx_bps = _rvq_entropy_summary(cfg, code_rows)
+                m["rvq_h_mean_bits_sym"] = h_mean
+                m["empirical_index_bps"] = idx_bps
+                rows.append(m)
+            except Exception as e:
+                _emit(f"  [eval-warn] {p}: {type(e).__name__}: {e}", flush=True)
+    finally:
+        if was_training:
+            model.train()
+    keys = (
+        "si_sdr_db",
+        "pesq_wb",
+        "stoi",
+        "lsd_db",
+        "cos",
+        "rvq_h_mean_bits_sym",
+        "empirical_index_bps",
+    )
+    out: dict[str, float | int | None] = {"n": len(rows)}
+    for k in keys:
+        out[k] = _finite_mean(row.get(k) for row in rows)
+    return out
+
+
+def _append_eval_tsv(path: str, step: int, scope: str, summary: dict[str, float | int | None]) -> None:
+    if not path:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    need_hdr = not p.is_file()
+    cols = (
+        "step",
+        "scope",
+        "n",
+        "sisdr_db",
+        "pesq_wb",
+        "stoi",
+        "lsd_db",
+        "cos",
+        "rvq_h_mean_bits_sym",
+        "empirical_index_bps",
+    )
+    with p.open("a", encoding="utf-8") as f:
+        if need_hdr:
+            f.write("\t".join(cols) + "\n")
+        f.write(
+            "\t".join(
+                [
+                    str(int(step)),
+                    scope,
+                    str(int(summary.get("n") or 0)),
+                    _fmt_eval_metric(summary.get("si_sdr_db")),
+                    _fmt_eval_metric(summary.get("pesq_wb")),
+                    _fmt_eval_metric(summary.get("stoi")),
+                    _fmt_eval_metric(summary.get("lsd_db")),
+                    _fmt_eval_metric(summary.get("cos")),
+                    _fmt_eval_metric(summary.get("rvq_h_mean_bits_sym")),
+                    _fmt_eval_metric(summary.get("empirical_index_bps"), digits=1),
+                ]
+            )
+            + "\n"
+        )
+
+
+def _format_eval_summary(prefix: str, summary: dict[str, float | int | None]) -> str:
+    return (
+        f"n={int(summary.get('n') or 0)}  "
+        f"SI-SDR={_fmt_eval_metric(summary.get('si_sdr_db'), 2)} dB  "
+        f"PESQ_wb={_fmt_eval_metric(summary.get('pesq_wb'))}  "
+        f"STOI={_fmt_eval_metric(summary.get('stoi'))}  "
+        f"LSD={_fmt_eval_metric(summary.get('lsd_db'))} dB  "
+        f"cos={_fmt_eval_metric(summary.get('cos'))}  "
+        f"H={_fmt_eval_metric(summary.get('rvq_h_mean_bits_sym'))} b/sym  "
+        f"idx_bps={_fmt_eval_metric(summary.get('empirical_index_bps'), 0)}"
+    )
+
+
+_EVAL_METRIC_ALIASES = {
+    "sisdr": "si_sdr_db",
+    "sisdr_db": "si_sdr_db",
+    "si_sdr": "si_sdr_db",
+    "si_sdr_db": "si_sdr_db",
+    "pesq": "pesq_wb",
+    "pesq_wb": "pesq_wb",
+    "stoi": "stoi",
+    "lsd": "lsd_db",
+    "lsd_db": "lsd_db",
+    "cos": "cos",
+    "rvq_h": "rvq_h_mean_bits_sym",
+    "rvq_h_mean_bits_sym": "rvq_h_mean_bits_sym",
+    "idx_bps": "empirical_index_bps",
+    "empirical_index_bps": "empirical_index_bps",
+}
+
+
+def _canonical_eval_metric_name(name: str) -> str:
+    key = (name or "si_sdr_db").strip().lower().replace("-", "_")
+    return _EVAL_METRIC_ALIASES.get(key, key)
+
+
+def _eval_metric_higher_is_better(name: str) -> bool:
+    return _canonical_eval_metric_name(name) not in {"lsd_db", "empirical_index_bps"}
+
+
+def _is_better_eval_value(new: float, old: float | None, metric: str) -> bool:
+    if not math.isfinite(new):
+        return False
+    if old is None or not math.isfinite(old):
+        return True
+    return new > old if _eval_metric_higher_is_better(metric) else new < old
+
+
+def _write_best_holdout_marker(
+    cfg: Config,
+    *,
+    step: int,
+    metric: str,
+    value: float,
+    previous: float | None,
+    summary: dict[str, float | int | None],
+    best_path: Path,
+) -> None:
+    ck_dir = Path(cfg.checkpoint_dir)
+    ck_dir.mkdir(parents=True, exist_ok=True)
+    marker = ck_dir / "best_holdout.json"
+    payload = {
+        "step": int(step),
+        "metric": _canonical_eval_metric_name(metric),
+        "value": float(value),
+        "previous_value": None if previous is None else float(previous),
+        "higher_is_better": _eval_metric_higher_is_better(metric),
+        "best_checkpoint": str(best_path),
+        "numbered_checkpoint": str(ck_dir / f"codec_step{int(step)}.pt"),
+        "summary": {k: (None if v is None else float(v)) for k, v in summary.items() if k != "n"},
+        "n": int(summary.get("n") or 0),
+    }
+    marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 @torch.no_grad()
 def run_quality_eval(
     model: CUDACodec,
@@ -1667,10 +1996,14 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--ae-only", action="store_true", default=c.ae_only)
     p.add_argument("--enc-channels", type=str, default=",".join(str(x) for x in c.enc_channels))
     p.add_argument("--stride1-blocks-per-scale", type=int, default=c.stride1_blocks_per_scale)
+    p.add_argument("--decoder-refine-blocks-per-scale", type=int, default=c.decoder_refine_blocks_per_scale)
     p.add_argument("--latent-dim", type=int, default=c.latent_dim)
     _add_bool(p, "--pre-vq-layernorm", c.pre_vq_layernorm)
     p.add_argument("--latent-temporal-depth", type=int, default=c.latent_temporal_depth)
     p.add_argument("--latent-temporal-post-depth", type=int, default=c.latent_temporal_post_depth)
+    p.add_argument("--self-attention-depth", type=int, default=c.self_attention_depth, help="SelfAttention1D blocks on latents before RVQ")
+    p.add_argument("--self-attention-post-depth", type=int, default=c.self_attention_post_depth, help="SelfAttention1D blocks on quantized latents before decoder")
+    p.add_argument("--self-attention-heads", type=int, default=c.self_attention_heads)
     p.add_argument("--n-codebooks", type=int, default=c.n_codebooks)
     p.add_argument("--codebook-size", type=int, default=c.codebook_size)
     p.add_argument("--codebook-sizes", type=str, default=None)
@@ -1694,6 +2027,15 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--lambda-mag-l1", type=float, default=c.lambda_mag_l1)
     p.add_argument("--lambda-sc", type=float, default=c.lambda_sc)
     p.add_argument("--lambda-complex-stft", type=float, default=c.lambda_complex_stft)
+    p.add_argument("--lambda-hf-under", type=float, default=c.lambda_hf_under)
+    p.add_argument("--lambda-hf-sc", type=float, default=c.lambda_hf_sc)
+    p.add_argument("--lambda-hf-complex", type=float, default=c.lambda_hf_complex)
+    p.add_argument("--hf-min-hz", type=float, default=c.hf_min_hz)
+    p.add_argument("--hf-gate-db", type=float, default=c.hf_gate_db)
+    p.add_argument("--hf-under-margin", type=float, default=c.hf_under_margin)
+    _add_bool(p, "--hf-peak-mask", c.hf_peak_mask)
+    p.add_argument("--hf-start-step", type=int, default=c.hf_start_step)
+    p.add_argument("--hf-ramp-steps", type=int, default=c.hf_ramp_steps)
     p.add_argument("--mel-n-fft", type=int, default=c.mel_n_fft)
     p.add_argument("--mel-hop", type=int, default=c.mel_hop)
     p.add_argument("--n-mels", type=int, default=c.n_mels)
@@ -1716,6 +2058,10 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--vq-reset-log-every", type=int, default=c.vq_reset_log_every)
     _add_bool(p, "--vq-cosine", c.vq_cosine)
     p.add_argument("--vq-beta", type=float, default=c.vq_commitment)
+    p.add_argument("--vq-loss", choices=["mse", "huber"], default=c.vq_loss)
+    p.add_argument("--vq-huber-delta", type=float, default=c.vq_huber_delta)
+    _add_bool(p, "--vq-loss-normalize", c.vq_loss_normalize)
+    p.add_argument("--vq-loss-norm-eps", type=float, default=c.vq_loss_norm_eps)
     p.add_argument("--lambda-cos", type=float, default=c.lambda_cos)
     p.add_argument("--cos-hinge", type=float, default=c.cos_hinge)
     p.add_argument("--cos-target", type=float, default=c.cos_target)
@@ -1747,9 +2093,14 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--curriculum-entropy-start", type=float, default=c.curriculum_entropy_start)
     p.add_argument("--curriculum-adv-start", type=float, default=c.curriculum_adv_start)
     _add_bool(p, "--curriculum-quantize-blend", c.curriculum_quantize_blend, "Blend continuous AE into quantized path during phase B")
-    p.add_argument("--activation", choices=["gelu", "snake", "snake_beta"], default=c.activation)
+    p.add_argument(
+        "--activation",
+        choices=["gelu", "snake", "snake_beta", "harmonic_beta", "periodic_gelu"],
+        default=c.activation,
+    )
     p.add_argument("--rvq-code-dim", type=int, default=c.rvq_code_dim)
     p.add_argument("--vq-ema-decay", type=float, default=c.vq_ema_decay)
+    p.add_argument("--vq-ema-every", type=int, default=c.vq_ema_every)
     p.add_argument("--decoder-upsample", choices=["transpose", "repeat_conv"], default=c.decoder_upsample)
     p.add_argument("--causal", action="store_true", default=c.causal)
     _add_bool(p, "--bf16", c.use_bf16)
@@ -1757,9 +2108,16 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--torch-compile", action="store_true", help="Compile model with torch.compile when available")
     p.add_argument("--full-checkpoint", action=argparse.BooleanOptionalAction, default=c.full_checkpoint)
     p.add_argument("--eval-every", type=int, default=c.eval_every)
-    p.add_argument("--eval-clips", type=int, default=c.eval_clips)
+    p.add_argument("--eval-clips", "--eval-samples", dest="eval_clips", type=int, default=c.eval_clips)
     p.add_argument("--eval-seconds", type=float, default=c.eval_seconds)
     p.add_argument("--eval-seed", type=int, default=c.eval_seed, help="Stable validation clip seed; eval rows are comparable across steps")
+    p.add_argument("--eval-dir", type=str, default=None)
+    p.add_argument(
+        "--best-holdout-metric",
+        type=str,
+        default=c.best_holdout_metric,
+        help="Metric used to update checkpoints/best_holdout.json (sisdr_db, pesq_wb, stoi, lsd_db, cos)",
+    )
     p.add_argument("--log-mlx-tsv", type=str, default=c.log_mlx_tsv)
     p.add_argument("--results-tsv", type=str, default=c.results_tsv_path)
     p.add_argument("--adaptive-mode", choices=["none", "bwe_stub", "fps_stub"], default=c.adaptive_mode)
@@ -1770,6 +2128,7 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--logs-per-epoch", type=int, default=5, help="How many progress logs to print per epoch")
     p.add_argument("--log-every", type=int, default=None, help="Deprecated override: exact optimizer-step logging interval")
     p.add_argument("--log-cos-ema-beta", type=float, default=c.log_cos_ema_beta)
+    p.add_argument("--log-loss-ema-beta", type=float, default=c.log_loss_ema_beta)
     p.add_argument("--viz-per-epoch", type=int, default=1, help="Run reconstruction inference + PNG/WAV export N times per epoch")
     p.add_argument("--spectrogram-every", type=int, default=None, help="Deprecated override: exact update interval for PNG/WAV export; 0 disables")
     p.add_argument("--spectrogram-dir", type=str, default=c.spectrogram_dir)
@@ -1814,6 +2173,12 @@ def config_from_args(args) -> Config:
         raise SystemExit(f"--semantic-layers: {e}")
     if codebook_sizes is not None and len(codebook_sizes) != args.n_codebooks:
         raise SystemExit(f"--codebook-sizes: expected {args.n_codebooks} values, got {len(codebook_sizes)}")
+    if args.self_attention_depth < 0 or args.self_attention_post_depth < 0:
+        raise SystemExit("--self-attention-depth and --self-attention-post-depth must be >= 0")
+    if args.self_attention_heads < 1:
+        raise SystemExit("--self-attention-heads must be >= 1")
+    if (args.self_attention_depth > 0 or args.self_attention_post_depth > 0) and args.latent_dim % args.self_attention_heads != 0:
+        raise SystemExit("--latent-dim must be divisible by --self-attention-heads when SelfAttention1D is enabled")
     try:
         disc_periods = parse_positive_int_list_arg(args.disc_periods)
     except ValueError as e:
@@ -1822,8 +2187,10 @@ def config_from_args(args) -> Config:
     stft_weights = parse_stft_scale_weights_arg(args.stft_scale_weights) if args.stft_scale_weights else None
     if stft_weights is not None and len(stft_weights) != len(stft_scales):
         raise SystemExit("--stft-scale-weights must have one value per STFT scale")
-    if args.dataset is None:
-        raise SystemExit(f"--dataset is required ({', '.join(DATASET_CHOICES)})")
+    if args.data_dir is None and args.dataset is None:
+        raise SystemExit(f"--dataset is required ({', '.join(DATASET_CHOICES)}) unless --data-dir is provided")
+    if args.decoder_refine_blocks_per_scale < 0:
+        raise SystemExit("--decoder-refine-blocks-per-scale must be >= 0")
     if not (0.0 < args.lr_plateau_factor < 1.0):
         raise SystemExit("--lr-plateau-factor must be in (0, 1)")
     if args.lr_plateau_patience < 1:
@@ -1834,9 +2201,14 @@ def config_from_args(args) -> Config:
         raise SystemExit("--lr-plateau-ema must be in [0, 1)")
     if args.lr_plateau_cooldown < 0:
         raise SystemExit("--lr-plateau-cooldown must be >= 0")
-    data_dir = resolve_dataset_dir(args.dataset)
+    if args.data_dir is not None:
+        data_dir = Path(args.data_dir).expanduser().resolve()
+        dataset = args.dataset or data_dir.name or "custom"
+    else:
+        data_dir = resolve_dataset_dir(args.dataset)
+        dataset = args.dataset
     return Config(
-        dataset=args.dataset,
+        dataset=dataset,
         steps=int(args.steps) if args.steps is not None else 0,
         batch=args.batch,
         load_audio_threads=args.load_audio_threads,
@@ -1858,10 +2230,14 @@ def config_from_args(args) -> Config:
         ae_only=args.ae_only,
         enc_channels=enc_ch,
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
+        decoder_refine_blocks_per_scale=args.decoder_refine_blocks_per_scale,
         latent_dim=args.latent_dim,
         pre_vq_layernorm=args.pre_vq_layernorm,
         latent_temporal_depth=args.latent_temporal_depth,
         latent_temporal_post_depth=args.latent_temporal_post_depth,
+        self_attention_depth=args.self_attention_depth,
+        self_attention_post_depth=args.self_attention_post_depth,
+        self_attention_heads=args.self_attention_heads,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
         codebook_sizes=codebook_sizes,
@@ -1936,8 +2312,18 @@ def config_from_args(args) -> Config:
         curriculum_quantize_blend=bool(args.curriculum_quantize_blend),
         lambda_sc=args.lambda_sc,
         lambda_complex_stft=args.lambda_complex_stft,
+        lambda_hf_under=args.lambda_hf_under,
+        lambda_hf_sc=args.lambda_hf_sc,
+        lambda_hf_complex=args.lambda_hf_complex,
+        hf_min_hz=args.hf_min_hz,
+        hf_gate_db=args.hf_gate_db,
+        hf_under_margin=args.hf_under_margin,
+        hf_peak_mask=bool(args.hf_peak_mask),
+        hf_start_step=args.hf_start_step,
+        hf_ramp_steps=args.hf_ramp_steps,
         log_every=int(args.log_every) if args.log_every is not None else Config().log_every,
         log_cos_ema_beta=args.log_cos_ema_beta,
+        log_loss_ema_beta=args.log_loss_ema_beta,
         spectrogram_every=int(args.spectrogram_every) if args.spectrogram_every is not None else Config().spectrogram_every,
         spectrogram_dir=args.spectrogram_dir,
         save_audio=args.save_audio,
@@ -1945,11 +2331,16 @@ def config_from_args(args) -> Config:
         checkpoint_every=int(args.checkpoint_every) if args.checkpoint_every is not None else 0,
         checkpoint_dir=args.checkpoint_dir,
         data_dir=data_dir,
-        use_librispeech=bool(args.dataset in {"train-clean-100", "train-clean-360"}),
+        use_librispeech=bool(dataset in {"train-clean-100", "train-clean-360"}),
         lambda_mag_l1=args.lambda_mag_l1,
         activation=args.activation,
         rvq_code_dim=args.rvq_code_dim,
         vq_ema_decay=args.vq_ema_decay,
+        vq_ema_every=args.vq_ema_every,
+        vq_loss=args.vq_loss,
+        vq_huber_delta=args.vq_huber_delta,
+        vq_loss_normalize=bool(args.vq_loss_normalize),
+        vq_loss_norm_eps=args.vq_loss_norm_eps,
         decoder_upsample=args.decoder_upsample,
         causal=bool(args.causal),
         use_bf16=bool(args.bf16),
@@ -1959,6 +2350,8 @@ def config_from_args(args) -> Config:
         eval_clips=args.eval_clips,
         eval_seconds=args.eval_seconds,
         eval_seed=args.eval_seed,
+        eval_dir=Path(args.eval_dir) if args.eval_dir else None,
+        best_holdout_metric=_canonical_eval_metric_name(args.best_holdout_metric),
         log_mlx_tsv=args.log_mlx_tsv,
         results_tsv_path=args.results_tsv,
         adaptive_mode=args.adaptive_mode,
@@ -1994,12 +2387,8 @@ def main(argv: list[str] | None = None) -> None:
         except TypeError as e:
             raise SystemExit(f"--continue incompatible checkpoint config: {e}")
     else:
-        if args.data_dir is not None:
-            raise SystemExit(f"use --dataset {'|'.join(DATASET_CHOICES)} instead of --data-dir")
         if args.legacy_librispeech or args.legacy_no_librispeech:
             raise SystemExit(f"use --dataset {'|'.join(DATASET_CHOICES)} instead of legacy --librispeech/--no-librispeech")
-        if args.dataset is None:
-            raise SystemExit(f"--dataset is required ({', '.join(DATASET_CHOICES)})")
         cfg = config_from_args(args)
     if (args.steps is not None and args.steps < 0) or cfg.batch < 1 or cfg.grad_accum_steps < 1:
         raise SystemExit("--steps must be >=0 and --batch/--grad-accum-steps must be >=1")
@@ -2019,6 +2408,14 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--lambda-stft-excess must be >= 0")
     if args.stft_excess_margin < 0:
         raise SystemExit("--stft-excess-margin must be >= 0")
+    if args.lambda_hf_under < 0 or args.lambda_hf_sc < 0 or args.lambda_hf_complex < 0:
+        raise SystemExit("--lambda-hf-under/sc/complex must be >= 0")
+    if args.hf_min_hz < 0 or args.hf_min_hz >= 0.5 * Config().sample_rate:
+        raise SystemExit("--hf-min-hz must be in [0, Nyquist)")
+    if args.hf_under_margin < 0:
+        raise SystemExit("--hf-under-margin must be >= 0")
+    if args.hf_start_step < 0 or args.hf_ramp_steps < 0:
+        raise SystemExit("--hf-start-step and --hf-ramp-steps must be >= 0")
     if args.loss_balancer_eps <= 0:
         raise SystemExit("--loss-balancer-eps must be > 0")
     if args.loss_balancer_max_scale <= 0:
@@ -2061,8 +2458,22 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--eval-clips must be >= 1")
     if args.eval_seconds < 0:
         raise SystemExit("--eval-seconds must be >= 0")
+    if args.vq_ema_every < 1:
+        raise SystemExit("--vq-ema-every must be >= 1")
+    if args.vq_huber_delta <= 0:
+        raise SystemExit("--vq-huber-delta must be > 0")
+    if args.vq_loss_norm_eps <= 0:
+        raise SystemExit("--vq-loss-norm-eps must be > 0")
     if args.log_every is not None and args.log_every < 1:
         raise SystemExit("--log-every must be >= 1")
+    if args.log_loss_ema_beta < 0 or args.log_loss_ema_beta >= 1.0:
+        raise SystemExit("--log-loss-ema-beta must be in [0, 1)")
+    best_holdout_metric_arg = _canonical_eval_metric_name(args.best_holdout_metric)
+    if best_holdout_metric_arg not in _EVAL_METRIC_ALIASES.values():
+        raise SystemExit(
+            "--best-holdout-metric must be one of: "
+            + ", ".join(sorted(set(_EVAL_METRIC_ALIASES.values())))
+        )
     if args.viz_per_epoch < 0:
         raise SystemExit("--viz-per-epoch must be >= 0")
     if args.spectrogram_every is not None and args.spectrogram_every < 0:
@@ -2075,6 +2486,23 @@ def main(argv: list[str] | None = None) -> None:
         audio_paths = collect_audio_paths(cfg.data_dir)
         if not audio_paths:
             raise SystemExit(f"No audio files under {cfg.data_dir} for dataset {cfg.dataset or 'unknown'}")
+
+    eval_paths: list[Path] | None = None
+    if cfg.eval_dir is not None:
+        eval_root = Path(cfg.eval_dir).expanduser().resolve()
+        if not eval_root.is_dir():
+            raise SystemExit(f"Holdout eval dir missing: {eval_root}")
+        all_eval_paths = collect_audio_paths(eval_root)
+        if not all_eval_paths:
+            raise SystemExit(f"No audio files under holdout eval dir {eval_root}")
+        eval_paths = _select_eval_audio_paths(all_eval_paths, cfg)
+        seconds_s = "full files" if float(cfg.eval_seconds) <= 0 else f"{float(cfg.eval_seconds):g}s clips"
+        print_event(
+            ansi,
+            "eval",
+            f"holdout {len(eval_paths)}/{len(all_eval_paths)} files from {eval_root} ({seconds_s}, seed={cfg.eval_seed})",
+            color="cyan",
+        )
 
     if resume_blob is not None:
         total_steps = int(resume_blob.get("total_steps", cfg.steps))
@@ -2254,6 +2682,17 @@ def main(argv: list[str] | None = None) -> None:
             best_score = None if raw_score is None else float(raw_score)
         except Exception:
             best_score = None
+    best_holdout_metric = _canonical_eval_metric_name(cfg.best_holdout_metric)
+    best_holdout_value: float | None = None
+    best_holdout_meta_path = layout["checkpoints"] / "best_holdout.json"
+    if best_holdout_meta_path.is_file():
+        try:
+            best_holdout_blob = json.loads(best_holdout_meta_path.read_text(encoding="utf-8"))
+            if _canonical_eval_metric_name(str(best_holdout_blob.get("metric", best_holdout_metric))) == best_holdout_metric:
+                raw_holdout_value = best_holdout_blob.get("value")
+                best_holdout_value = None if raw_holdout_value is None else float(raw_holdout_value)
+        except Exception:
+            best_holdout_value = None
 
     def make_checkpoint_payload(step: int) -> dict:
         return {
@@ -2307,6 +2746,8 @@ def main(argv: list[str] | None = None) -> None:
     profiler = _ProfileStats(args.profile, device)
     if args.profile:
         print_event(ansi, "profile", "enabled; CUDA syncs timing, training will run slower while profiling", color="yellow")
+    ema_loss_v: float | None = None
+    ema_vq_v: float | None = None
     ema_cos_pct: float | None = None
     last_metrics = None
     last_batch = None
@@ -2388,7 +2829,11 @@ def main(argv: list[str] | None = None) -> None:
                 last_metrics["disc_fake"] = d_fake.detach()
         else:
             _set_requires_grad(discriminator, True)
-        if 0.0 < float(cfg.vq_ema_decay) < 1.0 and last_batch is not None:
+        if (
+            0.0 < float(cfg.vq_ema_decay) < 1.0
+            and last_batch is not None
+            and step % max(1, int(getattr(cfg, "vq_ema_every", 1))) == 0
+        ):
             update_vq_ema_codebooks(model, last_batch, cfg)
         if cfg.vq_reset_every > 0 and curr_after.reset_enabled and not cfg.ae_only and step > 0 and step % cfg.vq_reset_every == 0 and last_batch is not None:
             n_reset, per_st = vq_reset_dead_codes(model, last_batch, cfg)
@@ -2404,6 +2849,14 @@ def main(argv: list[str] | None = None) -> None:
             (step + 1) % cfg.log_every == 0 or epoch_boundary or step == cfg.steps - 1
         ):
             m = last_metrics
+            loss_beta = float(getattr(cfg, "log_loss_ema_beta", 0.0))
+            if loss_beta > 0.0:
+                mean_loss_v = float(loss_total / acm)
+                vq_now_v = float(m["vq_l"].detach().float().item())
+                ema_loss_v = mean_loss_v if ema_loss_v is None else loss_beta * ema_loss_v + (1.0 - loss_beta) * mean_loss_v
+                ema_vq_v = vq_now_v if ema_vq_v is None else loss_beta * ema_vq_v + (1.0 - loss_beta) * vq_now_v
+                m["loss_ema"] = ema_loss_v
+                m["vq_ema"] = ema_vq_v
             cos_pct = 100.0 * float(m["cos_m"].float().item())
             if cfg.log_cos_ema_beta > 0:
                 ema_cos_pct = cos_pct if ema_cos_pct is None else cfg.log_cos_ema_beta * ema_cos_pct + (1.0 - cfg.log_cos_ema_beta) * cos_pct
@@ -2452,49 +2905,77 @@ def main(argv: list[str] | None = None) -> None:
                 print_event(ansi, "profile", profiler.summary(), color="yellow")
 
         if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0 and last_batch is not None:
-            eval_m, h_vals, idx_bps = run_quality_eval(model, cfg, audio_paths, step, device, cb_sizes)
+            if eval_paths is not None:
+                summary = _holdout_eval_summary(model, cfg, eval_paths, device, step)
+                print_event(ansi, "eval-holdout", _format_eval_summary("eval-holdout", summary), color="green")
+                _append_eval_tsv(cfg.log_mlx_tsv, step, "holdout", summary)
+                eval_m = {
+                    "si_sdr_db": None if summary.get("si_sdr_db") is None else float(summary["si_sdr_db"]),
+                    "pesq_wb": None if summary.get("pesq_wb") is None else float(summary["pesq_wb"]),
+                    "stoi": None if summary.get("stoi") is None else float(summary["stoi"]),
+                    "lsd_db": None if summary.get("lsd_db") is None else float(summary["lsd_db"]),
+                    "l1": None,
+                    "cos": None if summary.get("cos") is None else float(summary["cos"]),
+                }
+                h_mean = summary.get("rvq_h_mean_bits_sym")
+                h_vals = [] if h_mean is None else [float(h_mean)]
+                idx_bps = None if summary.get("empirical_index_bps") is None else float(summary["empirical_index_bps"])
+                metric_v = summary.get(best_holdout_metric)
+                if metric_v is not None:
+                    mv = float(metric_v)
+                    if _is_better_eval_value(mv, best_holdout_value, best_holdout_metric):
+                        prev_v = best_holdout_value
+                        best_holdout_value = mv
+                        best_path = layout["checkpoints"] / "best.pt"
+                        torch.save(make_checkpoint_payload(step), best_path)
+                        _write_best_holdout_marker(
+                            cfg,
+                            step=step,
+                            metric=best_holdout_metric,
+                            value=mv,
+                            previous=prev_v,
+                            summary=summary,
+                            best_path=best_path,
+                        )
+                        prev_s = "none" if prev_v is None else _fmt_eval_metric(prev_v)
+                        print_event(
+                            ansi,
+                            "best-holdout",
+                            f"{best_holdout_metric}={_fmt_eval_metric(mv)} (prev={prev_s}) step={step} marker={best_holdout_meta_path}",
+                            color="green",
+                        )
+            else:
+                eval_m, h_vals, idx_bps = run_quality_eval(model, cfg, audio_paths, step, device, cb_sizes)
 
-            def fmt_opt(key: str, fmt: str = ".3f") -> str:
-                v = eval_m.get(key)
-                return "na" if v is None else format(float(v), fmt)
+                def fmt_opt(key: str, fmt: str = ".3f") -> str:
+                    v = eval_m.get(key)
+                    return "na" if v is None else format(float(v), fmt)
 
-            print_event(
-                ansi,
-                "eval",
-                (
-                    f"clips={cfg.eval_clips}  "
-                    f"SI-SDR={fmt_opt('si_sdr_db', '.2f')} dB  "
-                    f"PESQ={fmt_opt('pesq_wb')}  "
-                    f"STOI={fmt_opt('stoi')}  "
-                    f"LSD={fmt_opt('lsd_db', '.2f')} dB  "
-                    f"L1={fmt_opt('l1', '.4f')}  "
-                    f"cos={100.0 * float(eval_m.get('cos') or 0.0):.1f}%"
-                ),
-                color="green",
-            )
-            if cfg.log_mlx_tsv:
-                p = Path(cfg.log_mlx_tsv)
-                p.parent.mkdir(parents=True, exist_ok=True)
-                desired_hdr = "step\tphase\tsisdr_db\tpesq_wb\tstoi\tlsd_db\tl1\tcos\tidx_bps\n"
-                hdr = not p.is_file()
-                if not hdr:
-                    try:
-                        hdr = p.read_text(encoding="utf-8").splitlines()[0].strip() != desired_hdr.strip()
-                    except Exception:
-                        hdr = True
-                with p.open("a", encoding="utf-8") as f:
-                    if hdr:
-                        f.write(desired_hdr)
-                    vals = {
-                        "sisdr": fmt_opt("si_sdr_db", ".6f"),
-                        "pesq": fmt_opt("pesq_wb", ".6f"),
-                        "stoi": fmt_opt("stoi", ".6f"),
-                        "lsd": fmt_opt("lsd_db", ".6f"),
-                        "l1": fmt_opt("l1", ".6f"),
-                        "cos": fmt_opt("cos", ".6f"),
-                        "bps": "na" if idx_bps is None else f"{idx_bps:.6f}",
-                    }
-                    f.write(f"{step}\t{curriculum_state(step, cfg).phase}\t{vals['sisdr']}\t{vals['pesq']}\t{vals['stoi']}\t{vals['lsd']}\t{vals['l1']}\t{vals['cos']}\t{vals['bps']}\n")
+                print_event(
+                    ansi,
+                    "eval",
+                    (
+                        f"clips={cfg.eval_clips}  "
+                        f"SI-SDR={fmt_opt('si_sdr_db', '.2f')} dB  "
+                        f"PESQ={fmt_opt('pesq_wb')}  "
+                        f"STOI={fmt_opt('stoi')}  "
+                        f"LSD={fmt_opt('lsd_db', '.2f')} dB  "
+                        f"L1={fmt_opt('l1', '.4f')}  "
+                        f"cos={100.0 * float(eval_m.get('cos') or 0.0):.1f}%"
+                    ),
+                    color="green",
+                )
+                summary = {
+                    "n": int(cfg.eval_clips),
+                    "si_sdr_db": eval_m.get("si_sdr_db"),
+                    "pesq_wb": eval_m.get("pesq_wb"),
+                    "stoi": eval_m.get("stoi"),
+                    "lsd_db": eval_m.get("lsd_db"),
+                    "cos": eval_m.get("cos"),
+                    "rvq_h_mean_bits_sym": None if not h_vals else sum(h_vals) / len(h_vals),
+                    "empirical_index_bps": idx_bps,
+                }
+                _append_eval_tsv(cfg.log_mlx_tsv, step, "train_probe", summary)
             if h_vals:
                 h_mean = sum(h_vals) / len(h_vals)
                 bps_s = "na" if idx_bps is None else f"{idx_bps:.0f}"

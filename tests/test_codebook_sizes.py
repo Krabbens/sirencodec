@@ -139,3 +139,180 @@ def test_train_mlx_forward_variable_k():
     assert y.shape == x.shape
     assert idx is not None
     assert len(idx) == 2
+
+
+def test_mlx_custom_cosine_metric_matches_reference():
+    _load_train_mlx()
+    import mlx.core as mx
+    from sirencodec.mlx.kernels import batch_mean_cosine_metric
+    from sirencodec.mlx.train import batch_mean_cosine
+
+    x = mx.random.normal(shape=(3, 256, 1))
+    y = mx.random.normal(shape=(3, 256, 1))
+    ref = batch_mean_cosine(x, y)
+    got = batch_mean_cosine_metric(x, y)
+    mx.eval(ref, got)
+    assert abs(float(ref.item()) - float(got.item())) < 1e-5
+
+
+def test_mlx_spectral_subset_and_large_scale_cycling():
+    tm = _load_train_mlx()
+    import mlx.core as mx
+
+    pred = mx.reshape(mx.arange(8, dtype=mx.float32), (4, 2, 1))
+    tgt = -pred
+    p, q = tm._spectral_loss_batch(pred, tgt, step=0, max_items=2)
+    mx.eval(p, q)
+    assert np.array_equal(np.array(p[:, 0, 0]), np.array([0.0, 2.0], dtype=np.float32))
+    assert np.array_equal(np.array(q[:, 0, 0]), np.array([0.0, -2.0], dtype=np.float32))
+
+    p2, _ = tm._spectral_loss_batch(pred, tgt, step=1, max_items=2)
+    mx.eval(p2)
+    assert np.array_equal(np.array(p2[:, 0, 0]), np.array([4.0, 6.0], dtype=np.float32))
+
+    cfg = tm.Config(
+        stft_scales=((512, 128), (2048, 512), (4096, 1024)),
+        stft_scale_weights=(0.5, 2.0, 4.0),
+        stft_large_min_fft=4096,
+        stft_large_every=4,
+    )
+    scales0, weights0 = tm._active_stft_scales(cfg, 0)
+    assert scales0 == cfg.stft_scales
+    assert weights0 == cfg.stft_scale_weights
+    scales1, weights1 = tm._active_stft_scales(cfg, 1)
+    assert scales1 == ((512, 128), (2048, 512))
+    assert weights1 == (0.5, 2.0)
+
+
+def test_mlx_waveform_hf_losses_behave():
+    tm = _load_train_mlx()
+    import mlx.core as mx
+    from sirencodec.mlx.losses import high_frequency_stft_terms
+
+    x = mx.random.normal(shape=(2, 256, 1))
+    shifted = mx.concatenate([x[:, 3:, :], x[:, :3, :]], axis=1)
+    same_sisdr = tm.batch_neg_log_si_sdr(x, x)
+    shifted_sisdr = tm.batch_neg_log_si_sdr(x, shifted)
+    mx.eval(same_sisdr, shifted_sisdr)
+    assert float(same_sisdr.item()) < float(shifted_sisdr.item())
+
+    z = mx.zeros((1, 256, 1))
+    alt = mx.reshape((mx.arange(256, dtype=mx.float32) % 2) * 2.0 - 1.0, (1, 256, 1)) * 0.25
+    pre_zero = tm.batch_preemph_l1(z, z)
+    pre_alt = tm.batch_preemph_l1(z, alt)
+    hf_same, _ = high_frequency_stft_terms(
+        alt,
+        alt,
+        ((128, 32),),
+        sample_rate=16_000,
+        min_hz=2000.0,
+    )
+    hf_missing, _ = high_frequency_stft_terms(
+        z,
+        alt,
+        ((128, 32),),
+        sample_rate=16_000,
+        min_hz=2000.0,
+    )
+    mx.eval(pre_zero, pre_alt, hf_same, hf_missing)
+    assert float(pre_zero.item()) == pytest.approx(0.0)
+    assert float(pre_alt.item()) > 0.0
+    assert float(hf_missing.item()) > float(hf_same.item())
+
+
+def test_mlx_under1k_hf_config_forward_backward_is_finite():
+    tm = _load_train_mlx()
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    cfg = tm.Config(
+        batch=1,
+        segment=512,
+        enc_channels=(8, 12, 16, 16, 16, 16, 16, 16),
+        latent_dim=32,
+        n_codebooks=2,
+        codebook_sizes=(256, 128),
+        rvq_code_dim=0,
+        pre_vq_layernorm=True,
+        latent_temporal_depth=1,
+        latent_temporal_post_depth=0,
+        self_attention_depth=1,
+        self_attention_post_depth=1,
+        self_attention_heads=4,
+        decoder_refine_blocks_per_scale=1,
+        stft_scales=((128, 32),),
+        stft_scale_weights=(1.0,),
+        lambda_stft=0.1,
+        lambda_sc=0.1,
+        lambda_complex_stft=0.05,
+        lambda_hf_under=0.1,
+        lambda_hf_sc=0.1,
+        hf_min_hz=2000.0,
+        lambda_sisdr=0.1,
+        lambda_preemph=0.1,
+        lambda_ae_anchor_time=0.1,
+        lambda_ae_anchor_cos=0.05,
+        lambda_mel_l1=0.0,
+        lambda_vq=0.1,
+        lambda_marginal=0.0,
+        lambda_cos=0.1,
+    )
+    assert tm.nominal_rvq_kbps(cfg) * 1000.0 <= 1000.0
+    model = tm.MLXCodec(cfg)
+    x = mx.random.normal(shape=(1, 512, 1)) * 0.05
+    loss_fn = tm.make_train_fn(model, cfg, x, 0, None)
+    loss, grads = nn.value_and_grad(model, loss_fn)(model)
+    flat_grads = [g for _, g in tree_flatten(grads)]
+    mx.eval(loss, *flat_grads)
+    assert np.isfinite(float(loss.item()))
+    for g in flat_grads:
+        bad = mx.any(mx.logical_or(mx.isnan(g), mx.isinf(g)))
+        mx.eval(bad)
+        assert not bool(bad.item())
+
+
+def test_mlx_state_space_shape_and_backward_is_finite():
+    _load_train_mlx()
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from sirencodec.mlx.codec import StateSpace1D
+
+    layer = StateSpace1D(32, state_dim=4, expand=1, bidirectional=True)
+    x_short = mx.random.normal(shape=(2, 1, 32))
+    x_long = mx.random.normal(shape=(2, 500, 32))
+    y_short = layer(x_short)
+    y_long = layer(x_long)
+    mx.eval(y_short, y_long)
+    assert y_short.shape == x_short.shape
+    assert y_long.shape == x_long.shape
+
+    def loss_fn(m):
+        y = m(x_long)
+        return mx.mean(y * y)
+
+    loss, grads = nn.value_and_grad(layer, loss_fn)(layer)
+    flat_grads = [g for _, g in tree_flatten(grads)]
+    mx.eval(loss, *flat_grads)
+    assert np.isfinite(float(loss.item()))
+    for g in flat_grads:
+        bad = mx.any(mx.logical_or(mx.isnan(g), mx.isinf(g)))
+        mx.eval(bad)
+        assert not bool(bad.item())
+
+
+def test_mlx_state_space_rejects_invalid_attention_and_causal_combinations():
+    tm = _load_train_mlx()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        tm.MLXCodec(tm.Config(self_attention_depth=1, state_space_depth=1))
+    with pytest.raises(ValueError, match="causal"):
+        tm.MLXCodec(
+            tm.Config(
+                self_attention_depth=0,
+                self_attention_post_depth=0,
+                state_space_depth=1,
+                state_space_bidirectional=True,
+                causal=True,
+            )
+        )
