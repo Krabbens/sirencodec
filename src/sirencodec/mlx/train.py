@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import re
 import sys
 import time
@@ -58,7 +59,7 @@ except ImportError:
 
 
 # Split modules: config / data / losses / codec (see package layout).
-from .codec import MLXCodec, VectorQuantizerStage
+from .codec import MLXCodec, VectorQuantizerStage, _turbo_rotation
 from ..config import (
     DEFAULT_STFT_SCALES,
     FAST_STFT_SCALES,
@@ -69,6 +70,8 @@ from ..config import (
     mean_log_codebook_for_entropy,
     nominal_rvq_kbps,
     parse_codebook_sizes_arg,
+    parse_float_list_arg,
+    parse_positive_int_list_arg,
     parse_stft_scales_arg,
     parse_stft_scale_weights_arg,
 )
@@ -80,14 +83,22 @@ from .data import (
     synth_viz_clip,
 )
 from .losses import (
+    band_branch_l1_loss,
+    band_l1_loss,
+    harmonic_f0_voicing_loss,
+    high_frequency_complex_stft_l1,
+    high_frequency_stft_terms,
     mel_filterbank_mx,
     mel_log_bin_losses,
+    multi_stft_all_terms,
     multi_stft_complex_l1,
     multi_stft_loss,
     multi_stft_mag_l1_linear,
+    multi_stft_stationary_line_loss,
     multi_stft_spectral_convergence,
     multi_stft_spectral_terms,
 )
+from .kernels import batch_mean_cosine_metric
 
 
 # 5. Train step (closure over batch)
@@ -102,6 +113,25 @@ def effective_lambda_stft(step: int, cfg: Config) -> float:
     return cfg.lambda_stft * scale
 
 
+def spectral_loss_step_multiplier(step: int, cfg: Config) -> float:
+    """Sparse spectral schedule: active full-STFT steps are weighted by their cadence."""
+    every = max(1, int(getattr(cfg, "spectral_loss_every", 1)))
+    if every <= 1:
+        return 1.0
+    return float(every) if int(step) % every == 0 else 0.0
+
+
+def effective_hf_mult(step: int, cfg: Config) -> float:
+    """Delay/ramp high-frequency pressure independently from the broad STFT ramp."""
+    start = max(0, int(getattr(cfg, "hf_start_step", 0)))
+    ramp = max(0, int(getattr(cfg, "hf_ramp_steps", 0)))
+    if int(step) < start:
+        return 0.0
+    if ramp <= 0:
+        return 1.0
+    return min(1.0, float(int(step) - start) / float(ramp))
+
+
 def _eval_loss_and_grad_tree(loss: mx.array, grads) -> None:
     """Materialize backward: MLX keeps ``grads`` lazy until evaluated; ``opt.update`` needs real values."""
     flat = tree_flatten(grads)
@@ -110,6 +140,20 @@ def _eval_loss_and_grad_tree(loss: mx.array, grads) -> None:
         mx.eval(loss, *arrs)
     else:
         mx.eval(loss)
+
+
+def _eval_loss_grad_and_nonfinite(loss: mx.array, grads) -> tuple[float, bool]:
+    """Evaluate loss, gradient tree, and non-finite flag in one MLX sync."""
+    flat = tree_flatten(grads)
+    arrs = [a for _, a in flat if isinstance(a, mx.array)]
+    bad = mx.array(False)
+    for a in arrs:
+        bad = mx.logical_or(bad, mx.any(mx.logical_or(mx.isnan(a), mx.isinf(a))))
+    if arrs:
+        mx.eval(loss, bad, *arrs)
+    else:
+        mx.eval(loss, bad)
+    return float(loss.item()), bool(bad.item())
 
 
 def _eval_grad_tree(grads) -> None:
@@ -182,6 +226,350 @@ def batch_mean_cosine(orig: mx.array, recon: mx.array) -> mx.array:
     return mx.mean(cos)
 
 
+def batch_mean_cosine_for_metrics(orig: mx.array, recon: mx.array, cfg: Config) -> mx.array:
+    """Metric cosine; custom Metal is used only when cosine is not in the loss."""
+    if cfg.lambda_cos > 0 or cfg.cos_hinge > 0:
+        return batch_mean_cosine(orig, recon)
+    return batch_mean_cosine_metric(orig, recon)
+
+
+def batch_neg_log_si_sdr(orig: mx.array, recon: mx.array, eps: float = 1e-8) -> mx.array:
+    """Differentiable negative log SI-SDR ratio with a polarity gate."""
+    b = orig.shape[0]
+    o = orig.reshape(b, -1).astype(mx.float32)
+    r = recon.reshape(b, -1).astype(mx.float32)
+    o = o - mx.mean(o, axis=1, keepdims=True)
+    r = r - mx.mean(r, axis=1, keepdims=True)
+    dot = mx.sum(r * o, axis=1, keepdims=True)
+    target = dot * o / (mx.sum(o * o, axis=1, keepdims=True) + eps)
+    noise = r - target
+    ratio = (mx.sum(target * target, axis=1) + eps) / (mx.sum(noise * noise, axis=1) + eps)
+    dot_cos = mx.sum(o * r, axis=1)
+    no = mx.sqrt(mx.sum(o * o, axis=1) + eps)
+    nr = mx.sqrt(mx.sum(r * r, axis=1) + eps)
+    cos = dot_cos / (no * nr)
+    polarity_gate = mx.maximum(mx.sigmoid(8.0 * cos), eps)
+    return -mx.mean(mx.log(mx.maximum(ratio, eps)) + mx.log(polarity_gate))
+
+
+def batch_preemph_l1(orig: mx.array, recon: mx.array, coef: float = 0.97) -> mx.array:
+    """L1 after first-order pre-emphasis; cheap high-frequency waveform anchor."""
+    if orig.shape[1] < 2 or recon.shape[1] < 2:
+        return mx.array(0.0)
+    c = float(coef)
+    orig_hp = orig[:, 1:, :] - c * orig[:, :-1, :]
+    recon_hp = recon[:, 1:, :] - c * recon[:, :-1, :]
+    return mx.mean(mx.abs(recon_hp - orig_hp))
+
+
+def batch_multidelta_l1(orig: mx.array, recon: mx.array, lags: tuple[int, ...] = (1, 2, 4, 8)) -> mx.array:
+    """Mean L1 over multiple finite-difference lags; cheap time-domain HF anchor."""
+    t = int(orig.shape[1])
+    total = mx.array(0.0)
+    n = 0
+    for lag in lags:
+        lag_i = int(lag)
+        if lag_i < 1 or lag_i >= t:
+            continue
+        od = orig[:, lag_i:, :] - orig[:, :-lag_i, :]
+        rd = recon[:, lag_i:, :] - recon[:, :-lag_i, :]
+        total = total + mx.mean(mx.abs(rd - od))
+        n += 1
+    if n == 0:
+        return mx.array(0.0)
+    return total / float(n)
+
+
+def _select_eval_audio_paths(paths: list[Path], cfg: Config) -> list[Path]:
+    """Stable holdout subset; deterministic so eval rows compare checkpoint-to-checkpoint."""
+    n = max(1, int(getattr(cfg, "eval_clips", 1) or 1))
+    if len(paths) <= n:
+        return list(paths)
+    rng = random.Random(int(getattr(cfg, "eval_seed", 0) or 0))
+    idxs = sorted(rng.sample(range(len(paths)), n))
+    return [paths[i] for i in idxs]
+
+
+def _load_eval_audio_np(path: Path, cfg: Config):
+    """Load one full/trimmed normalized mono eval waveform as NumPy float32."""
+    import numpy as np
+    import soundfile as sf
+
+    wav, sr = sf.read(str(path), always_2d=True)
+    wav = wav[:, 0].astype(np.float32)
+    if wav.size < 1:
+        raise ValueError("empty audio")
+    if int(sr) != int(cfg.sample_rate):
+        n_out = max(1, int(round(wav.size * float(cfg.sample_rate) / float(sr))))
+        if wav.size == 1:
+            wav = np.repeat(wav, n_out).astype(np.float32)
+        else:
+            x_old = np.linspace(0.0, 1.0, num=wav.size, endpoint=False)
+            x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+            wav = np.interp(x_new, x_old, wav).astype(np.float32)
+    eval_seconds = float(getattr(cfg, "eval_seconds", 0.0) or 0.0)
+    if eval_seconds > 0:
+        need = max(1, int(round(eval_seconds * float(cfg.sample_rate))))
+        wav = wav[:need]
+    peak = float(np.max(np.abs(wav))) + 1e-5
+    return (wav / peak).astype(np.float32, copy=False)
+
+
+def _infer_eval_waveform_np(model: MLXCodec, cfg: Config, wav):
+    """Chunked codec inference for an eval waveform; returns recon and raw RVQ indices."""
+    import numpy as np
+
+    seg = max(1, int(cfg.segment))
+    stride = max(1, int(encoder_time_stride(cfg)))
+    outs = []
+    code_rows: list[list[int]] | None = None if cfg.ae_only else [[] for _ in range(int(cfg.n_codebooks))]
+    for start in range(0, int(wav.size), seg):
+        chunk = wav[start : start + seg]
+        valid = int(chunk.size)
+        if valid < seg:
+            chunk = np.pad(chunk, (0, seg - valid))
+        x = mx.array(chunk.reshape(1, seg, 1).astype(np.float32, copy=False))
+        y, _, _, _, idx_list = model.forward_full(x)
+        to_eval: list[mx.array] = [y]
+        if idx_list is not None:
+            to_eval.extend(idx_list)
+        mx.eval(*to_eval)
+        y_np = np.array(y[0, :, 0], dtype=np.float32)
+        outs.append(y_np[:valid])
+        if idx_list is not None and code_rows is not None:
+            valid_frames = max(1, int(math.ceil(float(valid) / float(stride))))
+            for si, ix in enumerate(idx_list):
+                if si >= len(code_rows):
+                    code_rows.append([])
+                row = np.array(ix).ravel()
+                code_rows[si].extend(int(v) for v in row[:valid_frames].tolist())
+    if not outs:
+        return np.zeros((0,), dtype=np.float32), code_rows
+    return np.concatenate(outs, axis=0).astype(np.float32, copy=False), code_rows
+
+
+def _finite_mean(vals) -> float | None:
+    xs: list[float] = []
+    for v in vals:
+        if v is None:
+            continue
+        fv = float(v)
+        if math.isfinite(fv):
+            xs.append(fv)
+    if not xs:
+        return None
+    return sum(xs) / float(len(xs))
+
+
+def _fmt_eval_metric(v: float | None, digits: int = 3) -> str:
+    if v is None:
+        return "na"
+    fv = float(v)
+    if not math.isfinite(fv):
+        return "na"
+    return f"{fv:.{digits}f}"
+
+
+def _rvq_entropy_summary(cfg: Config, code_rows: list[list[int]] | None) -> tuple[float | None, float | None]:
+    if not code_rows:
+        return None, None
+    sizes = effective_codebook_sizes(cfg)
+    h_stages: list[float] = []
+    for si, row in enumerate(code_rows):
+        if not row:
+            continue
+        kk = sizes[si] if si < len(sizes) else sizes[-1]
+        h_stages.append(entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(row, kk))
+    if not h_stages:
+        return None, None
+    h_mean = sum(h_stages) / float(len(h_stages))
+    fps = float(cfg.sample_rate) / float(encoder_time_stride(cfg))
+    return h_mean, h_mean * fps * float(len(h_stages))
+
+
+def _holdout_eval_summary(model: MLXCodec, cfg: Config, eval_paths: list[Path]) -> dict[str, float | int | None]:
+    rows: list[dict[str, float | None]] = []
+    for p in eval_paths:
+        try:
+            orig = _load_eval_audio_np(p, cfg)
+            recon, code_rows = _infer_eval_waveform_np(model, cfg, orig)
+            n = min(int(orig.size), int(recon.size))
+            if n < 256:
+                raise ValueError("too short after load/infer")
+            m = eval_metrics_mod.quality_metrics_16k(orig[:n], recon[:n])
+            h_mean, idx_bps = _rvq_entropy_summary(cfg, code_rows)
+            m["rvq_h_mean_bits_sym"] = h_mean
+            m["empirical_index_bps"] = idx_bps
+            rows.append(m)
+        except Exception as e:
+            print(f"  [eval-warn] {p}: {type(e).__name__}: {e}", flush=True)
+    keys = (
+        "si_sdr_db",
+        "pesq_wb",
+        "stoi",
+        "lsd_db",
+        "cos",
+        "rvq_h_mean_bits_sym",
+        "empirical_index_bps",
+    )
+    out: dict[str, float | int | None] = {"n": len(rows)}
+    for k in keys:
+        out[k] = _finite_mean(row.get(k) for row in rows)
+    return out
+
+
+def _append_eval_tsv(path: str, step: int, scope: str, summary: dict[str, float | int | None]) -> None:
+    if not path:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    need_hdr = not p.is_file()
+    cols = (
+        "step",
+        "scope",
+        "n",
+        "sisdr_db",
+        "pesq_wb",
+        "stoi",
+        "lsd_db",
+        "cos",
+        "rvq_h_mean_bits_sym",
+        "empirical_index_bps",
+    )
+    with p.open("a") as f:
+        if need_hdr:
+            f.write("\t".join(cols) + "\n")
+        f.write(
+            "\t".join(
+                [
+                    str(int(step)),
+                    scope,
+                    str(int(summary.get("n") or 0)),
+                    _fmt_eval_metric(summary.get("si_sdr_db")),
+                    _fmt_eval_metric(summary.get("pesq_wb")),
+                    _fmt_eval_metric(summary.get("stoi")),
+                    _fmt_eval_metric(summary.get("lsd_db")),
+                    _fmt_eval_metric(summary.get("cos")),
+                    _fmt_eval_metric(summary.get("rvq_h_mean_bits_sym")),
+                    _fmt_eval_metric(summary.get("empirical_index_bps"), digits=1),
+                ]
+            )
+            + "\n"
+        )
+
+
+def _format_eval_summary(prefix: str, summary: dict[str, float | int | None]) -> str:
+    return (
+        f"  [{prefix}] n={int(summary.get('n') or 0)}  "
+        f"SI-SDR={_fmt_eval_metric(summary.get('si_sdr_db'), 2)} dB  "
+        f"PESQ_wb={_fmt_eval_metric(summary.get('pesq_wb'))}  "
+        f"STOI={_fmt_eval_metric(summary.get('stoi'))}  "
+        f"LSD={_fmt_eval_metric(summary.get('lsd_db'))} dB  "
+        f"cos={_fmt_eval_metric(summary.get('cos'))}  "
+        f"H={_fmt_eval_metric(summary.get('rvq_h_mean_bits_sym'))} b/sym  "
+        f"idx_bps={_fmt_eval_metric(summary.get('empirical_index_bps'), 0)}"
+    )
+
+
+_EVAL_METRIC_ALIASES = {
+    "sisdr": "si_sdr_db",
+    "sisdr_db": "si_sdr_db",
+    "si_sdr": "si_sdr_db",
+    "si_sdr_db": "si_sdr_db",
+    "pesq": "pesq_wb",
+    "pesq_wb": "pesq_wb",
+    "stoi": "stoi",
+    "lsd": "lsd_db",
+    "lsd_db": "lsd_db",
+    "cos": "cos",
+    "rvq_h": "rvq_h_mean_bits_sym",
+    "rvq_h_mean_bits_sym": "rvq_h_mean_bits_sym",
+    "idx_bps": "empirical_index_bps",
+    "empirical_index_bps": "empirical_index_bps",
+}
+
+
+def _canonical_eval_metric_name(name: str) -> str:
+    key = (name or "si_sdr_db").strip().lower().replace("-", "_")
+    return _EVAL_METRIC_ALIASES.get(key, key)
+
+
+def _eval_metric_higher_is_better(name: str) -> bool:
+    return _canonical_eval_metric_name(name) not in {"lsd_db", "empirical_index_bps"}
+
+
+def _is_better_eval_value(new: float, old: float | None, metric: str) -> bool:
+    if not math.isfinite(new):
+        return False
+    if old is None or not math.isfinite(old):
+        return True
+    return new > old if _eval_metric_higher_is_better(metric) else new < old
+
+
+def _write_best_holdout_marker(
+    cfg: Config,
+    *,
+    step: int,
+    metric: str,
+    value: float,
+    previous: float | None,
+    summary: dict[str, float | int | None],
+) -> None:
+    ck_dir = Path(cfg.checkpoint_dir)
+    ck_dir.mkdir(parents=True, exist_ok=True)
+    marker = ck_dir / "best_holdout.json"
+    payload = {
+        "step": int(step),
+        "metric": _canonical_eval_metric_name(metric),
+        "value": float(value),
+        "previous_value": None if previous is None else float(previous),
+        "higher_is_better": _eval_metric_higher_is_better(metric),
+        "codec_checkpoint": str(ck_dir / f"codec_step{int(step)}.npz"),
+        "full_checkpoint": str(ck_dir / f"ckpt_step{int(step)}.safetensors"),
+        "summary": {k: (None if v is None else float(v)) for k, v in summary.items() if k != "n"},
+        "n": int(summary.get("n") or 0),
+    }
+    marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _spectral_loss_batch(
+    pred: mx.array,
+    tgt: mx.array,
+    *,
+    step: int,
+    max_items: int,
+) -> tuple[mx.array, mx.array]:
+    n = int(max_items)
+    b = int(pred.shape[0])
+    if n <= 0 or n >= b:
+        return pred, tgt
+    n = max(1, n)
+    start = (int(step) * n) % b
+    end = start + n
+    if end <= b:
+        return pred[start:end], tgt[start:end]
+    wrap = end - b
+    return mx.concatenate([pred[start:], pred[:wrap]], axis=0), mx.concatenate([tgt[start:], tgt[:wrap]], axis=0)
+
+
+def _active_stft_scales(
+    cfg: Config,
+    step: int,
+) -> tuple[tuple[tuple[int, int], ...], tuple[float, ...] | None]:
+    scales = tuple(cfg.stft_scales)
+    weights = tuple(cfg.stft_scale_weights) if cfg.stft_scale_weights is not None else None
+    every = int(getattr(cfg, "stft_large_every", 1))
+    min_fft = int(getattr(cfg, "stft_large_min_fft", 0))
+    if every <= 1 or min_fft <= 0 or int(step) % every == 0:
+        return scales, weights
+    keep = [i for i, (n_fft, _) in enumerate(scales) if int(n_fft) < min_fft]
+    if not keep:
+        return scales, weights
+    active_scales = tuple(scales[i] for i in keep)
+    active_weights = tuple(weights[i] for i in keep) if weights is not None else None
+    return active_scales, active_weights
+
+
 def make_train_fn(
     model: MLXCodec,
     cfg: Config,
@@ -201,68 +589,239 @@ def make_train_fn(
     forward_metrics: dict = {}
 
     def loss_fn(m: MLXCodec) -> mx.array:
-        y_hat, vq_l, ent_pos, marg_ent, idx = m.forward_full(batch)
-        lt = mx.mean(mx.abs(y_hat - batch))
-        if cfg.lambda_stft_grad > 0 or cfg.lambda_stft_cos > 0:
-            ls, lsg, lsc = multi_stft_spectral_terms(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                with_grad=cfg.lambda_stft_grad > 0,
-                with_cos_1m=cfg.lambda_stft_cos > 0,
-                grad_freq_weight=cfg.stft_grad_freq_weight,
-                grad_time_weight=cfg.stft_grad_time_weight,
-                hf_emphasis=cfg.stft_hf_emphasis,
-                scale_weights=cfg.stft_scale_weights,
-            )
+        want_ae_anchor = (
+            not cfg.ae_only
+            and (float(getattr(cfg, "lambda_ae_anchor_time", 0.0)) > 0.0 or float(getattr(cfg, "lambda_ae_anchor_cos", 0.0)) > 0.0)
+        )
+        want_band_branches = float(getattr(cfg, "lambda_band_branch_l1", 0.0)) > 0.0
+        want_harm_aux = bool(getattr(cfg, "decoder_harmonic_source", False)) and (
+            float(getattr(cfg, "lambda_harmonic_f0", 0.0)) > 0.0
+            or float(getattr(cfg, "lambda_harmonic_amp", 0.0)) > 0.0
+        )
+        if want_harm_aux and want_band_branches:
+            y_hat, vq_l, ent_pos, marg_ent, idx, y_bands, h_freq, h_amp = m.forward_full_with_bands_and_harmonic_aux(batch)
+            y_ae_anchor = None
+        elif want_harm_aux and want_ae_anchor:
+            y_hat, vq_l, ent_pos, marg_ent, idx, y_ae_anchor, h_freq, h_amp = m.forward_full_with_continuous_and_harmonic_aux(batch)
+            y_bands = None
+        elif want_harm_aux:
+            y_hat, vq_l, ent_pos, marg_ent, idx, h_freq, h_amp = m.forward_full_with_harmonic_aux(batch)
+            y_ae_anchor = None
+            y_bands = None
+        elif want_ae_anchor and want_band_branches:
+            y_hat, vq_l, ent_pos, marg_ent, idx, y_ae_anchor, y_bands = m.forward_full_with_continuous_and_bands(batch)
+            h_freq = None
+            h_amp = None
+        elif want_ae_anchor:
+            y_hat, vq_l, ent_pos, marg_ent, idx, y_ae_anchor = m.forward_full_with_continuous(batch)
+            y_bands = None
+            h_freq = None
+            h_amp = None
+        elif want_band_branches:
+            y_hat, vq_l, ent_pos, marg_ent, idx, y_bands = m.forward_full_with_bands(batch)
+            y_ae_anchor = None
+            h_freq = None
+            h_amp = None
         else:
-            if compiled_multi_stft is not None:
-                ls = compiled_multi_stft(y_hat, batch)
-            else:
-                ls = multi_stft_loss(
-                    y_hat,
-                    batch,
-                    cfg.stft_scales,
+            y_hat, vq_l, ent_pos, marg_ent, idx = m.forward_full(batch)
+            y_ae_anchor = None
+            y_bands = None
+            h_freq = None
+            h_amp = None
+        lt = mx.mean(mx.abs(y_hat - batch))
+        spec_mult = spectral_loss_step_multiplier(step, cfg)
+        spec_active = spec_mult > 0.0
+        stft_scales, stft_weights = _active_stft_scales(cfg, step)
+        if spec_active:
+            y_spec, b_spec = _spectral_loss_batch(y_hat, batch, step=step, max_items=cfg.spectral_batch_items)
+            if (
+                cfg.lambda_stft_grad > 0
+                or cfg.lambda_stft_cos > 0
+                or cfg.lambda_mag_l1 > 0
+                or cfg.lambda_sc > 0
+                or cfg.lambda_complex_stft > 0
+                or cfg.lambda_stft_excess > 0
+                or cfg.lambda_peak_contrast > 0
+                or cfg.lambda_peak_mag > 0
+                or cfg.lambda_freq_ac > 0
+                or cfg.lambda_hf_complex > 0
+            ):
+                ls, lsg, lsc, l_lin, l_sc, l_cx, l_excess, l_peak, l_peak_mag, l_freq_ac = multi_stft_all_terms(
+                    y_spec,
+                    b_spec,
+                    stft_scales,
+                    with_grad=cfg.lambda_stft_grad > 0,
+                    with_cos_1m=cfg.lambda_stft_cos > 0,
+                    with_linear=cfg.lambda_mag_l1 > 0,
+                    with_sc=cfg.lambda_sc > 0,
+                    with_complex=cfg.lambda_complex_stft > 0,
+                    with_excess=cfg.lambda_stft_excess > 0,
+                    with_peak_contrast=cfg.lambda_peak_contrast > 0,
+                    with_peak_mag=cfg.lambda_peak_mag > 0,
+                    with_freq_ac=cfg.lambda_freq_ac > 0,
+                    grad_freq_weight=cfg.stft_grad_freq_weight,
+                    grad_time_weight=cfg.stft_grad_time_weight,
                     hf_emphasis=cfg.stft_hf_emphasis,
-                    scale_weights=cfg.stft_scale_weights,
+                    excess_margin=cfg.stft_excess_margin,
+                    sample_rate=cfg.sample_rate,
+                    peak_min_hz=cfg.hf_min_hz,
+                    peak_gate_db=cfg.hf_gate_db,
+                    peak_radius=cfg.peak_contrast_radius,
+                    freq_ac_min_hz=cfg.freq_ac_min_hz,
+                    freq_ac_lags_hz=cfg.freq_ac_lags_hz,
+                    scale_weights=stft_weights,
                 )
+            else:
+                if compiled_multi_stft is not None:
+                    ls = compiled_multi_stft(y_spec, b_spec)
+                else:
+                    ls = multi_stft_loss(
+                        y_spec,
+                        b_spec,
+                        stft_scales,
+                        hf_emphasis=cfg.stft_hf_emphasis,
+                        scale_weights=stft_weights,
+                    )
+                lsg = mx.array(0.0)
+                lsc = mx.array(0.0)
+                l_lin = mx.array(0.0)
+                l_sc = mx.array(0.0)
+                l_cx = mx.array(0.0)
+                l_excess = mx.array(0.0)
+                l_peak = mx.array(0.0)
+                l_peak_mag = mx.array(0.0)
+                l_freq_ac = mx.array(0.0)
+        else:
+            y_spec = y_hat
+            b_spec = batch
+            ls = mx.array(0.0)
             lsg = mx.array(0.0)
             lsc = mx.array(0.0)
-        cos = batch_mean_cosine(batch, y_hat)
-        ls_w = effective_lambda_stft(step, cfg)
-        total = cfg.lambda_time * lt + ls_w * ls + cfg.lambda_vq * vq_l
-        l_lin = mx.array(0.0)
-        if cfg.lambda_mag_l1 > 0:
-            l_lin = multi_stft_mag_l1_linear(
+            l_lin = mx.array(0.0)
+            l_sc = mx.array(0.0)
+            l_cx = mx.array(0.0)
+            l_excess = mx.array(0.0)
+            l_peak = mx.array(0.0)
+            l_peak_mag = mx.array(0.0)
+            l_freq_ac = mx.array(0.0)
+        cos = batch_mean_cosine_for_metrics(batch, y_hat, cfg)
+        l_sisdr = batch_neg_log_si_sdr(batch, y_hat) if cfg.lambda_sisdr > 0 else mx.array(0.0)
+        l_preemph = batch_preemph_l1(batch, y_hat, cfg.preemph_coef) if cfg.lambda_preemph > 0 else mx.array(0.0)
+        l_multidelta = batch_multidelta_l1(batch, y_hat, cfg.multidelta_lags) if cfg.lambda_multidelta > 0 else mx.array(0.0)
+        l_band = (
+            band_l1_loss(
                 y_hat,
                 batch,
-                cfg.stft_scales,
-                hf_emphasis=cfg.stft_hf_emphasis,
-                scale_weights=cfg.stft_scale_weights,
+                sample_rate=cfg.sample_rate,
+                cutoffs_hz=cfg.band_split_cutoffs_hz,
+                taps=cfg.band_split_taps,
+                weights=cfg.band_l1_weights,
+                floor=cfg.band_l1_floor,
             )
+            if cfg.lambda_band_l1 > 0
+            else mx.array(0.0)
+        )
+        l_band_branch = (
+            band_branch_l1_loss(
+                y_bands,
+                batch,
+                sample_rate=cfg.sample_rate,
+                cutoffs_hz=cfg.band_split_cutoffs_hz,
+                taps=cfg.band_split_taps,
+                weights=cfg.band_branch_weights,
+                floor=cfg.band_l1_floor,
+            )
+            if cfg.lambda_band_branch_l1 > 0 and y_bands is not None
+            else mx.array(0.0)
+        )
+        l_hf_complex = (
+            high_frequency_complex_stft_l1(
+                y_spec,
+                b_spec,
+                stft_scales,
+                sample_rate=cfg.sample_rate,
+                min_hz=cfg.hf_min_hz,
+                scale_weights=stft_weights,
+            )
+            if spec_active and cfg.lambda_hf_complex > 0
+            else mx.array(0.0)
+        )
+        hf_mult = effective_hf_mult(step, cfg)
+        if spec_active and hf_mult > 0.0 and (cfg.lambda_hf_under > 0 or cfg.lambda_hf_sc > 0):
+            l_hf_under, l_hf_sc = high_frequency_stft_terms(
+                y_spec,
+                b_spec,
+                stft_scales,
+                sample_rate=cfg.sample_rate,
+                min_hz=cfg.hf_min_hz,
+                gate_db=cfg.hf_gate_db,
+                under_margin=cfg.hf_under_margin,
+                peak_mask=cfg.hf_peak_mask,
+                scale_weights=stft_weights,
+            )
+        else:
+            l_hf_under = mx.array(0.0)
+            l_hf_sc = mx.array(0.0)
+        l_harm_f0, l_harm_amp, harm_voice = (
+            harmonic_f0_voicing_loss(
+                h_freq,
+                h_amp,
+                batch,
+                sample_rate=cfg.sample_rate,
+                frame=cfg.harmonic_f0_frame,
+                hop=cfg.harmonic_f0_hop,
+                lags=cfg.harmonic_f0_lags,
+                voicing_threshold=cfg.harmonic_voicing_threshold,
+            )
+            if want_harm_aux
+            else (mx.array(0.0), mx.array(0.0), mx.array(0.0))
+        )
+        l_stationary = (
+            multi_stft_stationary_line_loss(
+                y_spec,
+                b_spec,
+                stft_scales,
+                sample_rate=cfg.sample_rate,
+                min_hz=cfg.stationary_line_min_hz,
+                radius=cfg.stationary_line_radius,
+                margin=cfg.stationary_line_margin,
+                scale_weights=stft_weights,
+            )
+            if spec_active and cfg.lambda_stationary_line > 0
+            else mx.array(0.0)
+        )
+        ls_w = effective_lambda_stft(step, cfg) * spec_mult
+        total = cfg.lambda_time * lt + ls_w * ls + cfg.lambda_vq * vq_l
+        if cfg.lambda_mag_l1 > 0:
             total = total + ls_w * cfg.lambda_mag_l1 * l_lin
         if cfg.lambda_stft_grad > 0:
             total = total + ls_w * cfg.lambda_stft_grad * lsg
         if cfg.lambda_stft_cos > 0:
             total = total + ls_w * cfg.lambda_stft_cos * lsc
-        l_sc = mx.array(0.0)
         if cfg.lambda_sc > 0:
-            l_sc = multi_stft_spectral_convergence(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                scale_weights=cfg.stft_scale_weights,
-            )
             total = total + ls_w * cfg.lambda_sc * l_sc
-        l_cx = mx.array(0.0)
         if cfg.lambda_complex_stft > 0:
-            l_cx = multi_stft_complex_l1(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                scale_weights=cfg.stft_scale_weights,
-            )
             total = total + ls_w * cfg.lambda_complex_stft * l_cx
+        if cfg.lambda_stft_excess > 0:
+            total = total + ls_w * cfg.lambda_stft_excess * l_excess
+        if cfg.lambda_peak_contrast > 0:
+            total = total + ls_w * cfg.lambda_peak_contrast * l_peak
+        if cfg.lambda_peak_mag > 0:
+            total = total + ls_w * cfg.lambda_peak_mag * l_peak_mag
+        if cfg.lambda_freq_ac > 0:
+            total = total + ls_w * cfg.lambda_freq_ac * l_freq_ac
+        if cfg.lambda_stationary_line > 0:
+            total = total + ls_w * cfg.lambda_stationary_line * l_stationary
+        if cfg.lambda_hf_under > 0:
+            total = total + ls_w * (cfg.lambda_hf_under * hf_mult) * l_hf_under
+        if cfg.lambda_hf_sc > 0:
+            total = total + ls_w * (cfg.lambda_hf_sc * hf_mult) * l_hf_sc
+        if cfg.lambda_hf_complex > 0:
+            total = total + ls_w * cfg.lambda_hf_complex * l_hf_complex
+        if cfg.lambda_harmonic_f0 > 0:
+            total = total + cfg.lambda_harmonic_f0 * l_harm_f0
+        if cfg.lambda_harmonic_amp > 0:
+            total = total + cfg.lambda_harmonic_amp * l_harm_amp
         # Diversity as non-negative penalty (same ∂/∂θ as −λ·H when H<log K): push H → log K
         log_k = mean_log_codebook_for_entropy(cfg)
         log_k_mx = mx.array(log_k, dtype=mx.float32)
@@ -277,12 +836,30 @@ def make_train_fn(
         if cfg.cos_hinge > 0:
             gap = mx.maximum(mx.array(0.0), mx.array(cfg.cos_target, dtype=mx.float32) - cos)
             total = total + cfg.cos_hinge * gap
+        if cfg.lambda_sisdr > 0:
+            total = total + cfg.lambda_sisdr * l_sisdr
+        if cfg.lambda_preemph > 0:
+            total = total + cfg.lambda_preemph * l_preemph
+        if cfg.lambda_multidelta > 0:
+            total = total + cfg.lambda_multidelta * l_multidelta
+        if cfg.lambda_band_l1 > 0:
+            total = total + cfg.lambda_band_l1 * l_band
+        if cfg.lambda_band_branch_l1 > 0:
+            total = total + cfg.lambda_band_branch_l1 * l_band_branch
+        ae_lt = mx.array(0.0)
+        ae_cos = mx.array(1.0)
+        ae_anchor = mx.array(0.0)
+        if y_ae_anchor is not None:
+            ae_lt = mx.mean(mx.abs(y_ae_anchor - batch))
+            ae_cos = batch_mean_cosine(batch, y_ae_anchor)
+            ae_anchor = cfg.lambda_ae_anchor_time * ae_lt + cfg.lambda_ae_anchor_cos * (1.0 - ae_cos)
+            total = total + ae_anchor
         lm1 = mx.array(0.0)
         lm2 = mx.array(0.0)
-        if mel_fb is not None and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0):
+        if spec_active and mel_fb is not None and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0):
             lm1, lm2 = mel_log_bin_losses(
-                y_hat,
-                batch,
+                y_spec,
+                b_spec,
                 mel_fb,
                 cfg.mel_n_fft,
                 cfg.mel_hop,
@@ -296,7 +873,28 @@ def make_train_fn(
             lsc=lsc,
             l_sc=l_sc,
             l_cx=l_cx,
+            l_excess=l_excess,
+            l_peak=l_peak,
+            l_peak_mag=l_peak_mag,
+            l_freq_ac=l_freq_ac,
+            l_stationary=l_stationary,
+            l_harm_f0=l_harm_f0,
+            l_harm_amp=l_harm_amp,
+            harm_voice=harm_voice,
+            l_hf_under=l_hf_under,
+            l_hf_sc=l_hf_sc,
+            l_hf_complex=l_hf_complex,
+            hf_mult=mx.array(hf_mult, dtype=mx.float32),
+            spec_mult=mx.array(spec_mult, dtype=mx.float32),
             l_lin=l_lin,
+            l_sisdr=l_sisdr,
+            l_preemph=l_preemph,
+            l_multidelta=l_multidelta,
+            l_band=l_band,
+            l_band_branch=l_band_branch,
+            ae_lt=ae_lt,
+            ae_cos=ae_cos,
+            ae_anchor=ae_anchor,
             lm1=lm1,
             lm2=lm2,
             vq_l=vq_l,
@@ -393,10 +991,8 @@ def vq_reset_dead_codes(model: MLXCodec, batch: mx.array, cfg: Config) -> tuple[
         dead = np.where(hist == 0)[0]
 
         d_emb = int(np.array(stage.embedding["weight"]).shape[1])
-        res_for_km = residual
-        if stage.in_proj is not None:
-            res_for_km = stage.in_proj(residual)
-            mx.eval(res_for_km)
+        res_for_km = _stage_code_space_residual(stage, residual, cfg)
+        mx.eval(res_for_km)
         res_np = np.array(res_for_km).reshape(-1, d_emb).astype(np.float32)
         npos = res_np.shape[0]
         if npos < 1:
@@ -477,28 +1073,40 @@ def update_vq_ema_codebooks(model: MLXCodec, batch: mx.array, cfg: Config) -> No
     beta = 1.0 - dec
     z = model.latent_before_rvq(batch)
     mx.eval(z)
-    quantized = mx.zeros_like(z)
-    for i in range(cfg.n_codebooks):
-        stage: VectorQuantizerStage = getattr(model.rvq, f"q{i}")
-        residual = z - quantized
-        z_i, _, _, idx = stage(residual)
-        mx.eval(z_i, idx)
-        r = stage.in_proj(residual) if stage.in_proj is not None else residual
-        mx.eval(r)
-        idx_np = np.array(idx).astype(np.int64).ravel()
-        d_emb = int(np.array(stage.embedding["weight"]).shape[1])
-        r_np = np.array(r).reshape(-1, d_emb).astype(np.float32)
-        k_sz = int(stage.num_embeddings)
-        w = np.array(stage.embedding["weight"], copy=True).astype(np.float32)
-        for k in range(k_sz):
-            m = idx_np == k
-            if np.any(m):
-                mu = np.mean(r_np[m], axis=0)
-                w[k] = dec * w[k] + beta * mu.astype(np.float32)
-        stage.embedding["weight"] = mx.array(w)
-        z_i2, _, _, _ = stage(residual)
-        mx.eval(z_i2)
-        quantized = quantized + z_i2
+
+    def update_chain(z_chain: mx.array, stages: list[VectorQuantizerStage]) -> None:
+        quantized = mx.zeros_like(z_chain)
+        for stage in stages:
+            residual = z_chain - quantized
+            z_i, _, _, idx = stage(residual)
+            mx.eval(z_i, idx)
+            r = _stage_code_space_residual(stage, residual, cfg)
+            mx.eval(r)
+            idx_np = np.array(idx).astype(np.int64).ravel()
+            d_emb = int(np.array(stage.embedding["weight"]).shape[1])
+            r_np = np.array(r).reshape(-1, d_emb).astype(np.float32)
+            k_sz = int(stage.num_embeddings)
+            w = np.array(stage.embedding["weight"], copy=True).astype(np.float32)
+            for k in range(k_sz):
+                m = idx_np == k
+                if np.any(m):
+                    mu = np.mean(r_np[m], axis=0)
+                    w[k] = dec * w[k] + beta * mu.astype(np.float32)
+            stage.embedding["weight"] = mx.array(w)
+            z_i2, _, _, _ = stage(residual)
+            mx.eval(z_i2)
+            quantized = quantized + z_i2
+
+    if model.rvq.group_splits and model.rvq.group_dims:
+        c0 = 0
+        for g, (n_stages, dim) in enumerate(zip(model.rvq.group_splits, model.rvq.group_dims, strict=True)):
+            c1 = c0 + dim
+            stages = [getattr(model.rvq, f"q{g}_{j}") for j in range(n_stages)]
+            update_chain(z[:, :, c0:c1], stages)
+            c0 = c1
+        return
+
+    update_chain(z, [getattr(model.rvq, f"q{i}") for i in range(cfg.n_codebooks)])
 
 
 def _format_vq_util(indices: list[mx.array] | None, sizes: tuple[int, ...]) -> str:
@@ -517,6 +1125,14 @@ def _format_vq_util(indices: list[mx.array] | None, sizes: tuple[int, ...]) -> s
         u = float(nu) / float(k)
         parts.append(f"u{i}={nu}/{k}({100.0 * u:.1f}%)")
     return "  " + " ".join(parts)
+
+
+def _stage_code_space_residual(stage: VectorQuantizerStage, residual: mx.array, cfg: Config) -> mx.array:
+    r = stage.in_proj(residual) if stage.in_proj is not None else residual
+    if cfg.turboquant:
+        rot = _turbo_rotation(cfg.turboquant_seed, stage.stage_id, int(r.shape[-1]))
+        r = r @ rot
+    return r
 
 
 def _tree_n_params(tree) -> int:
@@ -569,21 +1185,29 @@ def save_spectrogram_png(
     dur = o.size / float(sample_rate)
     n_fft = 512
     hop = 128  # matches NFFT=512, noverlap=384 in old specgram
+    s_orig = _log_mag_spectrogram_np(o, sample_rate, n_fft, hop)
+    s_recon = _log_mag_spectrogram_np(r, sample_rate, n_fft, hop)
+    both = np.concatenate([s_orig.reshape(-1), s_recon.reshape(-1)])
+    vmin = float(np.percentile(both, 1.0))
+    vmax = float(np.percentile(both, 99.5))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin, vmax = None, None
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig_w = min(22.0, max(10.0, 6.0 + dur * 1.5))
     fig, axes = plt.subplots(2, 1, figsize=(fig_w, 6), sharex=True)
-    for ax, data, title in (
-        (axes[0], o, "original"),
-        (axes[1], r, "reconstruction"),
+    for ax, data, spec, title in (
+        (axes[0], o, s_orig, "original"),
+        (axes[1], r, s_recon, "reconstruction"),
     ):
-        s_db = _log_mag_spectrogram_np(data, sample_rate, n_fft, hop)
         t1 = data.size / float(sample_rate)
         ax.imshow(
-            s_db,
+            spec,
             aspect="auto",
             origin="lower",
             cmap="magma",
             extent=[0.0, t1, 0.0, sample_rate / 2.0],
+            vmin=vmin,
+            vmax=vmax,
         )
         ax.set_ylabel("Hz")
         ax.set_title(title)
@@ -1036,6 +1660,12 @@ def main() -> None:
         help="Stride-1 Conv+GELU blocks per resolution before each downsample / after each upsample (0 = default; 1 = v2 refinement but cold init can give NaN grads—resume ok)",
     )
     p.add_argument(
+        "--decoder-refine-blocks-per-scale",
+        type=int,
+        default=0,
+        help="Extra decoder-only stride-1 Conv+activation blocks after each upsample; keeps encoder stride and nominal bitrate unchanged",
+    )
+    p.add_argument(
         "--latent-dim",
         type=int,
         default=512,
@@ -1062,6 +1692,61 @@ def main() -> None:
         help="Same temporal stack on quantized z_q before decoder (0=off)",
     )
     p.add_argument(
+        "--self-attention-depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="SelfAttention1D blocks on latents before RVQ (0=off)",
+    )
+    p.add_argument(
+        "--self-attention-post-depth",
+        type=int,
+        default=0,
+        metavar="M",
+        help="SelfAttention1D blocks on quantized z_q before decoder (0=off)",
+    )
+    p.add_argument(
+        "--self-attention-heads",
+        type=int,
+        default=8,
+        metavar="H",
+        help="Attention heads for SelfAttention1D; must divide --latent-dim",
+    )
+    p.add_argument(
+        "--state-space-depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="S4D/DSS-style state-space blocks on latents before RVQ (0=off; mutually exclusive with pre SelfAttention1D)",
+    )
+    p.add_argument(
+        "--state-space-post-depth",
+        type=int,
+        default=0,
+        metavar="M",
+        help="S4D/DSS-style state-space blocks on quantized z_q before decoder (0=off)",
+    )
+    p.add_argument(
+        "--state-space-state-dim",
+        type=int,
+        default=16,
+        metavar="S",
+        help="Diagonal SSM states per expanded latent channel",
+    )
+    p.add_argument(
+        "--state-space-expand",
+        type=int,
+        default=1,
+        metavar="E",
+        help="Channel expansion inside state-space mixer",
+    )
+    p.add_argument(
+        "--state-space-bidirectional",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use forward+backward SSM convolutions (disable for causal experiments)",
+    )
+    p.add_argument(
         "--n-codebooks",
         type=int,
         default=3,
@@ -1080,6 +1765,25 @@ def main() -> None:
         default=None,
         metavar="K0,K1,…",
         help="Comma-separated K per RVQ stage (length must match --n-codebooks), e.g. decreasing 256,128,64",
+    )
+    p.add_argument(
+        "--rvq-band-splits",
+        type=str,
+        default=None,
+        metavar="N0,N1,…",
+        help="Optional grouped RVQ stage counts over latent channel slices; sum must equal --n-codebooks, e.g. 5,5,5",
+    )
+    p.add_argument(
+        "--turboquant",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="TurboQuant-compatible RVQ: fixed random orthogonal rotation before code assignment, inverse rotation after lookup",
+    )
+    p.add_argument(
+        "--turboquant-seed",
+        type=int,
+        default=1729,
+        help="Seed for fixed TurboQuant RVQ rotations",
     )
     p.add_argument("--lambda-time", type=float, default=1.0, help="L1 waveform weight")
     p.add_argument(
@@ -1102,6 +1806,168 @@ def main() -> None:
         metavar="W",
         help="If >0: add W·λ_stft_eff·mean(1−cos) on flattened log-mag STFT per scale (spectral cosine; separate from --lambda-cos on waveform)",
     )
+    p.add_argument(
+        "--lambda-stft-excess",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="If >0: penalize log-STFT energy above target by --stft-excess-margin; fights broadband haze in silent valleys",
+    )
+    p.add_argument(
+        "--stft-excess-margin",
+        type=float,
+        default=0.20,
+        metavar="M",
+        help="Log-magnitude margin before --lambda-stft-excess activates",
+    )
+    p.add_argument(
+        "--lambda-hf-under",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="Target-gated high-frequency missing-energy loss; restores HF peaks without rewarding broadband haze",
+    )
+    p.add_argument(
+        "--lambda-hf-sc",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="High-frequency-only spectral convergence weight",
+    )
+    p.add_argument(
+        "--lambda-hf-complex",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="High-frequency-only complex STFT L1; penalizes missing HF and unmatched broadband HF noise",
+    )
+    p.add_argument("--hf-min-hz", type=float, default=2500.0, help="Lower frequency edge for HF losses")
+    p.add_argument("--hf-gate-db", type=float, default=-18.0, help="Target HF gate relative to per-sample STFT peak, in dB")
+    p.add_argument(
+        "--hf-under-margin",
+        type=float,
+        default=0.05,
+        help="Log-magnitude margin before HF under-energy loss activates",
+    )
+    p.add_argument(
+        "--hf-peak-mask",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Restrict HF-under to target local maxima along frequency; avoids rewarding broad HF shelves",
+    )
+    p.add_argument(
+        "--lambda-peak-contrast",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="HF target-peak contrast loss on log-STFT; encourages harmonic ridges instead of broadband HF shelves",
+    )
+    p.add_argument(
+        "--lambda-peak-mag",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="HF target-peak logmag under-loss; raises missing harmonic ridge bins without rewarding all HF bins",
+    )
+    p.add_argument(
+        "--peak-contrast-radius",
+        type=int,
+        default=3,
+        help="Frequency-bin radius for target-peak masks used by --lambda-peak-contrast and --lambda-peak-mag",
+    )
+    p.add_argument(
+        "--lambda-freq-ac",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="Frequency-axis autocorrelation loss on log-STFT; encourages harmonic spacing without semantic/GAN teacher",
+    )
+    p.add_argument(
+        "--freq-ac-min-hz",
+        type=float,
+        default=300.0,
+        metavar="HZ",
+        help="Lowest spectral bin included in frequency-autocorrelation loss",
+    )
+    p.add_argument(
+        "--freq-ac-lags-hz",
+        type=str,
+        default="60,80,100,125,160,200,250,315,400,500",
+        metavar="HZ,...",
+        help="Frequency lag list in Hz for --lambda-freq-ac",
+    )
+    p.add_argument(
+        "--lambda-stationary-line",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="Penalize prediction-only stationary narrow spectral lines in mean-over-time log-STFT",
+    )
+    p.add_argument(
+        "--stationary-line-min-hz",
+        type=float,
+        default=1000.0,
+        metavar="HZ",
+        help="Lowest bin included in stationary-line excess loss",
+    )
+    p.add_argument(
+        "--stationary-line-radius",
+        type=int,
+        default=5,
+        metavar="BINS",
+        help="Frequency-neighborhood radius for stationary-line contrast",
+    )
+    p.add_argument(
+        "--stationary-line-margin",
+        type=float,
+        default=0.08,
+        metavar="M",
+        help="Allowed prediction-over-target stationary-line contrast margin",
+    )
+    p.add_argument(
+        "--lambda-harmonic-f0",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="Autocorrelation-derived F0 supervision weight for --decoder-harmonic-source",
+    )
+    p.add_argument(
+        "--lambda-harmonic-amp",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help="Autocorrelation-derived voicing/amplitude supervision weight for --decoder-harmonic-source",
+    )
+    p.add_argument(
+        "--harmonic-f0-frame",
+        type=int,
+        default=512,
+        metavar="N",
+        help="Frame size in samples for harmonic-source autocorrelation F0 target",
+    )
+    p.add_argument(
+        "--harmonic-f0-hop",
+        type=int,
+        default=256,
+        metavar="N",
+        help="Hop size in samples for harmonic-source autocorrelation F0 target",
+    )
+    p.add_argument(
+        "--harmonic-f0-lags",
+        type=str,
+        default="32,36,40,45,50,56,63,71,80,90,101,113,127,143,160,180,202,226,254",
+        metavar="SAMPLES,...",
+        help="Candidate autocorrelation lags in samples for harmonic-source F0 target",
+    )
+    p.add_argument(
+        "--harmonic-voicing-threshold",
+        type=float,
+        default=0.30,
+        metavar="R",
+        help="Normalized autocorrelation threshold for voiced harmonic-source frames",
+    )
+    p.add_argument("--hf-start-step", type=int, default=0, help="Keep HF losses disabled until this optimizer step")
+    p.add_argument("--hf-ramp-steps", type=int, default=0, help="Linearly ramp HF losses to full weight over this many steps")
     p.add_argument(
         "--stft-grad-freq-weight",
         type=float,
@@ -1143,6 +2009,34 @@ def main() -> None:
         metavar="W1,W2,…",
         help="Comma weights for each STFT scale (same count as resolved --stft-scales); "
         "loss uses sum(w_i·L_i)/sum(w_i). Omit for uniform. Example with hi-res focus: 1,1.5,2",
+    )
+    p.add_argument(
+        "--spectral-batch-items",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Limit spectral/mel losses to N items per micro-batch; 0 = full micro-batch",
+    )
+    p.add_argument(
+        "--spectral-loss-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Compute full spectral/mel/HF loss bundle every N optimizer steps and scale active spectral gradients by N",
+    )
+    p.add_argument(
+        "--stft-large-min-fft",
+        type=int,
+        default=0,
+        metavar="NFFT",
+        help="Treat STFT scales with n_fft >= NFFT as large; 0 disables large-scale cycling",
+    )
+    p.add_argument(
+        "--stft-large-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run large STFT scales every N optimizer steps",
     )
     p.add_argument(
         "--stft-hf-emphasis",
@@ -1187,6 +2081,33 @@ def main() -> None:
         help="Faster training: use two STFT scales (512,128)+(1024,256) unless --stft-scales is set",
     )
     p.add_argument("--lambda-vq", type=float, default=5.0, help="Weight on VQ commit+codebook sum")
+    p.add_argument(
+        "--vq-loss",
+        type=str,
+        choices=("mse", "huber"),
+        default="mse",
+        help="Shape for VQ commit/codebook match loss; huber limits outlier gradients from latent spikes",
+    )
+    p.add_argument(
+        "--vq-huber-delta",
+        type=float,
+        default=1.0,
+        metavar="D",
+        help="Huber delta for --vq-loss huber (larger approaches MSE; must be >0)",
+    )
+    p.add_argument(
+        "--vq-loss-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Normalize VQ match residuals by per-frame residual RMS before computing --vq-loss",
+    )
+    p.add_argument(
+        "--vq-loss-norm-eps",
+        type=float,
+        default=1e-4,
+        metavar="EPS",
+        help="Epsilon inside residual-RMS normalization for --vq-loss-normalize",
+    )
     p.add_argument(
         "--lambda-entropy",
         type=float,
@@ -1285,6 +2206,34 @@ def main() -> None:
         default=0.9,
         help="Floor for cosine hinge (default 0.9)",
     )
+    p.add_argument("--lambda-sisdr", type=float, default=0.0, help="Differentiable negative log SI-SDR waveform loss weight")
+    p.add_argument("--lambda-preemph", type=float, default=0.0, help="Pre-emphasized waveform L1 loss weight")
+    p.add_argument("--preemph-coef", type=float, default=0.97, help="Pre-emphasis coefficient for --lambda-preemph")
+    p.add_argument(
+        "--lambda-multidelta",
+        type=float,
+        default=0.0,
+        help="Multi-lag finite-difference waveform L1 weight; HF/time anchor that does not reward spectral-floor haze",
+    )
+    p.add_argument(
+        "--multidelta-lags",
+        type=str,
+        default="1,2,4,8",
+        metavar="LAGS",
+        help="Comma-separated positive sample lags for --lambda-multidelta",
+    )
+    p.add_argument(
+        "--lambda-ae-anchor-time",
+        type=float,
+        default=0.0,
+        help="Train continuous z->decoder L1 anchor alongside hard RVQ reconstruction",
+    )
+    p.add_argument(
+        "--lambda-ae-anchor-cos",
+        type=float,
+        default=0.0,
+        help="Train continuous z->decoder waveform cosine anchor alongside hard RVQ reconstruction",
+    )
     p.add_argument(
         "--lambda-sc",
         type=float,
@@ -1310,8 +2259,8 @@ def main() -> None:
         "--activation",
         type=str,
         default="gelu",
-        choices=("gelu", "snake", "snake_beta"),
-        help="Encoder/decoder nonlinearity (snake/snake_beta = DAC-style periodic)",
+        choices=("gelu", "snake", "snake_beta", "harmonic_beta", "periodic_gelu"),
+        help="Encoder/decoder nonlinearity (snake*=DAC sin²; harmonic_beta 2-scale; periodic_gelu GELU+sin²)",
     )
     p.add_argument(
         "--rvq-code-dim",
@@ -1328,11 +2277,190 @@ def main() -> None:
         help="EMA decay for codebook rows in (0,1), e.g. 0.99 (0=disabled)",
     )
     p.add_argument(
+        "--vq-ema-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run CPU/NumPy VQ EMA codebook refresh every N optimizer steps (1=every step; higher=faster)",
+    )
+    p.add_argument(
         "--decoder-upsample",
         type=str,
         default="transpose",
         choices=("transpose", "repeat_conv"),
         help="Decoder upsampling: ConvTranspose1d or repeat×2+Conv (also forced when --causal)",
+    )
+    p.add_argument(
+        "--decoder-transpose-kernel",
+        type=int,
+        default=7,
+        metavar="K",
+        help="ConvTranspose1d upsample kernel. Even K, e.g. 8, gives even stride-2 overlap; legacy is 7.",
+    )
+    p.add_argument(
+        "--decoder-band-split",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Decoder predicts low/mid/high branches filtered by a fixed FIR bank, then summed (same RVQ bitrate)",
+    )
+    p.add_argument(
+        "--band-split-cutoffs-hz",
+        type=str,
+        default="2500,5000",
+        metavar="LOW,MID",
+        help="Two band split cutoffs in Hz for --decoder-band-split and --lambda-band-l1",
+    )
+    p.add_argument(
+        "--band-split-taps",
+        type=int,
+        default=129,
+        metavar="N",
+        help="Odd FIR tap count for band split filters",
+    )
+    p.add_argument(
+        "--decoder-band-head-depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Extra independent Conv1d blocks per low/mid/high decoder head before fixed FIR filtering",
+    )
+    p.add_argument(
+        "--decoder-band-latent-split",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Decode three rvq-band-split latent channel groups with separate decoder towers before fixed FIR sum",
+    )
+    p.add_argument(
+        "--decoder-harmonic-source",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Decoder adds a differentiable voiced source-filter branch with harmonic partials; RVQ bitrate is unchanged",
+    )
+    p.add_argument(
+        "--decoder-harmonic-partials",
+        type=int,
+        default=6,
+        metavar="N",
+        help="Number of 1/k-weighted harmonic partials in --decoder-harmonic-source",
+    )
+    p.add_argument(
+        "--decoder-harmonic-fmin-hz",
+        type=float,
+        default=60.0,
+        metavar="HZ",
+        help="Minimum predicted F0 for --decoder-harmonic-source",
+    )
+    p.add_argument(
+        "--decoder-harmonic-fmax-hz",
+        type=float,
+        default=450.0,
+        metavar="HZ",
+        help="Maximum predicted F0 for --decoder-harmonic-source",
+    )
+    p.add_argument(
+        "--decoder-harmonic-gain",
+        type=float,
+        default=0.25,
+        metavar="G",
+        help="Gain for the harmonic excitation branch before tanh",
+    )
+    p.add_argument(
+        "--decoder-harmonic-amp-bias",
+        type=float,
+        default=-2.0,
+        metavar="B",
+        help="Additive bias before sigmoid amplitude gate in --decoder-harmonic-source; negative starts the source quieter",
+    )
+    p.add_argument(
+        "--decoder-harmonic-rolloff",
+        type=float,
+        default=1.0,
+        metavar="P",
+        help="Partial amplitude rolloff for --decoder-harmonic-source: weight(k)=1/k^P",
+    )
+    p.add_argument(
+        "--decoder-harmonic-mode",
+        type=str,
+        default="additive",
+        choices=("additive", "source_filter"),
+        help="Harmonic decoder topology. source_filter constrains mid/high bands to deterministic harmonic excitation plus small conv residual",
+    )
+    p.add_argument(
+        "--decoder-harmonic-control-smooth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Odd moving-average taps for predicted F0/amplitude/envelopes; 0 disables smoothing",
+    )
+    p.add_argument(
+        "--decoder-harmonic-env-bias",
+        type=float,
+        default=0.0,
+        metavar="B",
+        help="Additive bias before sigmoid mid/high harmonic envelopes in source_filter mode",
+    )
+    p.add_argument(
+        "--decoder-harmonic-band-weights",
+        type=str,
+        default="0.0,0.35,1.0",
+        metavar="LOW,MID,HIGH",
+        help="When harmonic source and band split are both enabled, route harmonic excitation into these filtered bands",
+    )
+    p.add_argument(
+        "--decoder-harmonic-residual-band-weights",
+        type=str,
+        default="1.0,0.25,0.05",
+        metavar="LOW,MID,HIGH",
+        help="In source_filter mode, attenuate generic conv residual bands before adding harmonic mid/high source",
+    )
+    p.add_argument(
+        "--decoder-harmonic-groups",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Optional learned partial-group gates for --decoder-harmonic-source; 0 keeps fixed 1/k partial weights",
+    )
+    p.add_argument(
+        "--decoder-harmonic-group-bias",
+        type=float,
+        default=-1.5,
+        metavar="B",
+        help="Additive bias before sigmoid partial-group gates; negative starts harmonic groups quieter",
+    )
+    p.add_argument(
+        "--lambda-band-l1",
+        type=float,
+        default=0.0,
+        metavar="λ",
+        help="Band-normalized waveform L1 weight (low/mid/high filtered, target-energy normalized)",
+    )
+    p.add_argument(
+        "--band-l1-weights",
+        type=str,
+        default="0.25,1.0,1.5",
+        metavar="LOW,MID,HIGH",
+        help="Weights for band-normalized L1",
+    )
+    p.add_argument(
+        "--band-l1-floor",
+        type=float,
+        default=0.015,
+        metavar="A",
+        help="Target-band magnitude floor for band-normalized L1",
+    )
+    p.add_argument(
+        "--lambda-band-branch-l1",
+        type=float,
+        default=0.0,
+        metavar="λ",
+        help="Train decoder low/mid/high branches against matching target bands before summing",
+    )
+    p.add_argument(
+        "--band-branch-weights",
+        type=str,
+        default="0.10,1.0,2.0",
+        metavar="LOW,MID,HIGH",
+        help="Weights for branch-supervised band L1",
     )
     p.add_argument("--causal", action="store_true", help="Causal encoder/decoder convs (left pad only)")
     p.add_argument("--bf16", action="store_true", help="Run codec in bfloat16 (STFT fp32)")
@@ -1351,7 +2479,37 @@ def main() -> None:
         type=int,
         default=0,
         metavar="N",
-        help="Run SI-SDR (+ PESQ if installed) every N steps on a short val clip (0=off)",
+        help="Run eval every N steps: holdout if --eval-dir is set, otherwise a train-batch probe (0=off)",
+    )
+    p.add_argument(
+        "--eval-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Holdout audio root for eval metrics; files are selected once with --eval-seed",
+    )
+    p.add_argument(
+        "--eval-samples",
+        "--eval-clips",
+        dest="eval_clips",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Number of holdout files for --eval-dir (alias: --eval-clips)",
+    )
+    p.add_argument(
+        "--eval-seconds",
+        type=float,
+        default=3.0,
+        metavar="S",
+        help="Seconds per holdout file for eval (0 = full file)",
+    )
+    p.add_argument(
+        "--eval-seed",
+        type=int,
+        default=0,
+        metavar="SEED",
+        help="Seed for deterministic holdout file selection",
     )
     p.add_argument(
         "--log-mlx-tsv",
@@ -1388,11 +2546,25 @@ def main() -> None:
     )
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument(
+        "--log-loss-ema-beta",
+        type=float,
+        default=0.98,
+        metavar="B",
+        help="EMA of raw train loss and VQ loss in logs only (0=off, diagnostic only)",
+    )
+    p.add_argument(
         "--log-cos-ema-beta",
         type=float,
         default=0.99,
         metavar="B",
         help="EMA of cos%% in log: ema←B·ema+(1−B)·cos (0=off, typical 0.95–0.995)",
+    )
+    p.add_argument(
+        "--best-holdout-metric",
+        type=str,
+        default="sisdr_db",
+        metavar="M",
+        help="Metric used to update checkpoints/best_holdout.json (sisdr_db, pesq_wb, stoi, lsd_db, cos)",
     )
     p.add_argument(
         "--spectrogram-every",
@@ -1444,6 +2616,9 @@ def main() -> None:
         help="Print per-block timing (data/D/G-fwd+bwd/optim/ema/vq-reset) every --log-every; small overhead from mx.eval syncs",
     )
     p.set_defaults(**argparse_defaults_from_config())
+    argv = sys.argv[1:]
+    user_stft_scales = any(a == "--stft-scales" or a.startswith("--stft-scales=") for a in argv)
+    user_stft_weights = any(a == "--stft-scale-weights" or a.startswith("--stft-scale-weights=") for a in argv)
     args = p.parse_args()
 
     if not args.data_dir and args.librispeech:
@@ -1451,6 +2626,15 @@ def main() -> None:
 
     if args.spectrogram_seconds < 0:
         print("--spectrogram-seconds must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.eval_every < 0:
+        print("--eval-every must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.eval_clips < 1:
+        print("--eval-samples/--eval-clips must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.eval_seconds < 0:
+        print("--eval-seconds must be >= 0", file=sys.stderr)
         sys.exit(1)
     if args.checkpoint_every < 0:
         print("--checkpoint-every must be >= 0", file=sys.stderr)
@@ -1460,6 +2644,15 @@ def main() -> None:
         sys.exit(1)
     if args.grad_accum_steps < 1:
         print("--grad-accum-steps must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.vq_ema_every < 1:
+        print("--vq-ema-every must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.vq_huber_delta <= 0:
+        print("--vq-huber-delta must be > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.vq_loss_norm_eps <= 0:
+        print("--vq-loss-norm-eps must be > 0", file=sys.stderr)
         sys.exit(1)
     if args.lr_min_ratio < 0 or args.lr_min_ratio > 1.0:
         print("--lr-min-ratio must be in [0, 1]", file=sys.stderr)
@@ -1501,6 +2694,83 @@ def main() -> None:
     if args.lambda_stft_cos < 0:
         print("--lambda-stft-cos must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.lambda_stft_excess < 0:
+        print("--lambda-stft-excess must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.stft_excess_margin < 0:
+        print("--stft-excess-margin must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if (
+        args.lambda_hf_under < 0
+        or args.lambda_hf_sc < 0
+        or args.lambda_hf_complex < 0
+        or args.lambda_peak_contrast < 0
+        or args.lambda_peak_mag < 0
+        or args.lambda_freq_ac < 0
+        or args.lambda_stationary_line < 0
+        or args.lambda_harmonic_f0 < 0
+        or args.lambda_harmonic_amp < 0
+    ):
+        print(
+            "--lambda-hf-under, --lambda-hf-sc, --lambda-hf-complex, --lambda-peak-contrast, --lambda-peak-mag, --lambda-freq-ac, --lambda-stationary-line, --lambda-harmonic-f0, and --lambda-harmonic-amp must be >= 0",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.hf_min_hz < 0 or args.hf_min_hz >= 0.5 * Config().sample_rate:
+        print("--hf-min-hz must be >= 0 and below Nyquist", file=sys.stderr)
+        sys.exit(1)
+    if args.hf_under_margin < 0:
+        print("--hf-under-margin must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.hf_start_step < 0 or args.hf_ramp_steps < 0:
+        print("--hf-start-step and --hf-ramp-steps must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.peak_contrast_radius < 1:
+        print("--peak-contrast-radius must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.freq_ac_min_hz < 0 or args.freq_ac_min_hz >= 0.5 * Config().sample_rate:
+        print("--freq-ac-min-hz must be >= 0 and below Nyquist", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.freq_ac_lags_hz, (tuple, list)):
+            freq_ac_lags_hz = tuple(float(x) for x in args.freq_ac_lags_hz)
+        else:
+            freq_ac_lags_hz = parse_float_list_arg(str(args.freq_ac_lags_hz))
+    except ValueError as e:
+        print(f"--freq-ac-lags-hz: {e}", file=sys.stderr)
+        sys.exit(1)
+    if len(freq_ac_lags_hz) < 1 or any(x <= 0.0 for x in freq_ac_lags_hz):
+        print("--freq-ac-lags-hz must contain at least one positive lag", file=sys.stderr)
+        sys.exit(1)
+    if args.stationary_line_min_hz < 0 or args.stationary_line_min_hz >= 0.5 * Config().sample_rate:
+        print("--stationary-line-min-hz must be >= 0 and below Nyquist", file=sys.stderr)
+        sys.exit(1)
+    if args.stationary_line_radius < 1:
+        print("--stationary-line-radius must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.stationary_line_margin < 0:
+        print("--stationary-line-margin must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.harmonic_f0_lags, (tuple, list)):
+            harmonic_f0_lags = tuple(int(x) for x in args.harmonic_f0_lags)
+        else:
+            harmonic_f0_lags = parse_positive_int_list_arg(str(args.harmonic_f0_lags))
+    except ValueError as e:
+        print(f"--harmonic-f0-lags: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.harmonic_f0_frame < 16:
+        print("--harmonic-f0-frame must be >= 16", file=sys.stderr)
+        sys.exit(1)
+    if args.harmonic_f0_hop < 1:
+        print("--harmonic-f0-hop must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if not (0.0 <= args.harmonic_voicing_threshold < 1.0):
+        print("--harmonic-voicing-threshold must be in [0, 1)", file=sys.stderr)
+        sys.exit(1)
+    if any(int(l) >= int(args.harmonic_f0_frame) for l in harmonic_f0_lags):
+        print("--harmonic-f0-lags must be smaller than --harmonic-f0-frame", file=sys.stderr)
+        sys.exit(1)
     if args.stft_grad_freq_weight < 0 or args.stft_grad_time_weight < 0:
         print("--stft-grad-freq-weight and --stft-grad-time-weight must be >= 0", file=sys.stderr)
         sys.exit(1)
@@ -1509,6 +2779,18 @@ def main() -> None:
         sys.exit(1)
     if args.stft_hf_emphasis < 0:
         print("--stft-hf-emphasis must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.spectral_batch_items < 0:
+        print("--spectral-batch-items must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.spectral_loss_every < 1:
+        print("--spectral-loss-every must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.stft_large_min_fft < 0:
+        print("--stft-large-min-fft must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.stft_large_every < 1:
+        print("--stft-large-every must be >= 1", file=sys.stderr)
         sys.exit(1)
     if args.lambda_mel_l1 < 0 or args.lambda_mel_l2 < 0:
         print("--lambda-mel-l1 and --lambda-mel-l2 must be >= 0", file=sys.stderr)
@@ -1525,8 +2807,19 @@ def main() -> None:
     if args.mel_fmin < 0:
         print("--mel-fmin must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.log_loss_ema_beta < 0 or args.log_loss_ema_beta >= 1.0:
+        print("--log-loss-ema-beta must be in [0, 1) (0 = disable EMA)", file=sys.stderr)
+        sys.exit(1)
     if args.log_cos_ema_beta < 0 or args.log_cos_ema_beta >= 1.0:
         print("--log-cos-ema-beta must be in [0, 1) (0 = disable EMA)", file=sys.stderr)
+        sys.exit(1)
+    best_holdout_metric = _canonical_eval_metric_name(args.best_holdout_metric)
+    if best_holdout_metric not in _EVAL_METRIC_ALIASES.values():
+        print(
+            "--best-holdout-metric must be one of: "
+            + ", ".join(sorted(set(_EVAL_METRIC_ALIASES))),
+            file=sys.stderr,
+        )
         sys.exit(1)
     if not (0.0 < args.stft_ramp_start <= 1.0):
         print("--stft-ramp-start must be in (0, 1]", file=sys.stderr)
@@ -1540,17 +2833,201 @@ def main() -> None:
     if args.stride1_blocks_per_scale < 0:
         print("--stride1-blocks-per-scale must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.decoder_refine_blocks_per_scale < 0:
+        print("--decoder-refine-blocks-per-scale must be >= 0", file=sys.stderr)
+        sys.exit(1)
     if args.vq_reset_full_refresh_max_unique < 1:
         print("--vq-reset-full-refresh-max-unique must be >= 1", file=sys.stderr)
         sys.exit(1)
     if args.latent_temporal_depth < 0 or args.latent_temporal_post_depth < 0:
         print("--latent-temporal-depth and --latent-temporal-post-depth must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.self_attention_depth < 0 or args.self_attention_post_depth < 0:
+        print("--self-attention-depth and --self-attention-post-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.self_attention_heads < 1:
+        print("--self-attention-heads must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.state_space_depth < 0 or args.state_space_post_depth < 0:
+        print("--state-space-depth and --state-space-post-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.state_space_state_dim < 1:
+        print("--state-space-state-dim must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.state_space_expand < 1:
+        print("--state-space-expand must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_transpose_kernel < 2:
+        print("--decoder-transpose-kernel must be >= 2", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.band_split_cutoffs_hz, (tuple, list)):
+            band_split_cutoffs = tuple(float(x) for x in args.band_split_cutoffs_hz)
+        else:
+            band_split_cutoffs = parse_float_list_arg(str(args.band_split_cutoffs_hz))
+    except ValueError as e:
+        print(f"--band-split-cutoffs-hz: {e}", file=sys.stderr)
+        sys.exit(1)
+    if len(band_split_cutoffs) != 2:
+        print("--band-split-cutoffs-hz must contain exactly two cutoffs", file=sys.stderr)
+        sys.exit(1)
+    nyq = 0.5 * float(Config().sample_rate)
+    if not (0.0 < band_split_cutoffs[0] < band_split_cutoffs[1] < nyq):
+        print("--band-split-cutoffs-hz must satisfy 0 < low < high < Nyquist", file=sys.stderr)
+        sys.exit(1)
+    if args.band_split_taps < 3 or args.band_split_taps % 2 == 0:
+        print("--band-split-taps must be odd and >= 3", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_band_head_depth < 0:
+        print("--decoder-band-head-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if bool(args.decoder_band_latent_split) and not bool(args.decoder_band_split):
+        print("--decoder-band-latent-split requires --decoder-band-split", file=sys.stderr)
+        sys.exit(1)
+    if bool(args.decoder_band_latent_split) and bool(args.decoder_harmonic_source):
+        print("--decoder-band-latent-split is incompatible with --decoder-harmonic-source", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_partials < 1:
+        print("--decoder-harmonic-partials must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_fmin_hz <= 0 or args.decoder_harmonic_fmax_hz <= args.decoder_harmonic_fmin_hz:
+        print("--decoder-harmonic-fmin-hz must be > 0 and below --decoder-harmonic-fmax-hz", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_fmax_hz >= nyq:
+        print("--decoder-harmonic-fmax-hz must be below Nyquist", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_gain < 0:
+        print("--decoder-harmonic-gain must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_rolloff <= 0:
+        print("--decoder-harmonic-rolloff must be > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_control_smooth < 0:
+        print("--decoder-harmonic-control-smooth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_control_smooth > 1 and args.decoder_harmonic_control_smooth % 2 == 0:
+        print("--decoder-harmonic-control-smooth must be odd when > 1", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.decoder_harmonic_band_weights, (tuple, list)):
+            harmonic_band_weights = tuple(float(x) for x in args.decoder_harmonic_band_weights)
+        else:
+            harmonic_band_weights = parse_float_list_arg(str(args.decoder_harmonic_band_weights))
+    except ValueError as e:
+        print(f"--decoder-harmonic-band-weights: {e}", file=sys.stderr)
+        sys.exit(1)
+    if len(harmonic_band_weights) != 3:
+        print("--decoder-harmonic-band-weights must contain exactly three weights", file=sys.stderr)
+        sys.exit(1)
+    if any(x < 0.0 for x in harmonic_band_weights) or sum(harmonic_band_weights) <= 0.0:
+        print("--decoder-harmonic-band-weights must be non-negative and sum to > 0", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.decoder_harmonic_residual_band_weights, (tuple, list)):
+            harmonic_residual_band_weights = tuple(float(x) for x in args.decoder_harmonic_residual_band_weights)
+        else:
+            harmonic_residual_band_weights = parse_float_list_arg(str(args.decoder_harmonic_residual_band_weights))
+    except ValueError as e:
+        print(f"--decoder-harmonic-residual-band-weights: {e}", file=sys.stderr)
+        sys.exit(1)
+    if len(harmonic_residual_band_weights) != 3:
+        print("--decoder-harmonic-residual-band-weights must contain exactly three weights", file=sys.stderr)
+        sys.exit(1)
+    if any(x < 0.0 for x in harmonic_residual_band_weights):
+        print("--decoder-harmonic-residual-band-weights must be non-negative", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_groups < 0:
+        print("--decoder-harmonic-groups must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_harmonic_mode == "source_filter" and not (
+        bool(args.decoder_harmonic_source) and bool(args.decoder_band_split)
+    ):
+        print("--decoder-harmonic-mode source_filter requires --decoder-harmonic-source and --decoder-band-split", file=sys.stderr)
+        sys.exit(1)
+    if (args.lambda_harmonic_f0 > 0 or args.lambda_harmonic_amp > 0) and not bool(args.decoder_harmonic_source):
+        print("--lambda-harmonic-f0/--lambda-harmonic-amp require --decoder-harmonic-source", file=sys.stderr)
+        sys.exit(1)
+    if bool(args.causal) and bool(args.decoder_band_split):
+        print("--decoder-band-split is centered-FIR and incompatible with --causal", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_band_l1 < 0:
+        print("--lambda-band-l1 must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_band_branch_l1 < 0:
+        print("--lambda-band-branch-l1 must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.band_l1_weights, (tuple, list)):
+            band_l1_weights = tuple(float(x) for x in args.band_l1_weights)
+        else:
+            band_l1_weights = parse_float_list_arg(str(args.band_l1_weights))
+    except ValueError as e:
+        print(f"--band-l1-weights: {e}", file=sys.stderr)
+        sys.exit(1)
+    if len(band_l1_weights) != 3:
+        print("--band-l1-weights must contain exactly three weights", file=sys.stderr)
+        sys.exit(1)
+    if any(x < 0.0 for x in band_l1_weights) or sum(band_l1_weights) <= 0.0:
+        print("--band-l1-weights must be non-negative and sum to > 0", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.band_branch_weights, (tuple, list)):
+            band_branch_weights = tuple(float(x) for x in args.band_branch_weights)
+        else:
+            band_branch_weights = parse_float_list_arg(str(args.band_branch_weights))
+    except ValueError as e:
+        print(f"--band-branch-weights: {e}", file=sys.stderr)
+        sys.exit(1)
+    if len(band_branch_weights) != 3:
+        print("--band-branch-weights must contain exactly three weights", file=sys.stderr)
+        sys.exit(1)
+    if any(x < 0.0 for x in band_branch_weights) or sum(band_branch_weights) <= 0.0:
+        print("--band-branch-weights must be non-negative and sum to > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.band_l1_floor < 0:
+        print("--band-l1-floor must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_band_branch_l1 > 0 and not bool(args.decoder_band_split):
+        print("--lambda-band-branch-l1 requires --decoder-band-split", file=sys.stderr)
+        sys.exit(1)
+    if (args.self_attention_depth > 0 or args.self_attention_post_depth > 0) and args.latent_dim % args.self_attention_heads != 0:
+        print("--latent-dim must be divisible by --self-attention-heads when SelfAttention1D is enabled", file=sys.stderr)
+        sys.exit(1)
+    if args.self_attention_depth > 0 and args.state_space_depth > 0:
+        print("--self-attention-depth and --state-space-depth are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    if args.self_attention_post_depth > 0 and args.state_space_post_depth > 0:
+        print("--self-attention-post-depth and --state-space-post-depth are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    if bool(args.causal) and bool(args.state_space_bidirectional) and (
+        args.state_space_depth > 0 or args.state_space_post_depth > 0
+    ):
+        print("--state-space-bidirectional is incompatible with --causal when state-space blocks are enabled", file=sys.stderr)
+        sys.exit(1)
     if args.lambda_sc < 0:
         print("--lambda-sc must be >= 0", file=sys.stderr)
         sys.exit(1)
     if args.lambda_complex_stft < 0:
         print("--lambda-complex-stft must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_sisdr < 0 or args.lambda_preemph < 0 or args.lambda_multidelta < 0:
+        print("--lambda-sisdr, --lambda-preemph, and --lambda-multidelta must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if not (0.0 <= args.preemph_coef < 1.0):
+        print("--preemph-coef must be >= 0 and < 1", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if isinstance(args.multidelta_lags, (tuple, list)):
+            multidelta_lags = tuple(int(x) for x in args.multidelta_lags)
+            if any(x < 1 for x in multidelta_lags):
+                raise ValueError("expected positive integers")
+        else:
+            multidelta_lags = parse_positive_int_list_arg(str(args.multidelta_lags))
+    except ValueError as e:
+        print(f"--multidelta-lags: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_ae_anchor_time < 0 or args.lambda_ae_anchor_cos < 0:
+        print("--lambda-ae-anchor-time and --lambda-ae-anchor-cos must be >= 0", file=sys.stderr)
         sys.exit(1)
 
     codebook_sizes_arg: tuple[int, ...] | None = None
@@ -1566,8 +3043,27 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+    rvq_band_splits_arg: tuple[int, ...] | None = None
+    if args.rvq_band_splits:
+        try:
+            rvq_band_splits_arg = parse_positive_int_list_arg(args.rvq_band_splits)
+        except ValueError as e:
+            print(f"--rvq-band-splits: {e}", file=sys.stderr)
+            sys.exit(1)
+        if len(rvq_band_splits_arg) < 2:
+            print("--rvq-band-splits must contain at least two groups", file=sys.stderr)
+            sys.exit(1)
+        if sum(rvq_band_splits_arg) != args.n_codebooks:
+            print(
+                f"--rvq-band-splits must sum to --n-codebooks ({args.n_codebooks}), got {sum(rvq_band_splits_arg)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if bool(args.decoder_band_latent_split) and (rvq_band_splits_arg is None or len(rvq_band_splits_arg) != 3):
+        print("--decoder-band-latent-split requires --rvq-band-splits with exactly three groups", file=sys.stderr)
+        sys.exit(1)
 
-    if args.stft_scales:
+    if user_stft_scales and args.stft_scales:
         try:
             stft_scales_resolved = parse_stft_scales_arg(args.stft_scales)
         except ValueError as e:
@@ -1579,7 +3075,7 @@ def main() -> None:
         stft_scales_resolved = Config().stft_scales
 
     stft_scale_weights_resolved: tuple[float, ...] | None = None
-    if args.stft_scale_weights is not None:
+    if user_stft_weights and args.stft_scale_weights is not None:
         try:
             stft_scale_weights_resolved = parse_stft_scale_weights_arg(args.stft_scale_weights)
         except ValueError as e:
@@ -1592,6 +3088,8 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+    elif args.fast and not user_stft_scales:
+        stft_scale_weights_resolved = None
     else:
         stft_scale_weights_resolved = Config().stft_scale_weights
 
@@ -1616,23 +3114,66 @@ def main() -> None:
         ae_only=args.ae_only,
         enc_channels=enc_ch,
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
+        decoder_refine_blocks_per_scale=args.decoder_refine_blocks_per_scale,
         latent_dim=args.latent_dim,
         pre_vq_layernorm=args.pre_vq_layernorm,
         latent_temporal_depth=args.latent_temporal_depth,
         latent_temporal_post_depth=args.latent_temporal_post_depth,
+        self_attention_depth=args.self_attention_depth,
+        self_attention_post_depth=args.self_attention_post_depth,
+        self_attention_heads=args.self_attention_heads,
+        state_space_depth=args.state_space_depth,
+        state_space_post_depth=args.state_space_post_depth,
+        state_space_state_dim=args.state_space_state_dim,
+        state_space_expand=args.state_space_expand,
+        state_space_bidirectional=args.state_space_bidirectional,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
         codebook_sizes=codebook_sizes_arg,
+        rvq_band_splits=rvq_band_splits_arg,
+        turboquant=bool(args.turboquant),
+        turboquant_seed=int(args.turboquant_seed),
         lambda_time=args.lambda_time,
         lambda_stft=args.lambda_stft,
         lambda_stft_grad=args.lambda_stft_grad,
         lambda_stft_cos=args.lambda_stft_cos,
+        lambda_stft_excess=args.lambda_stft_excess,
+        stft_excess_margin=args.stft_excess_margin,
+        lambda_hf_under=args.lambda_hf_under,
+        lambda_hf_sc=args.lambda_hf_sc,
+        lambda_hf_complex=args.lambda_hf_complex,
+        hf_min_hz=args.hf_min_hz,
+        hf_gate_db=args.hf_gate_db,
+        hf_under_margin=args.hf_under_margin,
+        hf_peak_mask=args.hf_peak_mask,
+        lambda_peak_contrast=args.lambda_peak_contrast,
+        lambda_peak_mag=args.lambda_peak_mag,
+        peak_contrast_radius=args.peak_contrast_radius,
+        lambda_freq_ac=args.lambda_freq_ac,
+        freq_ac_min_hz=args.freq_ac_min_hz,
+        freq_ac_lags_hz=tuple(float(x) for x in freq_ac_lags_hz),
+        lambda_stationary_line=args.lambda_stationary_line,
+        stationary_line_min_hz=args.stationary_line_min_hz,
+        stationary_line_radius=args.stationary_line_radius,
+        stationary_line_margin=args.stationary_line_margin,
+        lambda_harmonic_f0=args.lambda_harmonic_f0,
+        lambda_harmonic_amp=args.lambda_harmonic_amp,
+        harmonic_f0_frame=args.harmonic_f0_frame,
+        harmonic_f0_hop=args.harmonic_f0_hop,
+        harmonic_f0_lags=tuple(int(x) for x in harmonic_f0_lags),
+        harmonic_voicing_threshold=args.harmonic_voicing_threshold,
+        hf_start_step=args.hf_start_step,
+        hf_ramp_steps=args.hf_ramp_steps,
         stft_grad_freq_weight=args.stft_grad_freq_weight,
         stft_grad_time_weight=args.stft_grad_time_weight,
         stft_ramp_steps=args.stft_ramp_steps,
         stft_ramp_start_frac=args.stft_ramp_start,
         stft_scales=stft_scales_resolved,
         stft_scale_weights=stft_scale_weights_resolved,
+        spectral_batch_items=args.spectral_batch_items,
+        spectral_loss_every=args.spectral_loss_every,
+        stft_large_min_fft=args.stft_large_min_fft,
+        stft_large_every=args.stft_large_every,
         stft_hf_emphasis=args.stft_hf_emphasis,
         mel_n_fft=args.mel_n_fft,
         mel_hop=args.mel_hop,
@@ -1642,6 +3183,10 @@ def main() -> None:
         lambda_mel_l1=args.lambda_mel_l1,
         lambda_mel_l2=args.lambda_mel_l2,
         lambda_vq=args.lambda_vq,
+        vq_loss=args.vq_loss,
+        vq_huber_delta=args.vq_huber_delta,
+        vq_loss_normalize=bool(args.vq_loss_normalize),
+        vq_loss_norm_eps=args.vq_loss_norm_eps,
         lambda_entropy=args.lambda_entropy,
         lambda_marginal=args.lambda_marginal,
         marginal_tau=args.marginal_tau,
@@ -1659,10 +3204,19 @@ def main() -> None:
         lambda_cos=args.lambda_cos,
         cos_hinge=args.cos_hinge,
         cos_target=args.cos_target,
+        lambda_sisdr=args.lambda_sisdr,
+        lambda_preemph=args.lambda_preemph,
+        preemph_coef=args.preemph_coef,
+        lambda_multidelta=args.lambda_multidelta,
+        multidelta_lags=multidelta_lags,
+        lambda_ae_anchor_time=args.lambda_ae_anchor_time,
+        lambda_ae_anchor_cos=args.lambda_ae_anchor_cos,
         lambda_sc=args.lambda_sc,
         lambda_complex_stft=args.lambda_complex_stft,
         log_every=args.log_every,
+        log_loss_ema_beta=args.log_loss_ema_beta,
         log_cos_ema_beta=args.log_cos_ema_beta,
+        best_holdout_metric=best_holdout_metric,
         spectrogram_every=args.spectrogram_every,
         spectrogram_dir=args.spectrogram_dir,
         save_audio=args.save_audio,
@@ -1675,12 +3229,50 @@ def main() -> None:
         activation=args.activation,
         rvq_code_dim=args.rvq_code_dim,
         vq_ema_decay=args.vq_ema_decay,
+        vq_ema_every=args.vq_ema_every,
         decoder_upsample=args.decoder_upsample,
+        decoder_transpose_kernel=args.decoder_transpose_kernel,
+        decoder_band_split=bool(args.decoder_band_split),
+        band_split_cutoffs_hz=(float(band_split_cutoffs[0]), float(band_split_cutoffs[1])),
+        band_split_taps=args.band_split_taps,
+        decoder_band_head_depth=args.decoder_band_head_depth,
+        decoder_band_latent_split=bool(args.decoder_band_latent_split),
+        decoder_harmonic_source=bool(args.decoder_harmonic_source),
+        decoder_harmonic_partials=args.decoder_harmonic_partials,
+        decoder_harmonic_fmin_hz=args.decoder_harmonic_fmin_hz,
+        decoder_harmonic_fmax_hz=args.decoder_harmonic_fmax_hz,
+        decoder_harmonic_gain=args.decoder_harmonic_gain,
+        decoder_harmonic_amp_bias=args.decoder_harmonic_amp_bias,
+        decoder_harmonic_rolloff=args.decoder_harmonic_rolloff,
+        decoder_harmonic_mode=args.decoder_harmonic_mode,
+        decoder_harmonic_control_smooth=args.decoder_harmonic_control_smooth,
+        decoder_harmonic_env_bias=args.decoder_harmonic_env_bias,
+        decoder_harmonic_band_weights=(
+            float(harmonic_band_weights[0]),
+            float(harmonic_band_weights[1]),
+            float(harmonic_band_weights[2]),
+        ),
+        decoder_harmonic_residual_band_weights=(
+            float(harmonic_residual_band_weights[0]),
+            float(harmonic_residual_band_weights[1]),
+            float(harmonic_residual_band_weights[2]),
+        ),
+        decoder_harmonic_groups=args.decoder_harmonic_groups,
+        decoder_harmonic_group_bias=args.decoder_harmonic_group_bias,
+        lambda_band_l1=args.lambda_band_l1,
+        band_l1_weights=(float(band_l1_weights[0]), float(band_l1_weights[1]), float(band_l1_weights[2])),
+        band_l1_floor=args.band_l1_floor,
+        lambda_band_branch_l1=args.lambda_band_branch_l1,
+        band_branch_weights=(float(band_branch_weights[0]), float(band_branch_weights[1]), float(band_branch_weights[2])),
         causal=bool(args.causal),
         use_bf16=bool(args.bf16),
         use_compile=bool(args.compile_loss),
         full_checkpoint=bool(args.full_checkpoint),
         eval_every=args.eval_every,
+        eval_clips=args.eval_clips,
+        eval_seconds=args.eval_seconds,
+        eval_dir=Path(args.eval_dir) if args.eval_dir else None,
+        eval_seed=args.eval_seed,
         log_mlx_tsv=args.log_mlx_tsv,
         results_tsv_path=args.results_tsv,
         adaptive_mode=args.adaptive_mode,
@@ -1821,6 +3413,15 @@ def main() -> None:
     stft_w_info = ""
     if cfg.stft_scale_weights is not None:
         stft_w_info = "  stft_w=" + ",".join(f"{w:g}" for w in cfg.stft_scale_weights)
+    spec_items = "all" if cfg.spectral_batch_items <= 0 else f"{cfg.spectral_batch_items}/micro"
+    spec_every = max(1, int(cfg.spectral_loss_every))
+    spec_every_info = "every step" if spec_every <= 1 else f"every {spec_every} steps ×{spec_every:g}"
+    if cfg.stft_large_min_fft <= 0:
+        large_info = "off"
+    elif cfg.stft_large_every <= 1:
+        large_info = f"nfft>={cfg.stft_large_min_fft} every step"
+    else:
+        large_info = f"nfft>={cfg.stft_large_min_fft} every {cfg.stft_large_every} steps"
     _ls = (cfg.lr_schedule or "").lower()
     if _ls in ("none", "constant", "off", ""):
         lr_info = f"lr={cfg.lr} (const)"
@@ -1861,30 +3462,117 @@ def main() -> None:
             f"  mel=nfft{cfg.mel_n_fft}/hop{cfg.mel_hop} M={cfg.n_mels} "
             f"[{cfg.mel_fmin:g}-{fmax_mel:g}]Hz  λ_mel_L1={cfg.lambda_mel_l1}  λ_mel_L2={cfg.lambda_mel_l2}"
         )
-    lt_pre_post = f"lat_tmp={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}"
+    lt_pre_post = (
+        f"lat_tmp={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}  "
+        f"self_attn={cfg.self_attention_depth}/{cfg.self_attention_post_depth}×h{cfg.self_attention_heads}  "
+        f"ssm={cfg.state_space_depth}/{cfg.state_space_post_depth}×S{cfg.state_space_state_dim}"
+        f"/e{cfg.state_space_expand}/{'bi' if cfg.state_space_bidirectional else 'uni'}"
+    )
     sc_info = f"  λ_sc={cfg.lambda_sc:g}" if cfg.lambda_sc > 0 else ""
     cx_info = f"  λ_cx={cfg.lambda_complex_stft:g}" if cfg.lambda_complex_stft > 0 else ""
+    excess_info = f"  λ_excess={cfg.lambda_stft_excess:g}@{cfg.stft_excess_margin:g}" if cfg.lambda_stft_excess > 0 else ""
+    peak_info = (
+        f"  λ_peak={cfg.lambda_peak_contrast:g}@r{cfg.peak_contrast_radius}"
+        if cfg.lambda_peak_contrast > 0
+        else ""
+    )
+    peak_mag_info = (
+        f"  λ_pmag={cfg.lambda_peak_mag:g}@r{cfg.peak_contrast_radius}"
+        if cfg.lambda_peak_mag > 0
+        else ""
+    )
+    freq_ac_info = (
+        f"  λ_fac={cfg.lambda_freq_ac:g}@≥{cfg.freq_ac_min_hz:g}Hz"
+        if cfg.lambda_freq_ac > 0
+        else ""
+    )
+    stationary_info = (
+        f"  λ_stat={cfg.lambda_stationary_line:g}@≥{cfg.stationary_line_min_hz:g}Hz/r{cfg.stationary_line_radius}/m{cfg.stationary_line_margin:g}"
+        if cfg.lambda_stationary_line > 0
+        else ""
+    )
+    harm_loss_info = (
+        f"  λ_hf0={cfg.lambda_harmonic_f0:g}  λ_hamp={cfg.lambda_harmonic_amp:g}"
+        f" acf={cfg.harmonic_f0_frame}/{cfg.harmonic_f0_hop}@thr{cfg.harmonic_voicing_threshold:g}"
+        if cfg.lambda_harmonic_f0 > 0 or cfg.lambda_harmonic_amp > 0
+        else ""
+    )
+    hf_info = ""
+    if cfg.lambda_hf_under > 0 or cfg.lambda_hf_sc > 0 or cfg.lambda_hf_complex > 0:
+        hf_info = (
+            f"  λ_hf_under={cfg.lambda_hf_under:g}  λ_hf_sc={cfg.lambda_hf_sc:g}  λ_hf_cx={cfg.lambda_hf_complex:g}  "
+            f"hf≥{cfg.hf_min_hz:g}Hz gate={cfg.hf_gate_db:g}dB margin={cfg.hf_under_margin:g}"
+            f"{' peak_mask' if cfg.hf_peak_mask else ''}"
+            f" start={cfg.hf_start_step} ramp={cfg.hf_ramp_steps}"
+        )
+    wave_info = ""
+    if (
+        cfg.lambda_sisdr > 0
+        or cfg.lambda_preemph > 0
+        or cfg.lambda_multidelta > 0
+        or cfg.lambda_ae_anchor_time > 0
+        or cfg.lambda_ae_anchor_cos > 0
+    ):
+        wave_info = (
+            f"  λ_sisdr={cfg.lambda_sisdr:g}  λ_pre={cfg.lambda_preemph:g}@{cfg.preemph_coef:g}  "
+            f"λ_md={cfg.lambda_multidelta:g}@{','.join(str(x) for x in cfg.multidelta_lags)}  "
+            f"λ_ae_anchor={cfg.lambda_ae_anchor_time:g}/{cfg.lambda_ae_anchor_cos:g}"
+        )
+    band_info = ""
+    if cfg.decoder_band_split or cfg.lambda_band_l1 > 0 or cfg.lambda_band_branch_l1 > 0:
+        band_info = (
+            f"  band_split={cfg.decoder_band_split}@{cfg.band_split_cutoffs_hz[0]:g},{cfg.band_split_cutoffs_hz[1]:g}Hz/"
+            f"{cfg.band_split_taps}t/head{cfg.decoder_band_head_depth}/lat{int(cfg.decoder_band_latent_split)}  λ_band_l1={cfg.lambda_band_l1:g}  "
+            f"band_w={','.join(f'{w:g}' for w in cfg.band_l1_weights)}  "
+            f"λ_band_br={cfg.lambda_band_branch_l1:g}  br_w={','.join(f'{w:g}' for w in cfg.band_branch_weights)} "
+            f"floor={cfg.band_l1_floor:g}"
+        )
+    harm_info = ""
+    if cfg.decoder_harmonic_source:
+        group_s = ""
+        if cfg.decoder_harmonic_groups > 0:
+            group_s = f"/G{cfg.decoder_harmonic_groups}@bias{cfg.decoder_harmonic_group_bias:g}"
+        harm_info = (
+            f"  harm_src=P{cfg.decoder_harmonic_partials}@{cfg.decoder_harmonic_fmin_hz:g}-"
+            f"{cfg.decoder_harmonic_fmax_hz:g}Hz×{cfg.decoder_harmonic_gain:g}/bias{cfg.decoder_harmonic_amp_bias:g}"
+            f"/roll{cfg.decoder_harmonic_rolloff:g}/mode={cfg.decoder_harmonic_mode}"
+            f"/smooth{cfg.decoder_harmonic_control_smooth}"
+            f"/band{','.join(f'{w:g}' for w in cfg.decoder_harmonic_band_weights)}"
+            f"/res{','.join(f'{w:g}' for w in cfg.decoder_harmonic_residual_band_weights)}"
+            f"/env_bias{cfg.decoder_harmonic_env_bias:g}{group_s}"
+        )
     _acm_p = max(1, int(cfg.grad_accum_steps))
     batch_info = (
         f"  batch={cfg.batch}×accum={_acm_p}→{cfg.batch * _acm_p}"
         if _acm_p > 1
         else f"  batch={cfg.batch}"
     )
+    rvq_group_info = ""
+    if cfg.rvq_band_splits:
+        rvq_group_info = f"/groups{','.join(str(int(x)) for x in cfg.rvq_band_splits)}"
+    vq_loss_info = f"{cfg.vq_loss}"
+    if str(cfg.vq_loss).lower() == "huber":
+        vq_loss_info = f"{vq_loss_info}@δ{cfg.vq_huber_delta:g}"
+    if cfg.vq_loss_normalize:
+        vq_loss_info = f"{vq_loss_info}/rms"
     print(
         f"Parameters: {n_params / 1e6:.2f}M{batch_info}  latent={cfg.latent_dim}  {lt_pre_post}  pre_vq_ln={cfg.pre_vq_layernorm}  enc_stride={st}×  "
-        f"s1/scale={cfg.stride1_blocks_per_scale}  "
+        f"s1/scale={cfg.stride1_blocks_per_scale}  dec_refine/scale={cfg.decoder_refine_blocks_per_scale}  "
+        f"dec_up={cfg.decoder_upsample}/k{cfg.decoder_transpose_kernel}{band_info}{harm_info}  "
         f"grad_clip={cfg.grad_clip_norm}  {lr_info}  "
         f"~{nom_kbps:.1f} kbps nominal  "
         f"STFT×{len(cfg.stft_scales)}: {stft_nfo}{stft_w_info}  stft_hf={cfg.stft_hf_emphasis:g}  "
-        f"λ_L1={cfg.lambda_time}  λ_stft={cfg.lambda_stft}  λ_stft_grad={cfg.lambda_stft_grad}{sc_info}{cx_info}  "
+        f"spectral_items={spec_items}  spectral_loss={spec_every_info}  large={large_info}  "
+        f"λ_L1={cfg.lambda_time}  λ_stft={cfg.lambda_stft}  λ_stft_grad={cfg.lambda_stft_grad}{sc_info}{cx_info}{excess_info}{peak_info}{peak_mag_info}{freq_ac_info}{stationary_info}{harm_loss_info}{hf_info}  "
         f"sgrad_df/dt={cfg.stft_grad_freq_weight}/{cfg.stft_grad_time_weight}  λ_stft_cos={cfg.lambda_stft_cos}  {ramp_s}"
-        f"RVQ={cfg.n_codebooks}×K={rvq_ks}  vq_cos={cfg.vq_cosine}  λ_vq={cfg.lambda_vq}  λ_ent={cfg.lambda_entropy}  "
+        f"RVQ={cfg.n_codebooks}×K={rvq_ks}{rvq_group_info}  vq_cos={cfg.vq_cosine}  turboquant={cfg.turboquant}  λ_vq={cfg.lambda_vq}  λ_ent={cfg.lambda_entropy}  "
         f"λ_marg={cfg.lambda_marginal}  τ_marg={cfg.marginal_tau}  "
         f"{'λ_marg_boost=' + str(cfg.marginal_boost_steps) + '@×' + str(cfg.marginal_boost_mult) + '→1  ' if cfg.marginal_boost_steps > 0 else ''}"
         f"vq_reset={cfg.vq_reset_every}@{cfg.vq_reset_collapse_frac}  "
         f"σ={cfg.vq_reset_noise}  shuffle={cfg.vq_reset_shuffle}  vq_km={cfg.vq_reset_kmeans}  "
         f"vq_full≤{cfg.vq_reset_full_refresh_max_unique}u→allK  vq_rst_log={cfg.vq_reset_log_every}  "
-        f"λ_cos={cfg.lambda_cos}  cos_hinge={cfg.cos_hinge}@{cfg.cos_target}"
+        f"vq_ema={cfg.vq_ema_decay:g}/{cfg.vq_ema_every}  vq_loss={vq_loss_info}  "
+        f"λ_cos={cfg.lambda_cos}  cos_hinge={cfg.cos_hinge}@{cfg.cos_target}{wave_info}"
         f"{mel_info}"
     )
     if cfg.causal:
@@ -1918,6 +3606,23 @@ def main() -> None:
     else:
         print("Using synthetic sine/noise batches")
 
+    eval_paths: list[Path] | None = None
+    if cfg.eval_dir is not None:
+        eval_root = Path(cfg.eval_dir).expanduser().resolve()
+        if not eval_root.is_dir():
+            print(f"Holdout eval dir missing: {eval_root}", file=sys.stderr)
+            sys.exit(1)
+        all_eval_paths = _collect_audio_paths(eval_root)
+        if not all_eval_paths:
+            print(f"No audio files (.wav/.flac/.ogg/.mp3) under holdout eval dir {eval_root}", file=sys.stderr)
+            sys.exit(1)
+        eval_paths = _select_eval_audio_paths(all_eval_paths, cfg)
+        seconds_s = "full files" if float(cfg.eval_seconds) <= 0 else f"{float(cfg.eval_seconds):g}s clips"
+        print(
+            f"Using {len(eval_paths)}/{len(all_eval_paths)} holdout eval files from {eval_root} "
+            f"({seconds_s}, seed={cfg.eval_seed})"
+        )
+
     t0 = time.time()
     acm = max(1, int(cfg.grad_accum_steps))
     if audio_paths is not None:
@@ -1928,7 +3633,11 @@ def main() -> None:
         )
     else:
         data_off = 0
+    ema_loss_v: float | None = None
+    ema_vq_v: float | None = None
     ema_cos_pct: float | None = None
+    best_holdout_metric = _canonical_eval_metric_name(cfg.best_holdout_metric)
+    best_holdout_value: float | None = None
 
     prof_on = bool(getattr(args, "profile", False))
     prof_acc: dict[str, float] = {}
@@ -2020,20 +3729,19 @@ def main() -> None:
         if grads_acc is None:
             print(f"  [skip] empty accum at step {step}", flush=True)
             continue
-        # Single sync at end of accum: evaluates loss + accumulated grads together.
-        _eval_loss_and_grad_tree(loss_acc, grads_acc)
-        lv_m_total = float(loss_acc.item())
+        # Single sync at end of accum: evaluates loss + accumulated grads + finite check together.
+        lv_m_total, bad_grad = _eval_loss_grad_and_nonfinite(loss_acc, grads_acc)
         if not math.isfinite(lv_m_total):
             print(f"  [skip] non-finite summed loss at step {step}", flush=True)
+            continue
+        if bad_grad:
+            print(f"  [skip] non-finite accumulated gradient at step {step}", flush=True)
             continue
         _ptoc("G_fwdbwd", _t_g)
 
         _t_misc = _ptic()
         lv0 = lv_m_total * inv_acm
         grads = grads_acc
-        if _grad_tree_any_nonfinite(grads):
-            print(f"  [skip] non-finite accumulated gradient at step {step}", flush=True)
-            continue
         if cfg.grad_clip_norm > 0:
             grads = clip_gradients_global_norm(grads, cfg.grad_clip_norm)
         _ptoc("clip", _t_misc)
@@ -2051,6 +3759,25 @@ def main() -> None:
             l_lin = fm.get("l_lin")
             l_sc = fm.get("l_sc")
             l_cx = fm.get("l_cx")
+            l_excess = fm.get("l_excess")
+            l_peak = fm.get("l_peak")
+            l_peak_mag = fm.get("l_peak_mag")
+            l_freq_ac = fm.get("l_freq_ac")
+            l_stationary = fm.get("l_stationary")
+            l_harm_f0 = fm.get("l_harm_f0")
+            l_harm_amp = fm.get("l_harm_amp")
+            harm_voice = fm.get("harm_voice")
+            l_hf_under = fm.get("l_hf_under")
+            l_hf_sc = fm.get("l_hf_sc")
+            l_hf_complex = fm.get("l_hf_complex")
+            hf_mult = fm.get("hf_mult")
+            l_sisdr = fm.get("l_sisdr")
+            l_preemph = fm.get("l_preemph")
+            l_multidelta = fm.get("l_multidelta")
+            l_band = fm.get("l_band")
+            l_band_branch = fm.get("l_band_branch")
+            ae_anchor = fm.get("ae_anchor")
+            spec_mult_m = fm.get("spec_mult")
             to_ev = [lt, ls, lsg, lsc, lm1, lm2, vq_l, ent_pos, marg_ent, cos_m]
             if isinstance(l_lin, mx.array):
                 to_ev.append(l_lin)
@@ -2058,6 +3785,44 @@ def main() -> None:
                 to_ev.append(l_sc)
             if isinstance(l_cx, mx.array):
                 to_ev.append(l_cx)
+            if isinstance(l_excess, mx.array):
+                to_ev.append(l_excess)
+            if isinstance(l_peak, mx.array):
+                to_ev.append(l_peak)
+            if isinstance(l_peak_mag, mx.array):
+                to_ev.append(l_peak_mag)
+            if isinstance(l_freq_ac, mx.array):
+                to_ev.append(l_freq_ac)
+            if isinstance(l_stationary, mx.array):
+                to_ev.append(l_stationary)
+            if isinstance(l_harm_f0, mx.array):
+                to_ev.append(l_harm_f0)
+            if isinstance(l_harm_amp, mx.array):
+                to_ev.append(l_harm_amp)
+            if isinstance(harm_voice, mx.array):
+                to_ev.append(harm_voice)
+            if isinstance(l_hf_under, mx.array):
+                to_ev.append(l_hf_under)
+            if isinstance(l_hf_sc, mx.array):
+                to_ev.append(l_hf_sc)
+            if isinstance(l_hf_complex, mx.array):
+                to_ev.append(l_hf_complex)
+            if isinstance(hf_mult, mx.array):
+                to_ev.append(hf_mult)
+            if isinstance(l_sisdr, mx.array):
+                to_ev.append(l_sisdr)
+            if isinstance(l_preemph, mx.array):
+                to_ev.append(l_preemph)
+            if isinstance(l_multidelta, mx.array):
+                to_ev.append(l_multidelta)
+            if isinstance(l_band, mx.array):
+                to_ev.append(l_band)
+            if isinstance(l_band_branch, mx.array):
+                to_ev.append(l_band_branch)
+            if isinstance(ae_anchor, mx.array):
+                to_ev.append(ae_anchor)
+            if isinstance(spec_mult_m, mx.array):
+                to_ev.append(spec_mult_m)
             mx.eval(*to_ev)
             util = _format_vq_util(idx, cb_sizes)
             cos_pct = 100.0 * float(cos_m.item())
@@ -2069,12 +3834,22 @@ def main() -> None:
                 cos_ema_extra = ""
             vq_v = float(vq_l.item())
             vq_s = f"{vq_v:.4f}" if vq_v >= 1e-3 else f"{vq_v:.4e}"
+            loss_ema_extra = ""
+            loss_beta = float(cfg.log_loss_ema_beta)
+            if loss_beta > 0.0:
+                loss_v = float(lv)
+                ema_loss_v = loss_v if ema_loss_v is None else loss_beta * ema_loss_v + (1.0 - loss_beta) * loss_v
+                ema_vq_v = vq_v if ema_vq_v is None else loss_beta * ema_vq_v + (1.0 - loss_beta) * vq_v
+                loss_ema_extra = f"  loss_ema={ema_loss_v:.4f}  vq_ema={ema_vq_v:.4f}"
             ent_extra = ""
             if cfg.lambda_entropy > 0:
                 ent_extra = f"  ent_pos={float(ent_pos.item()):.4f}"
-            w_stft = effective_lambda_stft(step, cfg)
+            spec_mult_v = float(spec_mult_m.item()) if isinstance(spec_mult_m, mx.array) else 1.0
+            w_stft = effective_lambda_stft(step, cfg) * spec_mult_v
             w_marg = effective_lambda_marginal(step, cfg)
             ramp_extra = f"  λ_stft_eff={w_stft:.4f}" if cfg.stft_ramp_steps > 0 else ""
+            if cfg.spectral_loss_every > 1:
+                ramp_extra = f"{ramp_extra}  spec×={spec_mult_v:g}/{cfg.spectral_loss_every}"
             if cfg.lambda_marginal > 0 and cfg.marginal_boost_steps > 0:
                 ramp_extra = f"{ramp_extra}  λ_m_eff={w_marg:.4f}"
             sgrad_extra = ""
@@ -2095,6 +3870,46 @@ def main() -> None:
             cx_extra = ""
             if cfg.lambda_complex_stft > 0 and isinstance(l_cx, mx.array):
                 cx_extra = f"  cx={float(l_cx.item()):.4f}"
+            excess_extra = ""
+            if cfg.lambda_stft_excess > 0 and isinstance(l_excess, mx.array):
+                excess_extra = f"  excess={float(l_excess.item()):.4f}"
+            peak_extra = ""
+            if cfg.lambda_peak_contrast > 0 and isinstance(l_peak, mx.array):
+                peak_extra = f"  peak={float(l_peak.item()):.4f}"
+            if cfg.lambda_peak_mag > 0 and isinstance(l_peak_mag, mx.array):
+                peak_extra = f"{peak_extra}  pmag={float(l_peak_mag.item()):.4f}"
+            if cfg.lambda_freq_ac > 0 and isinstance(l_freq_ac, mx.array):
+                peak_extra = f"{peak_extra}  fac={float(l_freq_ac.item()):.4f}"
+            if cfg.lambda_stationary_line > 0 and isinstance(l_stationary, mx.array):
+                peak_extra = f"{peak_extra}  stat={float(l_stationary.item()):.4f}"
+            if cfg.lambda_harmonic_f0 > 0 and isinstance(l_harm_f0, mx.array):
+                peak_extra = f"{peak_extra}  hf0={float(l_harm_f0.item()):.4f}"
+            if cfg.lambda_harmonic_amp > 0 and isinstance(l_harm_amp, mx.array):
+                peak_extra = f"{peak_extra}  hamp={float(l_harm_amp.item()):.4f}"
+            if (cfg.lambda_harmonic_f0 > 0 or cfg.lambda_harmonic_amp > 0) and isinstance(harm_voice, mx.array):
+                peak_extra = f"{peak_extra}  voice={100.0 * float(harm_voice.item()):.1f}%"
+            hf_extra = ""
+            if (cfg.lambda_hf_under > 0 or cfg.lambda_hf_sc > 0) and isinstance(hf_mult, mx.array):
+                hf_extra = f"{hf_extra}  λ_hf_eff={float(hf_mult.item()):.3f}"
+            if cfg.lambda_hf_under > 0 and isinstance(l_hf_under, mx.array):
+                hf_extra = f"{hf_extra}  hf_under={float(l_hf_under.item()):.4f}"
+            if cfg.lambda_hf_sc > 0 and isinstance(l_hf_sc, mx.array):
+                hf_extra = f"{hf_extra}  hf_sc={float(l_hf_sc.item()):.4f}"
+            if cfg.lambda_hf_complex > 0 and isinstance(l_hf_complex, mx.array):
+                hf_extra = f"{hf_extra}  hf_cx={float(l_hf_complex.item()):.4f}"
+            wave_extra = ""
+            if cfg.lambda_sisdr > 0 and isinstance(l_sisdr, mx.array):
+                wave_extra = f"{wave_extra}  sisdr_loss={float(l_sisdr.item()):.4f}"
+            if cfg.lambda_preemph > 0 and isinstance(l_preemph, mx.array):
+                wave_extra = f"{wave_extra}  pre={float(l_preemph.item()):.4f}"
+            if cfg.lambda_multidelta > 0 and isinstance(l_multidelta, mx.array):
+                wave_extra = f"{wave_extra}  md={float(l_multidelta.item()):.4f}"
+            if cfg.lambda_band_l1 > 0 and isinstance(l_band, mx.array):
+                wave_extra = f"{wave_extra}  band_l1={float(l_band.item()):.4f}"
+            if cfg.lambda_band_branch_l1 > 0 and isinstance(l_band_branch, mx.array):
+                wave_extra = f"{wave_extra}  band_br={float(l_band_branch.item()):.4f}"
+            if (cfg.lambda_ae_anchor_time > 0 or cfg.lambda_ae_anchor_cos > 0) and isinstance(ae_anchor, mx.array):
+                wave_extra = f"{wave_extra}  ae_anchor={float(ae_anchor.item()):.4f}"
             if callable(lr_spec):
                 tlr = lr_spec(opt.step)
                 mx.eval(tlr)
@@ -2111,61 +3926,31 @@ def main() -> None:
                 prof_count = 0
             print(
                 f"step {step:6d}/{cfg.steps}  loss={lv:.5f}  "
-                f"L1={float(lt.item()):.4f}  stft={float(ls.item()):.4f}{sgrad_extra}{scos_extra}{sc_extra}{cx_extra}{mel_extra}{lin_extra}  "
-                f"vq={vq_s}  marg_ent={float(marg_ent.item()):.4f}{ent_extra}{ramp_extra}  "
+                f"L1={float(lt.item()):.4f}  stft={float(ls.item()):.4f}{sgrad_extra}{scos_extra}{sc_extra}{cx_extra}{excess_extra}{peak_extra}{hf_extra}{mel_extra}{lin_extra}{wave_extra}  "
+                f"vq={vq_s}{loss_ema_extra}  marg_ent={float(marg_ent.item()):.4f}{ent_extra}{ramp_extra}  "
                 f"cos={cos_pct:.1f}%{cos_ema_extra}{util}  lr={lr_log:.2e}  "
                 f"{elapsed / (step - start_step + 1) * 1000:.1f} ms/step{prof_extra}",
                 flush=True,
             )
         _t_opt = _ptic()
         opt.update(model, grads)
+        # MLX is lazy: materialize the parameter + optimizer-state update here so the next
+        # forward does not inherit an ever-growing graph from prior steps.
+        mx.eval(model.parameters(), opt.state)
         _ptoc("optim", _t_opt)
-        if plateau_schedule is not None and step >= cfg.lr_warmup_steps:
+        plateau_active = cfg.spectral_loss_every <= 1 or spectral_loss_step_multiplier(step, cfg) > 0.0
+        if plateau_schedule is not None and step >= cfg.lr_warmup_steps and plateau_active:
             plateau_schedule.observe(lv0)
 
-        if 0.0 < float(cfg.vq_ema_decay) < 1.0 and not cfg.ae_only:
+        if (
+            0.0 < float(cfg.vq_ema_decay) < 1.0
+            and not cfg.ae_only
+            and step % int(cfg.vq_ema_every) == 0
+        ):
             _t_vqe = _ptic()
             update_vq_ema_codebooks(model, batch0, cfg)
             mx.eval(model.parameters())
             _ptoc("vq_ema", _t_vqe)
-
-        if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0:
-            try:
-                import numpy as np
-            except ImportError:
-                np = None  # type: ignore
-            if np is not None:
-                y_ev, _, _, _, idx_ev = model.forward_full(batch0)
-                mx.eval(y_ev)
-                o = np.array(batch0[0, :, 0], dtype=np.float64)
-                r = np.array(y_ev[0, :, 0], dtype=np.float64)
-                sisdr = eval_metrics_mod.si_sdr_db(o, r)
-                pesq_v = eval_metrics_mod.pesq_wb_16k(o, r)
-                pesq_s = f"{pesq_v:.3f}" if pesq_v is not None else "na"
-                print(f"  [eval] SI-SDR={sisdr:.2f} dB  PESQ_wb={pesq_s}", flush=True)
-                if cfg.log_mlx_tsv:
-                    p = Path(cfg.log_mlx_tsv)
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    hdr = not p.is_file()
-                    with p.open("a") as f:
-                        if hdr:
-                            f.write("step\tsisdr_db\tpesq_wb\n")
-                        f.write(f"{step}\t{sisdr:.6f}\t{pesq_s}\n")
-                if idx_ev is not None and len(idx_ev) > 0:
-                    sizes = effective_codebook_sizes(cfg)
-                    h_stages: list[float] = []
-                    for si, ix in enumerate(idx_ev):
-                        mx.eval(ix)
-                        kk = sizes[si] if si < len(sizes) else sizes[-1]
-                        row = [int(x) for x in np.array(ix).ravel().tolist()]
-                        h_stages.append(entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(row, kk))
-                    h_mean = sum(h_stages) / float(len(h_stages))
-                    fps = cfg.sample_rate / float(encoder_time_stride(cfg))
-                    idx_bps = h_mean * fps * float(len(idx_ev))
-                    print(
-                        f"  [entropy] RVQ mean H={h_mean:.3f} b/sym  ~{idx_bps:.0f} b/s empirical index (vs nominal)",
-                        flush=True,
-                    )
 
         if (
             cfg.vq_reset_every > 0
@@ -2183,6 +3968,55 @@ def main() -> None:
                     parts = [f"s{i}={c}" for i, c in enumerate(per_st) if c > 0]
                     extra = f" ({', '.join(parts)})" if parts else ""
                     print(f"  [vq-reset] replaced {n_reset} dead codes{extra}", flush=True)
+
+        if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0:
+            try:
+                import numpy as np
+
+                if eval_paths is not None:
+                    summary = _holdout_eval_summary(model, cfg, eval_paths)
+                    print(_format_eval_summary("eval-holdout", summary), flush=True)
+                    _append_eval_tsv(cfg.log_mlx_tsv, step, "holdout", summary)
+                    metric_v = summary.get(best_holdout_metric)
+                    if metric_v is not None:
+                        mv = float(metric_v)
+                        if _is_better_eval_value(mv, best_holdout_value, best_holdout_metric):
+                            prev_v = best_holdout_value
+                            best_holdout_value = mv
+                            _write_best_holdout_marker(
+                                cfg,
+                                step=step,
+                                metric=best_holdout_metric,
+                                value=mv,
+                                previous=prev_v,
+                                summary=summary,
+                            )
+                            prev_s = "none" if prev_v is None else _fmt_eval_metric(prev_v)
+                            print(
+                                f"  [best-holdout] {best_holdout_metric}={_fmt_eval_metric(mv)} "
+                                f"(prev={prev_s}) step={step} marker={Path(cfg.checkpoint_dir) / 'best_holdout.json'}",
+                                flush=True,
+                            )
+                else:
+                    y_ev, _, _, _, idx_ev = model.forward_full(batch0)
+                    to_eval: list[mx.array] = [y_ev]
+                    if idx_ev is not None:
+                        to_eval.extend(idx_ev)
+                    mx.eval(*to_eval)
+                    o = np.array(batch0[0, :, 0], dtype=np.float64)
+                    r = np.array(y_ev[0, :, 0], dtype=np.float64)
+                    summary = eval_metrics_mod.quality_metrics_16k(o, r)
+                    h_mean, idx_bps = None, None
+                    if idx_ev is not None and len(idx_ev) > 0:
+                        code_rows = [[int(x) for x in np.array(ix).ravel().tolist()] for ix in idx_ev]
+                        h_mean, idx_bps = _rvq_entropy_summary(cfg, code_rows)
+                    summary["rvq_h_mean_bits_sym"] = h_mean
+                    summary["empirical_index_bps"] = idx_bps
+                    summary["n"] = 1
+                    print(_format_eval_summary("train-probe", summary), flush=True)
+                    _append_eval_tsv(cfg.log_mlx_tsv, step, "train_probe", summary)
+            except Exception as e:
+                print(f"  [eval-warn] {type(e).__name__}: {e}", flush=True)
 
         if cfg.checkpoint_every > 0 and step > 0:
             if step % cfg.checkpoint_every == 0 or step == cfg.steps - 1:

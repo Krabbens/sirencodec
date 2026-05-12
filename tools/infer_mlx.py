@@ -291,15 +291,19 @@ def infer_waveform(
 
 
 def main() -> None:
-    tm = _load_train_mlx()
     import numpy as np
 
     repo = Path(__file__).resolve().parents[1]
+    src_dir = repo / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    from sirencodec.config import Config, parse_codebook_sizes_arg
+
     p = argparse.ArgumentParser(description="MLX codec: load .npz checkpoint, reconstruct WAV")
     p.add_argument("checkpoint", type=Path, help="codec_step*.npz from train_mlx")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--input", "-i", type=Path, help="Input .wav / .flac / .ogg / .mp3 (any file you choose)")
-    src.add_argument(
+    source_group = p.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--input", "-i", type=Path, help="Input .wav / .flac / .ogg / .mp3 (any file you choose)")
+    source_group.add_argument(
         "--random-dev",
         action="store_true",
         help=(
@@ -307,7 +311,7 @@ def main() -> None:
             "Note: train_mlx --librispeech still samples from the whole tree, so overlap is likely."
         ),
     )
-    src.add_argument(
+    source_group.add_argument(
         "--random-test-clean",
         action="store_true",
         help=(
@@ -341,7 +345,7 @@ def main() -> None:
         help="Directory for *_orig.wav and *_recon.wav",
     )
     p.add_argument("--ae-only", action="store_true", help="Checkpoint trained without VQ")
-    dcfg = tm.Config()
+    dcfg = Config()
     p.add_argument(
         "--enc-channels",
         type=str,
@@ -361,6 +365,34 @@ def main() -> None:
         default=dcfg.pre_vq_layernorm,
         help="Must match training (--pre-vq-layernorm / --no-pre-vq-layernorm)",
     )
+    p.add_argument("--self-attention-depth", type=int, default=dcfg.self_attention_depth, help="Must match training")
+    p.add_argument(
+        "--self-attention-post-depth",
+        type=int,
+        default=dcfg.self_attention_post_depth,
+        help="Must match training",
+    )
+    p.add_argument("--self-attention-heads", type=int, default=dcfg.self_attention_heads, help="Must match training")
+    p.add_argument("--state-space-depth", type=int, default=dcfg.state_space_depth, help="Must match training")
+    p.add_argument(
+        "--state-space-post-depth",
+        type=int,
+        default=dcfg.state_space_post_depth,
+        help="Must match training",
+    )
+    p.add_argument(
+        "--state-space-state-dim",
+        type=int,
+        default=dcfg.state_space_state_dim,
+        help="Must match training",
+    )
+    p.add_argument("--state-space-expand", type=int, default=dcfg.state_space_expand, help="Must match training")
+    p.add_argument(
+        "--state-space-bidirectional",
+        action=argparse.BooleanOptionalAction,
+        default=dcfg.state_space_bidirectional,
+        help="Must match training",
+    )
     p.add_argument("--n-codebooks", type=int, default=dcfg.n_codebooks, help="Must match training")
     p.add_argument("--codebook-size", type=int, default=dcfg.codebook_size, help="Must match training (if uniform K)")
     p.add_argument(
@@ -375,6 +407,18 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=dcfg.vq_cosine,
         help="Must match training (Euclidean RVQ checkpoints: --no-vq-cosine)",
+    )
+    p.add_argument(
+        "--turboquant",
+        action=argparse.BooleanOptionalAction,
+        default=dcfg.turboquant,
+        help="Must match training when fixed TurboQuant RVQ rotations were enabled",
+    )
+    p.add_argument(
+        "--turboquant-seed",
+        type=int,
+        default=dcfg.turboquant_seed,
+        help="Must match training TurboQuant rotation seed",
     )
     p.add_argument("--max-seconds", type=float, default=None, help="Trim input to this many seconds")
     p.add_argument(
@@ -427,10 +471,34 @@ def main() -> None:
     if len(enc_ch) < 1:
         print("--enc-channels invalid", file=sys.stderr)
         sys.exit(1)
+    if args.self_attention_depth < 0 or args.self_attention_post_depth < 0:
+        print("--self-attention-depth and --self-attention-post-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.self_attention_heads < 1:
+        print("--self-attention-heads must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.state_space_depth < 0 or args.state_space_post_depth < 0:
+        print("--state-space-depth and --state-space-post-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.state_space_state_dim < 1:
+        print("--state-space-state-dim must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.state_space_expand < 1:
+        print("--state-space-expand must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if (args.self_attention_depth > 0 or args.self_attention_post_depth > 0) and args.latent_dim % args.self_attention_heads != 0:
+        print("--latent-dim must be divisible by --self-attention-heads when SelfAttention1D is enabled", file=sys.stderr)
+        sys.exit(1)
+    if args.self_attention_depth > 0 and args.state_space_depth > 0:
+        print("--self-attention-depth and --state-space-depth are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    if args.self_attention_post_depth > 0 and args.state_space_post_depth > 0:
+        print("--self-attention-post-depth and --state-space-post-depth are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
     cb_sizes_infer: tuple[int, ...] | None = None
     if args.codebook_sizes:
         try:
-            cb_sizes_infer = tm.parse_codebook_sizes_arg(args.codebook_sizes)
+            cb_sizes_infer = parse_codebook_sizes_arg(args.codebook_sizes)
         except ValueError as e:
             print(f"--codebook-sizes: {e}", file=sys.stderr)
             sys.exit(1)
@@ -440,17 +508,28 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-    cfg = tm.Config(
+    cfg = Config(
         enc_channels=enc_ch,
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
         latent_dim=args.latent_dim,
         pre_vq_layernorm=args.pre_vq_layernorm,
+        self_attention_depth=args.self_attention_depth,
+        self_attention_post_depth=args.self_attention_post_depth,
+        self_attention_heads=args.self_attention_heads,
+        state_space_depth=args.state_space_depth,
+        state_space_post_depth=args.state_space_post_depth,
+        state_space_state_dim=args.state_space_state_dim,
+        state_space_expand=args.state_space_expand,
+        state_space_bidirectional=args.state_space_bidirectional,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
         codebook_sizes=cb_sizes_infer,
         vq_cosine=args.vq_cosine,
+        turboquant=bool(args.turboquant),
+        turboquant_seed=int(args.turboquant_seed),
         ae_only=bool(args.ae_only),
     )
+    tm = _load_train_mlx()
     model = tm.MLXCodec(cfg)
     try:
         model.load_weights(str(ck))

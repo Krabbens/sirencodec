@@ -8,19 +8,23 @@ dependencies = [
     "numpy",
     "soundfile",
     "matplotlib",
-    "torch",
-    "torchaudio",
+    "torch; platform_system != 'Darwin'",
+    "torchaudio; platform_system != 'Darwin'",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+mlx = ["mlx; platform_system == 'Darwin' and platform_machine == 'arm64'"]
 
 [project.scripts]
 train = "sirencodec.cuda.train:main"
+train-cuda = "sirencodec.cuda.train:main"
+train-cuda-full = "sirencodec.cuda.train:main"
+train-mlx = "sirencodec.mlx.train:main"
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-torchaudio = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cu130", marker = "platform_system != 'Darwin'" }
+torchaudio = { index = "pytorch-cu130", marker = "platform_system != 'Darwin'" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

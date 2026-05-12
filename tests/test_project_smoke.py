@@ -83,6 +83,8 @@ def test_argparse_defaults_cover_current_config():
     assert defaults["lambda_preemph"] == Config().lambda_preemph
     assert defaults["lambda_fm"] == Config().lambda_fm
     assert defaults["disc_periods"] == ",".join(str(x) for x in Config().disc_periods)
+    assert defaults["self_attention_depth"] == Config().self_attention_depth
+    assert defaults["self_attention_heads"] == Config().self_attention_heads
 
 
 def test_stft_parsers_accept_valid_values_and_reject_bad_ones():
@@ -452,7 +454,7 @@ def test_sub1k_template_resolves_to_strong_spectral_loss():
     assert effective_codebook_sizes(cfg) == effective_codebook_sizes(base_cfg)
     base_params = sum(p.numel() for p in CUDACodec(base_cfg).parameters())
     wide_params = sum(p.numel() for p in CUDACodec(cfg).parameters())
-    assert wide_params / base_params == pytest.approx(2.93, rel=0.03)
+    assert wide_params / base_params == pytest.approx(2.56, rel=0.03)
 
 
 def test_sub1k_semantic_ft_30_template_matches_trunk_plus_semantic():

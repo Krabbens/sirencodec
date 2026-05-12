@@ -35,6 +35,7 @@ RUN uv sync --frozen --python python3
 COPY . .
 
 RUN install -m 0755 scripts/docker_git_sync.sh /usr/local/bin/sirencodec-sync \
+    && install -m 0755 scripts/download_train_clean_100.sh /usr/local/bin/download-train-clean-100 \
     && install -m 0755 scripts/download_train_clean_360.sh /usr/local/bin/download-train-clean-360 \
     && git lfs install --system --skip-repo \
     && git config --global --add safe.directory /workspace \
