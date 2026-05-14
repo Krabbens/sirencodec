@@ -17,7 +17,8 @@ def synth_batch(cfg: Config, key: int) -> mx.array:
     mx.random.seed(key)
     b, t = cfg.batch, cfg.segment
     t_ax = mx.arange(t, dtype=mx.float32)[None, :, None] / float(cfg.sample_rate)
-    freqs = mx.random.uniform(low=80.0, high=2000.0, shape=(b, 1, 1))
+    f_hi = max(90.0, min(2000.0, 0.45 * float(cfg.sample_rate)))
+    freqs = mx.random.uniform(low=80.0, high=f_hi, shape=(b, 1, 1))
     phases = mx.random.uniform(low=0.0, high=6.28318, shape=(b, 1, 1))
     x = mx.sin(2.0 * math.pi * freqs * t_ax + phases)
     x = x + 0.05 * mx.random.normal(shape=(b, t, 1))
@@ -38,6 +39,30 @@ _SKIP_PATH_PARTS = frozenset(
         ".tox",
     }
 )
+
+
+def _resample_np(wav, sr: int, target_sr: int):
+    import numpy as np
+
+    sr = int(sr)
+    target_sr = int(target_sr)
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if sr == target_sr or wav.size == 0:
+        return wav.astype(np.float32, copy=False)
+    try:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        g = gcd(sr, target_sr)
+        return resample_poly(wav, target_sr // g, sr // g).astype(np.float32)
+    except Exception:
+        n_new = max(1, int(round(wav.size * float(target_sr) / float(sr))))
+        return np.interp(
+            np.linspace(0, wav.size - 1, num=n_new, endpoint=True),
+            np.arange(wav.size),
+            wav,
+        ).astype(np.float32)
 
 
 def _skip_audio_path(p: Path) -> bool:
@@ -91,14 +116,13 @@ def _load_audio_row_np(
             "Could not read any audio file (all failed open/read). "
             "Check --data-dir and that files are valid wav/flac/ogg/mp3."
         )
-    wav = wav[:, 0].astype(np.float32)
+    if sr != sample_rate:
+        wav = _resample_np(wav[:, 0], sr, sample_rate)
+    else:
+        wav = wav[:, 0].astype(np.float32)
     if wav.size < need:
         wav = np.pad(wav, (0, need - wav.size))
-    if sr != sample_rate:
-        t_new = np.linspace(0, 1, num=need, endpoint=False)
-        wav = np.interp(t_new * wav.size, np.arange(wav.size), wav).astype(np.float32)
-    else:
-        wav = wav[:need]
+    wav = wav[:need]
     m = float(np.max(np.abs(wav))) + 1e-5
     return row_i, (wav[:need] / m).astype(np.float32)
 
@@ -146,18 +170,17 @@ def _load_audio_viz_clip(cfg: Config, paths: list[Path], step: int, n_samples: i
             idx = (idx + 1) % n
     if wav is None:
         raise RuntimeError("Could not read any file for spectrogram viz.")
-    wav = wav[:, 0].astype(np.float32)
+    if sr != cfg.sample_rate:
+        wav = _resample_np(wav[:, 0], sr, cfg.sample_rate)
+    else:
+        wav = wav[:, 0].astype(np.float32)
     if wav.size < n_samples:
         wav = np.pad(wav, (0, n_samples - wav.size))
-    if sr != cfg.sample_rate:
-        t_new = np.linspace(0, 1, num=n_samples, endpoint=False)
-        wav = np.interp(t_new * wav.size, np.arange(wav.size), wav).astype(np.float32)
+    if wav.size > n_samples:
+        start = (step * 11003) % max(1, wav.size - n_samples + 1)
+        wav = wav[start : start + n_samples]
     else:
-        if wav.size > n_samples:
-            start = (step * 11003) % max(1, wav.size - n_samples + 1)
-            wav = wav[start : start + n_samples]
-        else:
-            wav = wav[:n_samples]
+        wav = wav[:n_samples]
     m = float(np.max(np.abs(wav))) + 1e-5
     wav = (wav[:n_samples] / m).astype(np.float32)
     return mx.array(wav.reshape(1, n_samples, 1))
@@ -167,10 +190,10 @@ def synth_viz_clip(cfg: Config, key: int, n_samples: int) -> mx.array:
     """Synthetic [1, n_samples, 1] for viz when no --data-dir."""
     mx.random.seed(key)
     t_ax = mx.arange(n_samples, dtype=mx.float32)[None, :, None] / float(cfg.sample_rate)
-    freqs = mx.random.uniform(low=80.0, high=2000.0, shape=(1, 1, 1))
+    f_hi = max(90.0, min(2000.0, 0.45 * float(cfg.sample_rate)))
+    freqs = mx.random.uniform(low=80.0, high=f_hi, shape=(1, 1, 1))
     phases = mx.random.uniform(low=0.0, high=6.28318, shape=(1, 1, 1))
     x = mx.sin(2.0 * math.pi * freqs * t_ax + phases)
     x = x + 0.05 * mx.random.normal(shape=(1, n_samples, 1))
     m = mx.max(mx.abs(x), axis=1, keepdims=True) + 1e-5
     return x / m
-

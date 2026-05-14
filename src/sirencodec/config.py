@@ -433,6 +433,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         stft_w = ",".join(str(float(x)) for x in c.stft_scale_weights)
     d: dict[str, object] = {
         "enc_channels": ",".join(str(x) for x in c.enc_channels),
+        "sample_rate": c.sample_rate,
         "steps": c.steps,
         "batch": c.batch,
         "grad_accum_steps": c.grad_accum_steps,
