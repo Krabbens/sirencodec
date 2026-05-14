@@ -69,6 +69,7 @@ from ..config import (
     mean_log_codebook_for_entropy,
     nominal_rvq_kbps,
     parse_codebook_sizes_arg,
+    parse_positive_int_list_arg,
     parse_stft_scales_arg,
     parse_stft_scale_weights_arg,
 )
@@ -82,12 +83,137 @@ from .data import (
 from .losses import (
     mel_filterbank_mx,
     mel_log_bin_losses,
+    multi_stft_band_excess,
     multi_stft_complex_l1,
     multi_stft_loss,
     multi_stft_mag_l1_linear,
     multi_stft_spectral_convergence,
     multi_stft_spectral_terms,
 )
+
+
+class MlxContentVecSemanticTeacher:
+    """Frozen ContentVec/HuBERT feature loss implemented natively in MLX."""
+
+    def __init__(self, *, model_name: str, layers: tuple[int, ...], sample_rate: int):
+        if int(sample_rate) != 16_000:
+            raise ValueError("MLX ContentVec semantic teacher expects 16 kHz audio")
+        model_key = str(model_name).strip()
+        model_alias = model_key.lower().replace("-", "_")
+        if model_alias in {"hubert_base", "contentvec", "contentvec_base", "mlx_contentvec"}:
+            repo_id = "lexandstuff/mlx-contentvec"
+        elif "/" in model_key:
+            repo_id = model_key
+        else:
+            raise ValueError(
+                f"unknown MLX semantic model {model_name!r}; use HUBERT_BASE, CONTENTVEC, or a HuggingFace repo id"
+            )
+        from mlx_contentvec import ContentvecModel
+
+        self.model_name = model_key
+        self.repo_id = repo_id
+        self.layers = tuple(sorted(set(int(x) for x in layers)))
+        if not self.layers:
+            raise ValueError("semantic layers cannot be empty")
+        if min(self.layers) < 1:
+            raise ValueError("semantic layers must be 1-based positive integers")
+        if max(self.layers) > 12:
+            raise ValueError("mlx-contentvec base exposes layers 1..12")
+        self.model = ContentvecModel.from_pretrained(repo_id=repo_id)
+        self.model.eval()
+
+    @staticmethod
+    def _wave(x: mx.array) -> mx.array:
+        return x[..., 0] if len(x.shape) == 3 else x
+
+    def _features(self, x: mx.array, layer: int) -> mx.array:
+        return self.model(self._wave(x), output_layer=int(layer), mask=False, features_only=True)["x"]
+
+    def loss(self, reference: mx.array, estimate: mx.array, *, max_items: int) -> tuple[mx.array, mx.array, int]:
+        batch = int(estimate.shape[0])
+        n = min(batch, max(1, int(max_items)))
+        ref = reference[:n]
+        est = estimate[:n]
+        total = mx.array(0.0, dtype=mx.float32)
+        total_cos = mx.array(0.0, dtype=mx.float32)
+        for layer in self.layers:
+            ref_feat = mx.stop_gradient(self._features(ref, layer))
+            est_feat = self._features(est, layer)
+            t = min(int(ref_feat.shape[1]), int(est_feat.shape[1]))
+            ref_feat = ref_feat[:, :t, :]
+            est_feat = est_feat[:, :t, :]
+            dot = mx.sum(ref_feat * est_feat, axis=-1)
+            ref_norm = mx.sqrt(mx.sum(ref_feat * ref_feat, axis=-1) + 1e-8)
+            est_norm = mx.sqrt(mx.sum(est_feat * est_feat, axis=-1) + 1e-8)
+            cos = mx.mean(dot / (ref_norm * est_norm))
+            total = total + (1.0 - cos)
+            total_cos = total_cos + cos
+        denom = float(max(1, len(self.layers)))
+        loss = total / denom
+        mean_cos = total_cos / denom
+        return loss, mx.stop_gradient(mean_cos), int(n)
+
+    def latent_targets(
+        self,
+        reference: mx.array,
+        *,
+        max_items: int,
+        target_frames: int,
+    ) -> tuple[mx.array, int]:
+        """Frozen semantic frames resized to the codec latent frame count."""
+        batch = int(reference.shape[0])
+        n = min(batch, max(1, int(max_items)))
+        ref = reference[:n]
+        target_frames = max(1, int(target_frames))
+        total: mx.array | None = None
+        for layer in self.layers:
+            feat = mx.stop_gradient(self._features(ref, layer))
+            t_src = int(feat.shape[1])
+            if t_src != target_frames:
+                idx = mx.floor(
+                    mx.arange(target_frames, dtype=mx.float32) * (float(t_src) / float(target_frames))
+                ).astype(mx.int32)
+                feat = mx.take(feat, idx, axis=1)
+            total = feat if total is None else total + feat
+        out = total / float(max(1, len(self.layers))) if total is not None else mx.zeros((n, target_frames, 1))
+        return mx.stop_gradient(out), int(n)
+
+    def gradient(
+        self,
+        reference: mx.array,
+        estimate: mx.array,
+        *,
+        max_items: int,
+        clip_value: float,
+    ) -> tuple[mx.array, mx.array, mx.array, int, dict[str, mx.array]]:
+        def _loss_for_estimate(est: mx.array) -> mx.array:
+            loss, _, _ = self.loss(reference, est, max_items=max_items)
+            return loss
+
+        raw_grad = mx.grad(_loss_for_estimate)(estimate)
+        batch = int(estimate.shape[0])
+        n = min(batch, max(1, int(max_items)))
+        g_used = raw_grad[:n]
+        bad = mx.logical_or(mx.isnan(g_used), mx.isinf(g_used))
+        bad_count = mx.sum(bad)
+        grad = mx.where(mx.logical_or(mx.isnan(raw_grad), mx.isinf(raw_grad)), mx.zeros_like(raw_grad), raw_grad)
+        clip = float(max(0.0, clip_value))
+        if clip > 0.0:
+            clipped = mx.abs(grad[:n]) > clip
+            clip_frac = mx.mean(clipped.astype(mx.float32))
+            grad = mx.clip(grad, -clip, clip)
+        else:
+            clip_frac = mx.array(0.0, dtype=mx.float32)
+        flat = grad[:n].reshape(n, -1)
+        per_item_l2 = mx.sqrt(mx.sum(flat * flat, axis=1) + 1e-12)
+        stats = {
+            "semantic_grad_l2_mean": mx.stop_gradient(mx.mean(per_item_l2)),
+            "semantic_grad_l2_max": mx.stop_gradient(mx.max(per_item_l2)),
+            "semantic_grad_clip_frac": mx.stop_gradient(clip_frac),
+            "semantic_grad_bad_count": mx.stop_gradient(bad_count),
+        }
+        loss, cos, n = self.loss(reference, mx.stop_gradient(estimate), max_items=max_items)
+        return mx.stop_gradient(grad), mx.stop_gradient(loss), mx.stop_gradient(cos), n, stats
 
 
 # 5. Train step (closure over batch)
@@ -170,6 +296,35 @@ def effective_lambda_marginal(step: int, cfg: Config) -> float:
     return cfg.lambda_marginal * scale
 
 
+def effective_lambda_semantic(run_step: int, cfg: Config) -> float:
+    if cfg.lambda_semantic <= 0:
+        return 0.0
+    if cfg.semantic_ramp_steps <= 0:
+        return float(cfg.lambda_semantic)
+    t = min(1.0, max(0.0, float(run_step) / float(cfg.semantic_ramp_steps)))
+    return float(cfg.lambda_semantic) * t
+
+
+def effective_lambda_latent_semantic(run_step: int, cfg: Config) -> float:
+    if cfg.lambda_latent_semantic <= 0:
+        return 0.0
+    start = max(0, int(getattr(cfg, "latent_semantic_start_step", 0)))
+    if run_step < start:
+        return 0.0
+    local_step = run_step - start
+    if cfg.latent_semantic_ramp_steps <= 0:
+        return float(cfg.lambda_latent_semantic)
+    t = min(1.0, max(0.0, float(local_step) / float(cfg.latent_semantic_ramp_steps)))
+    return float(cfg.lambda_latent_semantic) * t
+
+
+def encoded_frame_count(num_samples: int, cfg: Config) -> int:
+    n = max(1, int(num_samples))
+    for _ in cfg.enc_channels:
+        n = (n + 1) // 2
+    return max(1, n)
+
+
 def batch_mean_cosine(orig: mx.array, recon: mx.array) -> mx.array:
     """Mean cosine similarity in [-1, 1] over batch (each item flattened)."""
     b = orig.shape[0]
@@ -190,6 +345,16 @@ def make_train_fn(
     mel_fb: mx.array | None = None,
     *,
     compiled_multi_stft: Callable[[mx.array, mx.array], mx.array] | None = None,
+    semantic_teacher: MlxContentVecSemanticTeacher | None = None,
+    semantic_grad: mx.array | None = None,
+    semantic_loss_value: mx.array | None = None,
+    semantic_cos: mx.array | float = 0.0,
+    semantic_items: int = 0,
+    semantic_weight: float | None = None,
+    semantic_grad_stats: dict[str, mx.array] | None = None,
+    latent_semantic_target: mx.array | None = None,
+    latent_semantic_weight: float = 0.0,
+    latent_semantic_items: int = 0,
 ):
     """Return a zero-arg loss for nn.value_and_grad(model, loss_fn).
 
@@ -201,7 +366,11 @@ def make_train_fn(
     forward_metrics: dict = {}
 
     def loss_fn(m: MLXCodec) -> mx.array:
-        y_hat, vq_l, ent_pos, marg_ent, idx = m.forward_full(batch)
+        if latent_semantic_target is not None and latent_semantic_weight > 0:
+            y_hat, vq_l, ent_pos, marg_ent, idx, z_bottleneck = m.forward_full_with_latent(batch)
+        else:
+            y_hat, vq_l, ent_pos, marg_ent, idx = m.forward_full(batch)
+            z_bottleneck = None
         lt = mx.mean(mx.abs(y_hat - batch))
         if cfg.lambda_stft_grad > 0 or cfg.lambda_stft_cos > 0:
             ls, lsg, lsc = multi_stft_spectral_terms(
@@ -263,6 +432,20 @@ def make_train_fn(
                 scale_weights=cfg.stft_scale_weights,
             )
             total = total + ls_w * cfg.lambda_complex_stft * l_cx
+        l_band = mx.array(0.0)
+        if cfg.lambda_stft_band_excess > 0:
+            l_band = multi_stft_band_excess(
+                y_hat,
+                batch,
+                cfg.stft_scales,
+                sample_rate=cfg.sample_rate,
+                margin=cfg.stft_band_excess_margin,
+                fmin=cfg.stft_band_excess_fmin,
+                fmax=cfg.stft_band_excess_fmax,
+                hf_emphasis=cfg.stft_hf_emphasis,
+                scale_weights=cfg.stft_scale_weights,
+            )
+            total = total + ls_w * cfg.lambda_stft_band_excess * l_band
         # Diversity as non-negative penalty (same ∂/∂θ as −λ·H when H<log K): push H → log K
         log_k = mean_log_codebook_for_entropy(cfg)
         log_k_mx = mx.array(log_k, dtype=mx.float32)
@@ -277,6 +460,21 @@ def make_train_fn(
         if cfg.cos_hinge > 0:
             gap = mx.maximum(mx.array(0.0), mx.array(cfg.cos_target, dtype=mx.float32) - cos)
             total = total + cfg.cos_hinge * gap
+        l_lat_sem = mx.array(0.0, dtype=mx.float32)
+        lat_sem_cos = mx.array(0.0, dtype=mx.float32)
+        lat_sem_items = int(latent_semantic_items)
+        if latent_semantic_target is not None and latent_semantic_weight > 0 and z_bottleneck is not None:
+            pred = m.semantic_from_latent(z_bottleneck[:lat_sem_items])
+            tgt = mx.stop_gradient(latent_semantic_target[:lat_sem_items])
+            t = min(int(pred.shape[1]), int(tgt.shape[1]))
+            d = min(int(pred.shape[2]), int(tgt.shape[2]))
+            pred = pred[:, :t, :d]
+            tgt = tgt[:, :t, :d]
+            pred_n = pred / mx.sqrt(mx.sum(pred * pred, axis=-1, keepdims=True) + 1e-8)
+            tgt_n = tgt / mx.sqrt(mx.sum(tgt * tgt, axis=-1, keepdims=True) + 1e-8)
+            lat_sem_cos = mx.mean(mx.sum(pred_n * tgt_n, axis=-1))
+            l_lat_sem = 1.0 - lat_sem_cos
+            total = total + float(latent_semantic_weight) * l_lat_sem
         lm1 = mx.array(0.0)
         lm2 = mx.array(0.0)
         if mel_fb is not None and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0):
@@ -288,6 +486,30 @@ def make_train_fn(
                 cfg.mel_hop,
             )
             total = total + ls_w * (cfg.lambda_mel_l1 * lm1 + cfg.lambda_mel_l2 * lm2)
+        l_sem = mx.array(0.0, dtype=mx.float32)
+        sem_cos: mx.array | float = semantic_cos
+        sem_items = int(semantic_items)
+        sem_w = float(cfg.lambda_semantic if semantic_weight is None else semantic_weight)
+        if semantic_grad is not None and sem_w > 0:
+            sem_dot = mx.sum(y_hat * mx.stop_gradient(semantic_grad))
+            sem_base = (
+                semantic_loss_value
+                if isinstance(semantic_loss_value, mx.array)
+                else mx.array(0.0, dtype=mx.float32)
+            )
+            l_sem = mx.stop_gradient(sem_base) + (sem_dot - mx.stop_gradient(sem_dot))
+            total = total + sem_w * l_sem
+        elif (
+            semantic_teacher is not None
+            and sem_w > 0
+            and step % max(1, int(cfg.semantic_every)) == 0
+        ):
+            l_sem, sem_cos, sem_items = semantic_teacher.loss(
+                batch,
+                y_hat,
+                max_items=cfg.semantic_batch_items,
+            )
+            total = total + sem_w * l_sem
         forward_metrics.clear()
         forward_metrics.update(
             lt=lt,
@@ -296,6 +518,7 @@ def make_train_fn(
             lsc=lsc,
             l_sc=l_sc,
             l_cx=l_cx,
+            l_band=l_band,
             l_lin=l_lin,
             lm1=lm1,
             lm2=lm2,
@@ -304,6 +527,34 @@ def make_train_fn(
             marg_ent=marg_ent,
             cos_m=cos,
             idx=idx,
+            l_sem=l_sem,
+            sem_cos=sem_cos,
+            sem_items=int(sem_items),
+            sem_weight=mx.array(sem_w, dtype=mx.float32),
+            sem_grad_l2_mean=(
+                semantic_grad_stats["semantic_grad_l2_mean"]
+                if semantic_grad_stats is not None
+                else mx.array(0.0, dtype=mx.float32)
+            ),
+            sem_grad_l2_max=(
+                semantic_grad_stats["semantic_grad_l2_max"]
+                if semantic_grad_stats is not None
+                else mx.array(0.0, dtype=mx.float32)
+            ),
+            sem_grad_clip_frac=(
+                semantic_grad_stats["semantic_grad_clip_frac"]
+                if semantic_grad_stats is not None
+                else mx.array(0.0, dtype=mx.float32)
+            ),
+            sem_grad_bad_count=(
+                semantic_grad_stats["semantic_grad_bad_count"]
+                if semantic_grad_stats is not None
+                else mx.array(0.0, dtype=mx.float32)
+            ),
+            l_lat_sem=l_lat_sem,
+            lat_sem_cos=mx.stop_gradient(lat_sem_cos),
+            lat_sem_items=int(lat_sem_items),
+            lat_sem_weight=mx.array(float(latent_semantic_weight), dtype=mx.float32),
         )
         return total
 
@@ -683,6 +934,8 @@ def _remap_legacy_codec_subdict(sub: dict[str, mx.array], module: MLXCodec) -> t
     out = dict(sub)
     n_moved = 0
     for k in list(out.keys()):
+        if k in tgt_shapes and tuple(out[k].shape) == tgt_shapes[k]:
+            continue
         m_e = _LEGACY_ENC_LAYERS.match(k)
         if m_e:
             idx, suf = m_e.group(1), m_e.group(2)
@@ -719,6 +972,39 @@ def _remap_legacy_codec_subdict(sub: dict[str, mx.array], module: MLXCodec) -> t
     return out, n_moved
 
 
+def _shape_compatible_weight_items(module: nn.Module, flat: dict[str, mx.array]) -> list[tuple[str, mx.array]]:
+    """Keep only checkpoint tensors that exist in ``module`` with the same shape.
+
+    MLX ``strict=False`` can still assign a tensor with a different first dimension
+    to an embedding parameter. That silently breaks architecture A/B tests such as
+    changing per-stage codebook sizes, so filter explicitly before fallback loads.
+    """
+    tgt_shapes = {k: tuple(v.shape) for k, v in dict(tree_flatten(module.parameters())).items()}
+    out: list[tuple[str, mx.array]] = []
+    skipped_shape: list[str] = []
+    skipped_unknown = 0
+    for k, v in flat.items():
+        if not isinstance(v, mx.array):
+            continue
+        tgt = tgt_shapes.get(k)
+        if tgt is None:
+            skipped_unknown += 1
+            continue
+        src = tuple(v.shape)
+        if src != tgt:
+            skipped_shape.append(f"{k}:{src}->{tgt}")
+            continue
+        out.append((k, v))
+    if skipped_shape or skipped_unknown:
+        shown = ", ".join(skipped_shape[:8])
+        extra = ""
+        if len(skipped_shape) > 8:
+            extra = f", ... +{len(skipped_shape) - 8} shape"
+        unk = f", {skipped_unknown} unknown" if skipped_unknown else ""
+        print(f"[resume] skipped incompatible tensors: {shown}{extra}{unk}", flush=True)
+    return out
+
+
 def _load_weights_prefix(module: nn.Module, flat: dict[str, mx.array], prefix: str) -> None:
     pl = len(prefix)
     sub = {k[pl:]: v for k, v in flat.items() if k.startswith(prefix) and isinstance(v, mx.array)}
@@ -736,9 +1022,9 @@ def _load_weights_prefix(module: nn.Module, flat: dict[str, mx.array], prefix: s
                 f"[resume] remapped {n_rem} legacy ``encoder.layers``/``decoder.layers`` keys → ``_b``/``_d``",
                 flush=True,
             )
-        module.load_weights(list(sub2.items()), strict=False)
+        module.load_weights(_shape_compatible_weight_items(module, sub2), strict=False)
     else:
-        module.load_weights(list(sub.items()), strict=False)
+        module.load_weights(_shape_compatible_weight_items(module, sub), strict=False)
 
 
 def _load_optimizer_prefix(opt: Adam, flat: dict[str, mx.array], prefix: str) -> None:
@@ -1062,6 +1348,64 @@ def main() -> None:
         help="Same temporal stack on quantized z_q before decoder (0=off)",
     )
     p.add_argument(
+        "--self-attention-depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Transformer self-attention blocks on latents before RVQ (0=off)",
+    )
+    p.add_argument(
+        "--self-attention-post-depth",
+        type=int,
+        default=0,
+        metavar="M",
+        help="Transformer self-attention blocks on quantized z_q before decoder (0=off)",
+    )
+    p.add_argument("--self-attention-heads", type=int, default=8, metavar="H")
+    p.add_argument(
+        "--decoder-refine-depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Residual temporal refinement blocks on final decoder features (0=off)",
+    )
+    p.add_argument("--decoder-refine-gain", type=float, default=0.1, metavar="G")
+    p.add_argument(
+        "--decoder-band-heads",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Total decoder waveform heads; >1 adds residual multi-band heads while preserving the base head",
+    )
+    p.add_argument("--decoder-band-depth", type=int, default=1, metavar="N")
+    p.add_argument("--decoder-band-gain", type=float, default=0.08, metavar="G")
+    p.add_argument(
+        "--post-lavasr-depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="LavaSR-style post-waveform refiner depth after decoder output (0=off; preserves RVQ bitrate)",
+    )
+    p.add_argument("--post-lavasr-channels", type=int, default=24, metavar="C")
+    p.add_argument("--post-lavasr-kernel", type=int, default=15, metavar="K")
+    p.add_argument("--post-lavasr-gain", type=float, default=0.03, metavar="G")
+    p.add_argument(
+        "--post-lavasr-highpass",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only add high-passed post-refiner residual, preserving low-band decoder output",
+    )
+    p.add_argument(
+        "--harmonic-source",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add learned differentiable harmonic excitation branch to decoder",
+    )
+    p.add_argument("--harmonic-harmonics", type=int, default=8, metavar="N")
+    p.add_argument("--harmonic-amp", type=float, default=0.05, metavar="G")
+    p.add_argument("--harmonic-f0-min", type=float, default=50.0, metavar="HZ")
+    p.add_argument("--harmonic-f0-max", type=float, default=650.0, metavar="HZ")
+    p.add_argument(
         "--n-codebooks",
         type=int,
         default=3,
@@ -1306,12 +1650,56 @@ def main() -> None:
         metavar="λ",
         help="Extra mean L1 on linear STFT magnitudes (same scales as log-STFT; 0=off)",
     )
+    p.add_argument("--lambda-stft-band-excess", type=float, default=0.0, help="Penalize persistent target-relative log-STFT excess per frequency band (horizontal stripe suppressor)")
+    p.add_argument("--stft-band-excess-margin", type=float, default=0.15, help="Log-magnitude margin before --lambda-stft-band-excess activates")
+    p.add_argument("--stft-band-excess-fmin", type=float, default=1200.0, help="Low edge in Hz for --lambda-stft-band-excess")
+    p.add_argument("--stft-band-excess-fmax", type=float, default=0.0, help="High edge in Hz for --lambda-stft-band-excess (0=Nyquist)")
+    p.add_argument("--lambda-semantic", type=float, default=0.0, help="MLX ContentVec/HuBERT semantic feature loss weight (0=off)")
+    p.add_argument("--semantic-model", type=str, default="HUBERT_BASE", help="HUBERT_BASE/CONTENTVEC alias or HuggingFace repo id for mlx-contentvec weights")
+    p.add_argument("--semantic-layers", type=str, default="9", help="1-based HuBERT layers, comma-separated")
+    p.add_argument("--semantic-batch-items", type=int, default=1, help="How many batch items receive semantic teacher loss")
+    p.add_argument("--semantic-every", type=int, default=1, help="Apply semantic loss every N optimizer steps")
+    p.add_argument("--semantic-ramp-steps", type=int, default=0, help="Ramp semantic loss from 0 to --lambda-semantic over this many run-local steps")
+    p.add_argument("--semantic-grad-clip", type=float, default=10.0, help="Elementwise clip value for injected semantic waveform gradient (0=off)")
+    p.add_argument("--semantic-grad-clip-abort-pct", type=float, default=0.0, help="Abort if semantic gradient clipping exceeds this percent for consecutive log rows (0=off)")
+    p.add_argument("--semantic-grad-clip-abort-logs", type=int, default=3, help="Consecutive logged rows over clip threshold before aborting")
+    p.add_argument(
+        "--lambda-latent-semantic",
+        type=float,
+        default=0.0,
+        help="Auxiliary cosine loss: predict frozen ContentVec/HuBERT frames from RVQ bottleneck z_q",
+    )
+    p.add_argument(
+        "--latent-semantic-ramp-steps",
+        type=int,
+        default=0,
+        help="Ramp latent semantic loss from 0 to --lambda-latent-semantic over this many run-local steps",
+    )
+    p.add_argument(
+        "--latent-semantic-start-step",
+        type=int,
+        default=0,
+        help="Delay latent semantic loss until this run-local optimizer step",
+    )
+    p.add_argument(
+        "--latent-semantic-dim",
+        type=int,
+        default=768,
+        help="Dimension of teacher semantic frames predicted by z_q head",
+    )
     p.add_argument(
         "--activation",
         type=str,
         default="gelu",
         choices=("gelu", "snake", "snake_beta"),
         help="Encoder/decoder nonlinearity (snake/snake_beta = DAC-style periodic)",
+    )
+    p.add_argument(
+        "--decoder-activation",
+        type=str,
+        default=None,
+        choices=("gelu", "snake", "snake_beta"),
+        help="Decoder-only nonlinearity override; default keeps --activation",
     )
     p.add_argument(
         "--rvq-code-dim",
@@ -1510,6 +1898,18 @@ def main() -> None:
     if args.stft_hf_emphasis < 0:
         print("--stft-hf-emphasis must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.lambda_stft_band_excess < 0:
+        print("--lambda-stft-band-excess must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.stft_band_excess_margin < 0:
+        print("--stft-band-excess-margin must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.stft_band_excess_fmin < 0 or args.stft_band_excess_fmax < 0:
+        print("--stft-band-excess-fmin and --stft-band-excess-fmax must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.stft_band_excess_fmax > 0 and args.stft_band_excess_fmax <= args.stft_band_excess_fmin:
+        print("--stft-band-excess-fmax must be > --stft-band-excess-fmin, or 0 for Nyquist", file=sys.stderr)
+        sys.exit(1)
     if args.lambda_mel_l1 < 0 or args.lambda_mel_l2 < 0:
         print("--lambda-mel-l1 and --lambda-mel-l2 must be >= 0", file=sys.stderr)
         sys.exit(1)
@@ -1546,11 +1946,97 @@ def main() -> None:
     if args.latent_temporal_depth < 0 or args.latent_temporal_post_depth < 0:
         print("--latent-temporal-depth and --latent-temporal-post-depth must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.self_attention_depth < 0 or args.self_attention_post_depth < 0:
+        print("--self-attention-depth and --self-attention-post-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.self_attention_heads < 1:
+        print("--self-attention-heads must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if (
+        (args.self_attention_depth > 0 or args.self_attention_post_depth > 0)
+        and args.latent_dim % args.self_attention_heads != 0
+    ):
+        print("--latent-dim must be divisible by --self-attention-heads", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_refine_depth < 0:
+        print("--decoder-refine-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_refine_gain < 0:
+        print("--decoder-refine-gain must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_band_heads < 1:
+        print("--decoder-band-heads must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_band_depth < 0:
+        print("--decoder-band-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_band_gain < 0:
+        print("--decoder-band-gain must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.post_lavasr_depth < 0:
+        print("--post-lavasr-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.post_lavasr_channels < 1:
+        print("--post-lavasr-channels must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.post_lavasr_kernel < 3:
+        print("--post-lavasr-kernel must be >= 3", file=sys.stderr)
+        sys.exit(1)
+    if args.post_lavasr_gain < 0:
+        print("--post-lavasr-gain must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.harmonic_harmonics < 1:
+        print("--harmonic-harmonics must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.harmonic_amp < 0:
+        print("--harmonic-amp must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.harmonic_f0_min <= 0 or args.harmonic_f0_max <= args.harmonic_f0_min:
+        print("--harmonic-f0-min/max must be positive and min < max", file=sys.stderr)
+        sys.exit(1)
     if args.lambda_sc < 0:
         print("--lambda-sc must be >= 0", file=sys.stderr)
         sys.exit(1)
     if args.lambda_complex_stft < 0:
         print("--lambda-complex-stft must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_semantic < 0:
+        print("--lambda-semantic must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.semantic_batch_items < 1:
+        print("--semantic-batch-items must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.semantic_every < 1:
+        print("--semantic-every must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.semantic_ramp_steps < 0:
+        print("--semantic-ramp-steps must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.semantic_grad_clip < 0:
+        print("--semantic-grad-clip must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.semantic_grad_clip_abort_pct < 0:
+        print("--semantic-grad-clip-abort-pct must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.semantic_grad_clip_abort_logs < 1:
+        print("--semantic-grad-clip-abort-logs must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_latent_semantic < 0:
+        print("--lambda-latent-semantic must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.latent_semantic_start_step < 0:
+        print("--latent-semantic-start-step must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.latent_semantic_ramp_steps < 0:
+        print("--latent-semantic-ramp-steps must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.latent_semantic_dim < 1:
+        print("--latent-semantic-dim must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    try:
+        semantic_layers_arg = parse_positive_int_list_arg(args.semantic_layers)
+    except ValueError as e:
+        print(f"--semantic-layers: {e}", file=sys.stderr)
         sys.exit(1)
 
     codebook_sizes_arg: tuple[int, ...] | None = None
@@ -1620,6 +2106,24 @@ def main() -> None:
         pre_vq_layernorm=args.pre_vq_layernorm,
         latent_temporal_depth=args.latent_temporal_depth,
         latent_temporal_post_depth=args.latent_temporal_post_depth,
+        self_attention_depth=args.self_attention_depth,
+        self_attention_post_depth=args.self_attention_post_depth,
+        self_attention_heads=args.self_attention_heads,
+        decoder_refine_depth=args.decoder_refine_depth,
+        decoder_refine_gain=args.decoder_refine_gain,
+        decoder_band_heads=args.decoder_band_heads,
+        decoder_band_depth=args.decoder_band_depth,
+        decoder_band_gain=args.decoder_band_gain,
+        post_lavasr_depth=args.post_lavasr_depth,
+        post_lavasr_channels=args.post_lavasr_channels,
+        post_lavasr_kernel=args.post_lavasr_kernel,
+        post_lavasr_gain=args.post_lavasr_gain,
+        post_lavasr_highpass=bool(args.post_lavasr_highpass),
+        harmonic_source=bool(args.harmonic_source),
+        harmonic_harmonics=args.harmonic_harmonics,
+        harmonic_amp=args.harmonic_amp,
+        harmonic_f0_min=args.harmonic_f0_min,
+        harmonic_f0_max=args.harmonic_f0_max,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
         codebook_sizes=codebook_sizes_arg,
@@ -1634,6 +2138,10 @@ def main() -> None:
         stft_scales=stft_scales_resolved,
         stft_scale_weights=stft_scale_weights_resolved,
         stft_hf_emphasis=args.stft_hf_emphasis,
+        lambda_stft_band_excess=args.lambda_stft_band_excess,
+        stft_band_excess_margin=args.stft_band_excess_margin,
+        stft_band_excess_fmin=args.stft_band_excess_fmin,
+        stft_band_excess_fmax=args.stft_band_excess_fmax,
         mel_n_fft=args.mel_n_fft,
         mel_hop=args.mel_hop,
         n_mels=args.n_mels,
@@ -1661,6 +2169,19 @@ def main() -> None:
         cos_target=args.cos_target,
         lambda_sc=args.lambda_sc,
         lambda_complex_stft=args.lambda_complex_stft,
+        lambda_semantic=args.lambda_semantic,
+        semantic_model=args.semantic_model,
+        semantic_layers=semantic_layers_arg,
+        semantic_batch_items=args.semantic_batch_items,
+        semantic_every=args.semantic_every,
+        semantic_ramp_steps=args.semantic_ramp_steps,
+        semantic_grad_clip=args.semantic_grad_clip,
+        semantic_grad_clip_abort_pct=args.semantic_grad_clip_abort_pct,
+        semantic_grad_clip_abort_logs=args.semantic_grad_clip_abort_logs,
+        lambda_latent_semantic=args.lambda_latent_semantic,
+        latent_semantic_start_step=args.latent_semantic_start_step,
+        latent_semantic_ramp_steps=args.latent_semantic_ramp_steps,
+        latent_semantic_dim=args.latent_semantic_dim,
         log_every=args.log_every,
         log_cos_ema_beta=args.log_cos_ema_beta,
         spectrogram_every=args.spectrogram_every,
@@ -1673,6 +2194,7 @@ def main() -> None:
         use_librispeech=bool(args.librispeech),
         lambda_mag_l1=args.lambda_mag_l1,
         activation=args.activation,
+        decoder_activation=args.decoder_activation,
         rvq_code_dim=args.rvq_code_dim,
         vq_ema_decay=args.vq_ema_decay,
         decoder_upsample=args.decoder_upsample,
@@ -1748,7 +2270,7 @@ def main() -> None:
                         flush=True,
                     )
                 try:
-                    model.load_weights(list(flat2.items()), strict=False)
+                    model.load_weights(_shape_compatible_weight_items(model, flat2), strict=False)
                 except Exception as e2:
                     print(f"load_weights failed: {e}", file=sys.stderr)
                     print(f"  after legacy key remap + strict=False: {e2}", file=sys.stderr)
@@ -1861,9 +2383,62 @@ def main() -> None:
             f"  mel=nfft{cfg.mel_n_fft}/hop{cfg.mel_hop} M={cfg.n_mels} "
             f"[{cfg.mel_fmin:g}-{fmax_mel:g}]Hz  λ_mel_L1={cfg.lambda_mel_l1}  λ_mel_L2={cfg.lambda_mel_l2}"
         )
-    lt_pre_post = f"lat_tmp={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}"
+    semantic_teacher: MlxContentVecSemanticTeacher | None = None
+    semantic_info = ""
+    if cfg.lambda_semantic > 0 or cfg.lambda_latent_semantic > 0:
+        try:
+            print(
+                f"[semantic] loading MLX ContentVec/HuBERT teacher {cfg.semantic_model} "
+                f"layers={','.join(str(x) for x in cfg.semantic_layers)}",
+                flush=True,
+            )
+            semantic_teacher = MlxContentVecSemanticTeacher(
+                model_name=cfg.semantic_model,
+                layers=cfg.semantic_layers,
+                sample_rate=cfg.sample_rate,
+            )
+        except Exception as e:
+            print(f"failed to initialize MLX semantic teacher {cfg.semantic_model}: {e}", file=sys.stderr)
+            sys.exit(1)
+        sem_parts = []
+        if cfg.lambda_semantic > 0:
+            sem_parts.append(
+                f"sem=mlx-contentvec/{cfg.semantic_model} "
+                f"L{','.join(str(x) for x in cfg.semantic_layers)} "
+                f"λ_sem={cfg.lambda_semantic:g} ramp={cfg.semantic_ramp_steps} "
+                f"subset={cfg.semantic_batch_items} every={cfg.semantic_every} "
+                f"sg_clip={cfg.semantic_grad_clip:g} abort>{cfg.semantic_grad_clip_abort_pct:g}%"
+            )
+        if cfg.lambda_latent_semantic > 0:
+            sem_parts.append(
+                f"zsem=mlx-contentvec/{cfg.semantic_model} "
+                f"L{','.join(str(x) for x in cfg.semantic_layers)} "
+                f"λ_zsem={cfg.lambda_latent_semantic:g} start={cfg.latent_semantic_start_step} "
+                f"ramp={cfg.latent_semantic_ramp_steps} "
+                f"D={cfg.latent_semantic_dim} subset={cfg.semantic_batch_items} every={cfg.semantic_every}"
+            )
+        semantic_info = "  " + "  ".join(sem_parts)
+    lt_pre_post = (
+        f"lat_tmp={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}  "
+        f"self_attn={cfg.self_attention_depth}/{cfg.self_attention_post_depth}×h{cfg.self_attention_heads}"
+    )
+    dec_arch = (
+        f"dec_refine={cfg.decoder_refine_depth}@{cfg.decoder_refine_gain:g}  "
+        f"bands={cfg.decoder_band_heads}x{cfg.decoder_band_depth}@{cfg.decoder_band_gain:g}  "
+        f"post_lava={cfg.post_lavasr_depth}x{cfg.post_lavasr_channels}"
+        f"/k{cfg.post_lavasr_kernel}@{cfg.post_lavasr_gain:g}"
+        f"{'+hp' if cfg.post_lavasr_highpass else '+full'}  "
+        f"harm={'on' if cfg.harmonic_source else 'off'}({cfg.harmonic_harmonics}h,{cfg.harmonic_amp:g})"
+    )
+    dec_act = cfg.decoder_activation or cfg.activation
     sc_info = f"  λ_sc={cfg.lambda_sc:g}" if cfg.lambda_sc > 0 else ""
     cx_info = f"  λ_cx={cfg.lambda_complex_stft:g}" if cfg.lambda_complex_stft > 0 else ""
+    band_info = (
+        f"  λ_band={cfg.lambda_stft_band_excess:g}@{cfg.stft_band_excess_margin:g}"
+        f"[{cfg.stft_band_excess_fmin:g}-{cfg.stft_band_excess_fmax or cfg.sample_rate / 2:g}]Hz"
+        if cfg.lambda_stft_band_excess > 0
+        else ""
+    )
     _acm_p = max(1, int(cfg.grad_accum_steps))
     batch_info = (
         f"  batch={cfg.batch}×accum={_acm_p}→{cfg.batch * _acm_p}"
@@ -1872,11 +2447,11 @@ def main() -> None:
     )
     print(
         f"Parameters: {n_params / 1e6:.2f}M{batch_info}  latent={cfg.latent_dim}  {lt_pre_post}  pre_vq_ln={cfg.pre_vq_layernorm}  enc_stride={st}×  "
-        f"s1/scale={cfg.stride1_blocks_per_scale}  "
+        f"s1/scale={cfg.stride1_blocks_per_scale}  act={cfg.activation}/{dec_act}  {dec_arch}  "
         f"grad_clip={cfg.grad_clip_norm}  {lr_info}  "
         f"~{nom_kbps:.1f} kbps nominal  "
         f"STFT×{len(cfg.stft_scales)}: {stft_nfo}{stft_w_info}  stft_hf={cfg.stft_hf_emphasis:g}  "
-        f"λ_L1={cfg.lambda_time}  λ_stft={cfg.lambda_stft}  λ_stft_grad={cfg.lambda_stft_grad}{sc_info}{cx_info}  "
+        f"λ_L1={cfg.lambda_time}  λ_stft={cfg.lambda_stft}  λ_stft_grad={cfg.lambda_stft_grad}{sc_info}{cx_info}{band_info}  "
         f"sgrad_df/dt={cfg.stft_grad_freq_weight}/{cfg.stft_grad_time_weight}  λ_stft_cos={cfg.lambda_stft_cos}  {ramp_s}"
         f"RVQ={cfg.n_codebooks}×K={rvq_ks}  vq_cos={cfg.vq_cosine}  λ_vq={cfg.lambda_vq}  λ_ent={cfg.lambda_entropy}  "
         f"λ_marg={cfg.lambda_marginal}  τ_marg={cfg.marginal_tau}  "
@@ -1885,7 +2460,7 @@ def main() -> None:
         f"σ={cfg.vq_reset_noise}  shuffle={cfg.vq_reset_shuffle}  vq_km={cfg.vq_reset_kmeans}  "
         f"vq_full≤{cfg.vq_reset_full_refresh_max_unique}u→allK  vq_rst_log={cfg.vq_reset_log_every}  "
         f"λ_cos={cfg.lambda_cos}  cos_hinge={cfg.cos_hinge}@{cfg.cos_target}"
-        f"{mel_info}"
+        f"{mel_info}{semantic_info}"
     )
     if cfg.causal:
         tms = streaming_mod.benchmark_causal_latency_ms(sample_rate=cfg.sample_rate, chunk_ms=20.0)
@@ -1933,6 +2508,7 @@ def main() -> None:
     prof_on = bool(getattr(args, "profile", False))
     prof_acc: dict[str, float] = {}
     prof_count = 0
+    sem_clip_bad_logs = 0
 
     def _psync(*arrs):
         if prof_on and arrs:
@@ -1959,6 +2535,8 @@ def main() -> None:
         data_off += cfg.batch
 
     for step in range(start_step, cfg.steps):
+        semantic_weight = effective_lambda_semantic(step - start_step, cfg)
+        latent_semantic_weight = effective_lambda_latent_semantic(step - start_step, cfg)
         _t_data = _ptic()
         if audio_paths is not None:
             if prefetch_future is not None:
@@ -1998,6 +2576,38 @@ def main() -> None:
             if micro > 0 and audio_paths is not None:
                 data_off += cfg.batch
             batch = b
+            sem_grad = None
+            sem_loss_value = None
+            sem_cos_value: mx.array | float = 0.0
+            sem_items = 0
+            sem_grad_stats = None
+            lat_sem_target = None
+            lat_sem_items = 0
+            if (
+                semantic_teacher is not None
+                and semantic_weight > 0
+                and step % max(1, int(cfg.semantic_every)) == 0
+            ):
+                y_sem = model.forward_reconstruction_only(b)
+                sem_grad, sem_loss_value, sem_cos_value, sem_items, sem_grad_stats = semantic_teacher.gradient(
+                    b,
+                    y_sem,
+                    max_items=cfg.semantic_batch_items,
+                    clip_value=cfg.semantic_grad_clip,
+                )
+                mx.eval(sem_grad, sem_loss_value, sem_cos_value, *sem_grad_stats.values())
+            if (
+                semantic_teacher is not None
+                and latent_semantic_weight > 0
+                and step % max(1, int(cfg.semantic_every)) == 0
+            ):
+                target_frames = encoded_frame_count(int(b.shape[1]), cfg)
+                lat_sem_target, lat_sem_items = semantic_teacher.latent_targets(
+                    b,
+                    max_items=cfg.semantic_batch_items,
+                    target_frames=target_frames,
+                )
+                mx.eval(lat_sem_target)
             loss_fn = make_train_fn(
                 model,
                 cfg,
@@ -2005,6 +2615,15 @@ def main() -> None:
                 step,
                 mel_fb_mx,
                 compiled_multi_stft=compiled_multi_stft,
+                semantic_grad=sem_grad,
+                semantic_loss_value=sem_loss_value,
+                semantic_cos=sem_cos_value,
+                semantic_items=sem_items,
+                semantic_weight=semantic_weight,
+                semantic_grad_stats=sem_grad_stats,
+                latent_semantic_target=lat_sem_target,
+                latent_semantic_weight=latent_semantic_weight,
+                latent_semantic_items=lat_sem_items,
             )
             lg = nn.value_and_grad(model, loss_fn)
             loss, grads = lg(model)
@@ -2051,6 +2670,17 @@ def main() -> None:
             l_lin = fm.get("l_lin")
             l_sc = fm.get("l_sc")
             l_cx = fm.get("l_cx")
+            l_band = fm.get("l_band")
+            l_sem = fm.get("l_sem")
+            sem_cos_m = fm.get("sem_cos")
+            sem_w_m = fm.get("sem_weight")
+            sem_grad_l2_mean = fm.get("sem_grad_l2_mean")
+            sem_grad_l2_max = fm.get("sem_grad_l2_max")
+            sem_grad_clip_frac = fm.get("sem_grad_clip_frac")
+            sem_grad_bad_count = fm.get("sem_grad_bad_count")
+            l_lat_sem = fm.get("l_lat_sem")
+            lat_sem_cos_m = fm.get("lat_sem_cos")
+            lat_sem_w_m = fm.get("lat_sem_weight")
             to_ev = [lt, ls, lsg, lsc, lm1, lm2, vq_l, ent_pos, marg_ent, cos_m]
             if isinstance(l_lin, mx.array):
                 to_ev.append(l_lin)
@@ -2058,6 +2688,21 @@ def main() -> None:
                 to_ev.append(l_sc)
             if isinstance(l_cx, mx.array):
                 to_ev.append(l_cx)
+            if isinstance(l_band, mx.array):
+                to_ev.append(l_band)
+            if isinstance(l_sem, mx.array):
+                to_ev.append(l_sem)
+            if isinstance(sem_cos_m, mx.array):
+                to_ev.append(sem_cos_m)
+            if isinstance(l_lat_sem, mx.array):
+                to_ev.append(l_lat_sem)
+            if isinstance(lat_sem_cos_m, mx.array):
+                to_ev.append(lat_sem_cos_m)
+            if isinstance(lat_sem_w_m, mx.array):
+                to_ev.append(lat_sem_w_m)
+            for sem_stat in (sem_w_m, sem_grad_l2_mean, sem_grad_l2_max, sem_grad_clip_frac, sem_grad_bad_count):
+                if isinstance(sem_stat, mx.array):
+                    to_ev.append(sem_stat)
             mx.eval(*to_ev)
             util = _format_vq_util(idx, cb_sizes)
             cos_pct = 100.0 * float(cos_m.item())
@@ -2095,6 +2740,43 @@ def main() -> None:
             cx_extra = ""
             if cfg.lambda_complex_stft > 0 and isinstance(l_cx, mx.array):
                 cx_extra = f"  cx={float(l_cx.item()):.4f}"
+            band_extra = ""
+            if cfg.lambda_stft_band_excess > 0 and isinstance(l_band, mx.array):
+                band_extra = f"  band={float(l_band.item()):.4f}"
+            sem_extra = ""
+            if cfg.lambda_semantic > 0 and isinstance(l_sem, mx.array):
+                sem_items = int(fm.get("sem_items", 0))
+                sem_weight_v = float(sem_w_m.item()) if isinstance(sem_w_m, mx.array) else float(semantic_weight)
+                sem_extra = f"  sem={float(l_sem.item()):.4f}  λ_sem_eff={sem_weight_v:.4f}"
+                if sem_items > 0:
+                    sem_cos_v = float(sem_cos_m.item()) if isinstance(sem_cos_m, mx.array) else float(sem_cos_m or 0.0)
+                    sem_extra += f"  ssl={100.0 * sem_cos_v:.1f}%/{sem_items}"
+                    sg_l2 = float(sem_grad_l2_mean.item()) if isinstance(sem_grad_l2_mean, mx.array) else 0.0
+                    sg_l2max = float(sem_grad_l2_max.item()) if isinstance(sem_grad_l2_max, mx.array) else 0.0
+                    sg_clip = float(sem_grad_clip_frac.item()) if isinstance(sem_grad_clip_frac, mx.array) else 0.0
+                    sg_bad = int(float(sem_grad_bad_count.item())) if isinstance(sem_grad_bad_count, mx.array) else 0
+                    sem_extra += f"  sg_l2={sg_l2:.3g}  sg_l2max={sg_l2max:.3g}  sg_clip={100.0 * sg_clip:.2f}%  sg_bad={sg_bad}"
+                    abort_pct = float(cfg.semantic_grad_clip_abort_pct)
+                    if abort_pct > 0.0:
+                        if 100.0 * sg_clip > abort_pct:
+                            sem_clip_bad_logs += 1
+                        else:
+                            sem_clip_bad_logs = 0
+                        if sem_clip_bad_logs >= int(cfg.semantic_grad_clip_abort_logs):
+                            print(
+                                f"  [abort] semantic gradient clipping {100.0 * sg_clip:.2f}% "
+                                f"> {abort_pct:.2f}% for {sem_clip_bad_logs} logged rows",
+                                flush=True,
+                            )
+                            sys.exit(2)
+            lat_sem_extra = ""
+            if cfg.lambda_latent_semantic > 0 and isinstance(l_lat_sem, mx.array):
+                lat_items = int(fm.get("lat_sem_items", 0))
+                lat_w = float(lat_sem_w_m.item()) if isinstance(lat_sem_w_m, mx.array) else float(latent_semantic_weight)
+                lat_sem_extra = f"  zsem={float(l_lat_sem.item()):.4f}  λ_zsem_eff={lat_w:.4f}"
+                if lat_items > 0:
+                    lat_cos_v = float(lat_sem_cos_m.item()) if isinstance(lat_sem_cos_m, mx.array) else 0.0
+                    lat_sem_extra += f"  zssl={100.0 * lat_cos_v:.1f}%/{lat_items}"
             if callable(lr_spec):
                 tlr = lr_spec(opt.step)
                 mx.eval(tlr)
@@ -2111,7 +2793,7 @@ def main() -> None:
                 prof_count = 0
             print(
                 f"step {step:6d}/{cfg.steps}  loss={lv:.5f}  "
-                f"L1={float(lt.item()):.4f}  stft={float(ls.item()):.4f}{sgrad_extra}{scos_extra}{sc_extra}{cx_extra}{mel_extra}{lin_extra}  "
+                f"L1={float(lt.item()):.4f}  stft={float(ls.item()):.4f}{sgrad_extra}{scos_extra}{sc_extra}{cx_extra}{band_extra}{mel_extra}{lin_extra}{sem_extra}{lat_sem_extra}  "
                 f"vq={vq_s}  marg_ent={float(marg_ent.item()):.4f}{ent_extra}{ramp_extra}  "
                 f"cos={cos_pct:.1f}%{cos_ema_extra}{util}  lr={lr_log:.2e}  "
                 f"{elapsed / (step - start_step + 1) * 1000:.1f} ms/step{prof_extra}",

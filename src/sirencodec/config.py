@@ -123,6 +123,28 @@ class Config:
     # Residual dilated Conv1d on latent sequence (NLC): smooths temporal VQ trajectory.
     latent_temporal_depth: int = 2  # 0 = off; applied after optional pre_vq_ln, before RVQ
     latent_temporal_post_depth: int = 2  # 0 = off; applied on quantized z_q before decoder
+    # Optional latent self-attention blocks. Defaults keep existing runs/checkpoints unchanged.
+    self_attention_depth: int = 0
+    self_attention_post_depth: int = 0
+    self_attention_heads: int = 8
+    # Optional decoder-side architecture experiments. Defaults keep old checkpoints exactly unchanged.
+    decoder_refine_depth: int = 0
+    decoder_refine_gain: float = 0.1
+    decoder_band_heads: int = 1
+    decoder_band_depth: int = 1
+    decoder_band_gain: float = 0.08
+    # LavaSR-inspired post-waveform refiner. It runs after the decoder output and, by default,
+    # only adds high-passed residual energy so the base decoder keeps low-band speech structure.
+    post_lavasr_depth: int = 0
+    post_lavasr_channels: int = 24
+    post_lavasr_kernel: int = 15
+    post_lavasr_gain: float = 0.03
+    post_lavasr_highpass: bool = True
+    harmonic_source: bool = False
+    harmonic_harmonics: int = 8
+    harmonic_amp: float = 0.05
+    harmonic_f0_min: float = 50.0
+    harmonic_f0_max: float = 650.0
     # Residual VQ (SoundStream / EnCodec style): each stage quantizes the remaining residual
     n_codebooks: int = 3
     codebook_size: int = 32
@@ -163,6 +185,12 @@ class Config:
     # This specifically fights broadband "spectral floor" smear between harmonic peaks.
     lambda_stft_excess: float = 0.0
     stft_excess_margin: float = 0.20
+    # Penalize target-relative excess log-STFT energy that stays present over time at the
+    # same frequency. This is aimed at artificial horizontal bands / whistle-like grids.
+    lambda_stft_band_excess: float = 0.0
+    stft_band_excess_margin: float = 0.15
+    stft_band_excess_fmin: float = 1200.0
+    stft_band_excess_fmax: float = 0.0  # 0 => Nyquist
     # Spectral Convergence (Yamamoto et al. 2020): ``‖|S(ŷ)|−|S(y)|‖_F / ‖|S(y)|‖_F`` per scale.
     # Scale-invariant; emphasizes harmonic peaks — classic GAN-free high-freq pressure. Same ramp as STFT.
     lambda_sc: float = 1.0
@@ -220,6 +248,17 @@ class Config:
     semantic_layers: tuple[int, ...] = (12,)
     semantic_batch_items: int = 8
     semantic_every: int = 16
+    semantic_ramp_steps: int = 0
+    semantic_grad_clip: float = 10.0
+    semantic_grad_clip_abort_pct: float = 0.0
+    semantic_grad_clip_abort_logs: int = 3
+    # Auxiliary bottleneck loss: predict frozen HuBERT/ContentVec frames from RVQ latents.
+    # This pushes phonetic information into the sub-1kbps code path instead of only
+    # correcting the decoded waveform.
+    lambda_latent_semantic: float = 0.0
+    latent_semantic_start_step: int = 0
+    latent_semantic_ramp_steps: int = 0
+    latent_semantic_dim: int = 768
     # Optional waveform GAN (hinge). Generator adversarial term participates in the reconstruction loss balancer.
     lambda_adv: float = 0.0
     # Discriminator feature matching. Strongly stabilizes MPD/MSD GAN starts.
@@ -260,8 +299,10 @@ class Config:
     # Extra mean L1 on **linear** STFT magnitudes (same scales as log-STFT; weighted by λ_stft ramp).
     # Without GAN this carries more of the absolute harmonic-amplitude shaping.
     lambda_mag_l1: float = 0.15
-    # Encoder/decoder activation: ``gelu`` | ``snake`` | ``snake_beta`` (DAC-style sin²).
+    # Encoder/default decoder activation: ``gelu`` | ``snake`` | ``snake_beta`` (DAC-style sin²).
     activation: str = "snake_beta"
+    # Optional decoder-only override. ``None`` keeps the historical shared activation.
+    decoder_activation: str | None = None
     # Factorized RVQ: project latent D→d before codebook (0 = use full ``latent_dim``).
     rvq_code_dim: int = 8
     # EMA codebook update decay in ``(0,1)`` (0 = disabled). Updated on CPU after each optimizer step.
@@ -415,6 +456,24 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "pre_vq_layernorm": c.pre_vq_layernorm,
         "latent_temporal_depth": c.latent_temporal_depth,
         "latent_temporal_post_depth": c.latent_temporal_post_depth,
+        "self_attention_depth": c.self_attention_depth,
+        "self_attention_post_depth": c.self_attention_post_depth,
+        "self_attention_heads": c.self_attention_heads,
+        "decoder_refine_depth": c.decoder_refine_depth,
+        "decoder_refine_gain": c.decoder_refine_gain,
+        "decoder_band_heads": c.decoder_band_heads,
+        "decoder_band_depth": c.decoder_band_depth,
+        "decoder_band_gain": c.decoder_band_gain,
+        "post_lavasr_depth": c.post_lavasr_depth,
+        "post_lavasr_channels": c.post_lavasr_channels,
+        "post_lavasr_kernel": c.post_lavasr_kernel,
+        "post_lavasr_gain": c.post_lavasr_gain,
+        "post_lavasr_highpass": c.post_lavasr_highpass,
+        "harmonic_source": c.harmonic_source,
+        "harmonic_harmonics": c.harmonic_harmonics,
+        "harmonic_amp": c.harmonic_amp,
+        "harmonic_f0_min": c.harmonic_f0_min,
+        "harmonic_f0_max": c.harmonic_f0_max,
         "n_codebooks": c.n_codebooks,
         "codebook_size": c.codebook_size,
         "lambda_time": c.lambda_time,
@@ -423,6 +482,10 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lambda_stft_cos": c.lambda_stft_cos,
         "lambda_stft_excess": c.lambda_stft_excess,
         "stft_excess_margin": c.stft_excess_margin,
+        "lambda_stft_band_excess": c.lambda_stft_band_excess,
+        "stft_band_excess_margin": c.stft_band_excess_margin,
+        "stft_band_excess_fmin": c.stft_band_excess_fmin,
+        "stft_band_excess_fmax": c.stft_band_excess_fmax,
         "lambda_sc": c.lambda_sc,
         "lambda_complex_stft": c.lambda_complex_stft,
         "stft_grad_freq_weight": c.stft_grad_freq_weight,
@@ -473,6 +536,14 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "semantic_layers": ",".join(str(x) for x in c.semantic_layers),
         "semantic_batch_items": c.semantic_batch_items,
         "semantic_every": c.semantic_every,
+        "semantic_ramp_steps": c.semantic_ramp_steps,
+        "semantic_grad_clip": c.semantic_grad_clip,
+        "semantic_grad_clip_abort_pct": c.semantic_grad_clip_abort_pct,
+        "semantic_grad_clip_abort_logs": c.semantic_grad_clip_abort_logs,
+        "lambda_latent_semantic": c.lambda_latent_semantic,
+        "latent_semantic_start_step": c.latent_semantic_start_step,
+        "latent_semantic_ramp_steps": c.latent_semantic_ramp_steps,
+        "latent_semantic_dim": c.latent_semantic_dim,
         "lambda_adv": c.lambda_adv,
         "lambda_fm": c.lambda_fm,
         "disc_lr": c.disc_lr,
@@ -490,6 +561,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "curriculum_quantize_blend": c.curriculum_quantize_blend,
         "lambda_mag_l1": c.lambda_mag_l1,
         "activation": c.activation,
+        "decoder_activation": c.decoder_activation,
         "rvq_code_dim": c.rvq_code_dim,
         "vq_ema_decay": c.vq_ema_decay,
         "decoder_upsample": c.decoder_upsample,

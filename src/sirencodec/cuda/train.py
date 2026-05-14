@@ -425,6 +425,8 @@ def compute_loss(
     sem_items = 0
     if semantic_teacher is not None and float(cfg.lambda_semantic) > 0 and (step % max(1, int(cfg.semantic_every)) == 0):
         l_sem, sem_info = semantic_teacher.loss(batch, y_hat, max_items=cfg.semantic_batch_items)
+        if l_sem.device != batch.device:
+            l_sem = l_sem.to(batch.device)
         sem_cos = sem_info.feature_cos
         sem_items = sem_info.subset_items
     adv_g = batch.new_zeros(())
@@ -869,6 +871,31 @@ def print_run_header(
         periods = ",".join(str(x) for x in cfg.disc_periods)
         _emit(_kv("disc", f"type={cfg.disc_type}  base={cfg.disc_base_channels}  scales={cfg.disc_scales}  periods={periods}", ansi, color="white"))
     _emit(_kv("model", f"params={n_params / 1e6:.2f}M  latent={cfg.latent_dim}  stride={st}x  ~{nom_kbps:.1f} kbps", ansi, color="white"))
+    _emit(
+        _kv(
+            "latent",
+            f"temporal={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}  "
+            f"self_attn={cfg.self_attention_depth}/{cfg.self_attention_post_depth}x{cfg.self_attention_heads} heads",
+            ansi,
+            color="white",
+        )
+    )
+    _emit(
+        _kv(
+            "decoder",
+            (
+                f"refine={cfg.decoder_refine_depth}@{cfg.decoder_refine_gain:g}  "
+                f"bands={cfg.decoder_band_heads}x{cfg.decoder_band_depth}@{cfg.decoder_band_gain:g}  "
+                f"post_lava={cfg.post_lavasr_depth}x{cfg.post_lavasr_channels}"
+                f"/k{cfg.post_lavasr_kernel}@{cfg.post_lavasr_gain:g}"
+                f"{'+hp' if cfg.post_lavasr_highpass else '+full'}  "
+                f"harmonic={'on' if cfg.harmonic_source else 'off'}"
+                f"({cfg.harmonic_harmonics}h,{cfg.harmonic_amp:g})"
+            ),
+            ansi,
+            color="white",
+        )
+    )
     stft_w = "none" if cfg.stft_scale_weights is None else ",".join(f"{float(w):g}" for w in cfg.stft_scale_weights)
     _emit(
         _kv(
@@ -1671,6 +1698,29 @@ def parse_args(argv: list[str] | None = None):
     _add_bool(p, "--pre-vq-layernorm", c.pre_vq_layernorm)
     p.add_argument("--latent-temporal-depth", type=int, default=c.latent_temporal_depth)
     p.add_argument("--latent-temporal-post-depth", type=int, default=c.latent_temporal_post_depth)
+    p.add_argument("--self-attention-depth", type=int, default=c.self_attention_depth)
+    p.add_argument("--self-attention-post-depth", type=int, default=c.self_attention_post_depth)
+    p.add_argument("--self-attention-heads", type=int, default=c.self_attention_heads)
+    p.add_argument("--decoder-refine-depth", type=int, default=c.decoder_refine_depth)
+    p.add_argument("--decoder-refine-gain", type=float, default=c.decoder_refine_gain)
+    p.add_argument("--decoder-band-heads", type=int, default=c.decoder_band_heads)
+    p.add_argument("--decoder-band-depth", type=int, default=c.decoder_band_depth)
+    p.add_argument("--decoder-band-gain", type=float, default=c.decoder_band_gain)
+    p.add_argument("--post-lavasr-depth", type=int, default=c.post_lavasr_depth)
+    p.add_argument("--post-lavasr-channels", type=int, default=c.post_lavasr_channels)
+    p.add_argument("--post-lavasr-kernel", type=int, default=c.post_lavasr_kernel)
+    p.add_argument("--post-lavasr-gain", type=float, default=c.post_lavasr_gain)
+    _add_bool(
+        p,
+        "--post-lavasr-highpass",
+        c.post_lavasr_highpass,
+        "Only add high-passed post-refiner residual, preserving low-band decoder output",
+    )
+    _add_bool(p, "--harmonic-source", c.harmonic_source, "Add learned harmonic excitation branch to decoder")
+    p.add_argument("--harmonic-harmonics", type=int, default=c.harmonic_harmonics)
+    p.add_argument("--harmonic-amp", type=float, default=c.harmonic_amp)
+    p.add_argument("--harmonic-f0-min", type=float, default=c.harmonic_f0_min)
+    p.add_argument("--harmonic-f0-max", type=float, default=c.harmonic_f0_max)
     p.add_argument("--n-codebooks", type=int, default=c.n_codebooks)
     p.add_argument("--codebook-size", type=int, default=c.codebook_size)
     p.add_argument("--codebook-sizes", type=str, default=None)
@@ -1787,6 +1837,7 @@ def parse_args(argv: list[str] | None = None):
     )
     p.add_argument("--resume", nargs="?", const="__latest__", default=None, help=argparse.SUPPRESS)
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto", help="Training device override")
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="ANSI colors in logs")
     valid_dests = {a.dest for a in p._actions}
     unknown_keys = sorted(str(k) for k in json_defaults.keys() if str(k) not in valid_dests)
@@ -1862,6 +1913,24 @@ def config_from_args(args) -> Config:
         pre_vq_layernorm=args.pre_vq_layernorm,
         latent_temporal_depth=args.latent_temporal_depth,
         latent_temporal_post_depth=args.latent_temporal_post_depth,
+        self_attention_depth=args.self_attention_depth,
+        self_attention_post_depth=args.self_attention_post_depth,
+        self_attention_heads=args.self_attention_heads,
+        decoder_refine_depth=args.decoder_refine_depth,
+        decoder_refine_gain=args.decoder_refine_gain,
+        decoder_band_heads=args.decoder_band_heads,
+        decoder_band_depth=args.decoder_band_depth,
+        decoder_band_gain=args.decoder_band_gain,
+        post_lavasr_depth=args.post_lavasr_depth,
+        post_lavasr_channels=args.post_lavasr_channels,
+        post_lavasr_kernel=args.post_lavasr_kernel,
+        post_lavasr_gain=args.post_lavasr_gain,
+        post_lavasr_highpass=bool(args.post_lavasr_highpass),
+        harmonic_source=bool(args.harmonic_source),
+        harmonic_harmonics=args.harmonic_harmonics,
+        harmonic_amp=args.harmonic_amp,
+        harmonic_f0_min=args.harmonic_f0_min,
+        harmonic_f0_max=args.harmonic_f0_max,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
         codebook_sizes=codebook_sizes,
@@ -2009,6 +2078,39 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--logs-per-epoch must be >= 1")
     if args.prefetch_audio_batches < 1:
         raise SystemExit("--prefetch-audio-batches must be >= 1")
+    if args.self_attention_depth < 0 or args.self_attention_post_depth < 0:
+        raise SystemExit("--self-attention-depth/post-depth must be >= 0")
+    if args.self_attention_heads < 1:
+        raise SystemExit("--self-attention-heads must be >= 1")
+    if (
+        (args.self_attention_depth > 0 or args.self_attention_post_depth > 0)
+        and args.latent_dim % args.self_attention_heads != 0
+    ):
+        raise SystemExit("--latent-dim must be divisible by --self-attention-heads")
+    if args.decoder_refine_depth < 0:
+        raise SystemExit("--decoder-refine-depth must be >= 0")
+    if args.decoder_refine_gain < 0:
+        raise SystemExit("--decoder-refine-gain must be >= 0")
+    if args.decoder_band_heads < 1:
+        raise SystemExit("--decoder-band-heads must be >= 1")
+    if args.decoder_band_depth < 0:
+        raise SystemExit("--decoder-band-depth must be >= 0")
+    if args.decoder_band_gain < 0:
+        raise SystemExit("--decoder-band-gain must be >= 0")
+    if args.post_lavasr_depth < 0:
+        raise SystemExit("--post-lavasr-depth must be >= 0")
+    if args.post_lavasr_channels < 1:
+        raise SystemExit("--post-lavasr-channels must be >= 1")
+    if args.post_lavasr_kernel < 3:
+        raise SystemExit("--post-lavasr-kernel must be >= 3")
+    if args.post_lavasr_gain < 0:
+        raise SystemExit("--post-lavasr-gain must be >= 0")
+    if args.harmonic_harmonics < 1:
+        raise SystemExit("--harmonic-harmonics must be >= 1")
+    if args.harmonic_amp < 0:
+        raise SystemExit("--harmonic-amp must be >= 0")
+    if args.harmonic_f0_min <= 0 or args.harmonic_f0_max <= args.harmonic_f0_min:
+        raise SystemExit("--harmonic-f0-min/max must be positive and min < max")
     if args.spectral_batch_items < 0:
         raise SystemExit("--spectral-batch-items must be >= 0")
     if args.stft_large_min_fft < 0:
@@ -2124,16 +2226,38 @@ def main(argv: list[str] | None = None) -> None:
     _open_text_log(layout["logs_txt"])
 
     torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
+    requested_device = str(getattr(args, "device", "auto") or "auto").lower()
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit("--device cuda requested, but CUDA is not available")
         device = torch.device("cuda")
         torch.backends.cudnn.benchmark = True
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
+    elif requested_device == "mps":
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            raise SystemExit("--device mps requested, but MPS is not available")
+        device = torch.device("mps")
+        print_event(ansi, "device", "CUDA not available; running on Apple MPS", color="yellow")
+    elif requested_device == "cpu":
+        device = torch.device("cpu")
+        print_event(ansi, "device", "running on CPU", color="yellow")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and float(getattr(cfg, "lambda_semantic", 0.0)) <= 0.0:
+        device = torch.device("mps")
+        print_event(ansi, "device", "CUDA not available; running on Apple MPS", color="yellow")
     else:
         device = torch.device("cpu")
-        print_event(ansi, "warn", "CUDA not available; running on CPU", color="yellow")
+        msg = "CUDA/MPS not available; running on CPU" if requested_device == "auto" else "running on CPU"
+        print_event(ansi, "warn", msg, color="yellow")
 
     model = CUDACodec(cfg).to(device)
     if init_from_ckpt is not None:
@@ -2145,12 +2269,15 @@ def main(argv: list[str] | None = None) -> None:
     semantic_teacher: FrozenSemanticTeacher | None = None
     if float(cfg.lambda_semantic) > 0:
         try:
+            teacher_device = torch.device("cpu") if device.type == "mps" else device
             semantic_teacher = FrozenSemanticTeacher(
                 bundle_name=cfg.semantic_model,
                 layers=cfg.semantic_layers,
                 sample_rate=cfg.sample_rate,
-                device=device,
+                device=teacher_device,
             )
+            if teacher_device != device:
+                print_event(ansi, "semantic", f"teacher on {teacher_device}; codec on {device}", color="yellow")
         except Exception as e:
             raise SystemExit(f"failed to initialize semantic teacher {cfg.semantic_model}: {e}")
     discriminator: torch.nn.Module | None = None

@@ -42,6 +42,7 @@ class FrozenSemanticTeacher:
         self.bundle_name = str(bundle_name)
         self.sample_rate = int(sample_rate)
         self.teacher_sample_rate = int(bundle.sample_rate)
+        self.device = device
         self.layers = tuple(sorted(set(int(x) for x in layers)))
         if not self.layers:
             raise ValueError("semantic layers cannot be empty")
@@ -55,7 +56,7 @@ class FrozenSemanticTeacher:
         self.model.requires_grad_(False)
 
     def _prepare(self, x: torch.Tensor) -> torch.Tensor:
-        wav = x[..., 0].float()
+        wav = x[..., 0].float().to(self.device)
         if self.sample_rate != self.teacher_sample_rate:
             wav = torchaudio.functional.resample(wav, self.sample_rate, self.teacher_sample_rate)
         return wav

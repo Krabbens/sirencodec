@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+mlx = ["mlx>=0.29.3", "mlx-contentvec>=0.1.1"]
 
 [project.scripts]
 train = "sirencodec.cuda.train:main"

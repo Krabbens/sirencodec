@@ -1,6 +1,8 @@
 """PyTorch/CUDA codec backend for the former MLX trainer CLI."""
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +27,7 @@ class NLCConv1d(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2).contiguous()
         if self.causal:
             x = F.pad(x, (self.dilation * (self.kernel - 1), 0))
         x = self.conv(x)
@@ -38,7 +40,7 @@ class NLCConvTranspose1d(nn.Module):
         self.conv = nn.ConvTranspose1d(cin, cout, kernel, stride=stride, padding=padding)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x.transpose(1, 2)).transpose(1, 2)
+        return self.conv(x.transpose(1, 2).contiguous()).transpose(1, 2)
 
 
 class UpsampleRepeatConv(nn.Module):
@@ -164,6 +166,105 @@ class ResidualVectorQuantizer(nn.Module):
         return quantized, total_vq, total_ent, total_marg, indices
 
 
+class DecoderRefineStack(nn.Module):
+    """Small residual temporal post-filter."""
+
+    def __init__(self, cfg: Config, channels: int, depth: int, gain: float):
+        super().__init__()
+        layers: list[nn.Module] = []
+        for i in range(max(0, int(depth))):
+            dilation = 2 ** (i % 4)
+            layers.append(NLCConv1d(channels, channels, 7, padding=3 * dilation, dilation=dilation, causal=cfg.causal))
+            layers.append(_act_module(cfg, channels))
+        self.layers = nn.Sequential(*layers)
+        self.gain = float(gain)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if len(self.layers) == 0 or self.gain == 0.0:
+            return x
+        return x + self.gain * self.layers(x)
+
+
+class DecoderBandHead(nn.Module):
+    """Residual waveform head with a distinct temporal kernel."""
+
+    def __init__(self, cfg: Config, channels: int, depth: int, kernel: int):
+        super().__init__()
+        layers: list[nn.Module] = []
+        for _ in range(max(0, int(depth))):
+            layers.append(NLCConv1d(channels, channels, kernel, padding=kernel // 2, causal=cfg.causal))
+            layers.append(_act_module(cfg, channels))
+        layers.append(NLCConv1d(channels, 1, kernel, padding=kernel // 2, causal=cfg.causal))
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
+
+class HarmonicSource(nn.Module):
+    """Learned differentiable harmonic excitation."""
+
+    def __init__(self, cfg: Config, channels: int):
+        super().__init__()
+        self.sample_rate = float(cfg.sample_rate)
+        self.harmonics = max(1, int(cfg.harmonic_harmonics))
+        self.f0_min = float(cfg.harmonic_f0_min)
+        self.f0_max = float(cfg.harmonic_f0_max)
+        self.f0_head = NLCConv1d(channels, 1, 7, padding=3, causal=cfg.causal)
+        self.amp_head = NLCConv1d(channels, self.harmonics, 7, padding=3, causal=cfg.causal)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f0_unit = torch.sigmoid(self.f0_head(x))
+        f0 = self.f0_min + (self.f0_max - self.f0_min) * f0_unit
+        phase = torch.cumsum(f0 * (2.0 * math.pi / self.sample_rate), dim=1)
+        harmonics = torch.arange(1, self.harmonics + 1, dtype=x.dtype, device=x.device).view(1, 1, -1)
+        amps = torch.sigmoid(self.amp_head(x)) / float(self.harmonics)
+        return torch.sum(amps * torch.sin(phase * harmonics), dim=-1, keepdim=True)
+
+
+def _lava_highpass_residual(x: torch.Tensor) -> torch.Tensor:
+    """Cheap differentiable high-pass residual for LavaSR-style low/high-band merge."""
+    left = torch.cat([x[:, :1, :], x[:, :-1, :]], dim=1)
+    right = torch.cat([x[:, 1:, :], x[:, -1:, :]], dim=1)
+    return x - (0.5 * (left + right))
+
+
+class PostLavaSRRefiner(nn.Module):
+    """Small waveform refiner applied after the decoder, inspired by LavaSR's LR merge."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        depth = max(0, int(cfg.post_lavasr_depth))
+        ch = max(4, int(cfg.post_lavasr_channels))
+        kernel = max(3, int(cfg.post_lavasr_kernel))
+        if kernel % 2 == 0:
+            kernel += 1
+        layers: list[nn.Module] = [NLCConv1d(1, ch, kernel, padding=kernel // 2, causal=cfg.causal)]
+        for i in range(depth):
+            dilation = 2 ** (i % 4)
+            layers.append(
+                NLCConv1d(
+                    ch,
+                    ch,
+                    kernel,
+                    padding=(kernel // 2) * dilation,
+                    dilation=dilation,
+                    causal=cfg.causal,
+                )
+            )
+            layers.append(_act_module(cfg, ch))
+        layers.append(NLCConv1d(ch, 1, kernel, padding=kernel // 2, causal=cfg.causal))
+        self.layers = nn.Sequential(*layers)
+        self.gain = float(cfg.post_lavasr_gain)
+        self.highpass = bool(cfg.post_lavasr_highpass)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        residual = self.layers(y)
+        if self.highpass:
+            residual = _lava_highpass_residual(residual)
+        return torch.tanh(y + self.gain * residual)
+
+
 class Decoder(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -183,17 +284,43 @@ class Decoder(nn.Module):
             for _ in range(n1):
                 layers.append(NLCConv1d(c[i + 1], c[i + 1], 7, padding=3, causal=cfg.causal))
                 layers.append(_act_module(cfg, c[i + 1]))
-        layers.append(NLCConv1d(c[-1], 1, 7, padding=3, causal=cfg.causal))
         self.layers = nn.Sequential(*layers)
+        self.out = NLCConv1d(c[-1], 1, 7, padding=3, causal=cfg.causal)
+        self.refine = (
+            DecoderRefineStack(cfg, c[-1], cfg.decoder_refine_depth, cfg.decoder_refine_gain)
+            if int(cfg.decoder_refine_depth) > 0
+            else None
+        )
+        self.band_gain = float(cfg.decoder_band_gain)
+        self.band_heads = nn.ModuleList(
+            DecoderBandHead(cfg, c[-1], cfg.decoder_band_depth, 7 + 8 * (i + 1))
+            for i in range(max(0, int(cfg.decoder_band_heads) - 1))
+        )
+        self.harmonic_gain = float(cfg.harmonic_amp)
+        self.harmonic_source = HarmonicSource(cfg, c[-1]) if bool(cfg.harmonic_source) else None
+        self.post_lavasr = PostLavaSRRefiner(cfg) if int(cfg.post_lavasr_depth) > 0 else None
 
     def forward(self, z: torch.Tensor, target_len: int) -> torch.Tensor:
-        x = self.layers(z)
-        t = x.shape[1]
+        features = self.layers(z)
+        if self.refine is not None:
+            features = self.refine(features)
+        y = self.out(features)
+        if len(self.band_heads) > 0 and self.band_gain != 0.0:
+            extra = torch.zeros_like(y)
+            for head in self.band_heads:
+                extra = extra + head(features)
+            y = y + self.band_gain * (extra / float(len(self.band_heads)))
+        if self.harmonic_source is not None and self.harmonic_gain != 0.0:
+            y = y + self.harmonic_gain * self.harmonic_source(features)
+        t = y.shape[1]
         if t >= target_len:
-            y = x[:, :target_len, :]
+            y = y[:, :target_len, :]
         else:
-            y = F.pad(x, (0, 0, 0, target_len - t))
-        return torch.tanh(y)
+            y = F.pad(y, (0, 0, 0, target_len - t))
+        y = torch.tanh(y)
+        if self.post_lavasr is not None:
+            y = self.post_lavasr(y)
+        return y
 
 
 class LatentTemporalStack(nn.Module):
@@ -211,6 +338,42 @@ class LatentTemporalStack(nn.Module):
         if len(self.layers) == 0:
             return x
         return x + self.layers(x)
+
+
+class LatentSelfAttentionBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, *, causal: bool = False):
+        super().__init__()
+        self.causal = bool(causal)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden = max(dim, dim * 2)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        mask = None
+        if self.causal:
+            t = h.shape[1]
+            mask = torch.ones((t, t), dtype=torch.bool, device=h.device).triu(1)
+        y, _ = self.attn(h, h, h, attn_mask=mask, need_weights=False)
+        x = x + y
+        return x + self.ff(self.norm2(x))
+
+
+class LatentSelfAttentionStack(nn.Module):
+    def __init__(self, dim: int, depth: int, heads: int, *, causal: bool = False):
+        super().__init__()
+        self.layers = nn.Sequential(
+            *(LatentSelfAttentionBlock(dim, heads, causal=causal) for _ in range(max(0, int(depth))))
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
 
 
 class WaveDiscriminator(nn.Module):
@@ -385,9 +548,29 @@ class CUDACodec(nn.Module):
             if cfg.latent_temporal_depth > 0
             else None
         )
+        self.self_attn_pre = (
+            LatentSelfAttentionStack(
+                cfg.latent_dim,
+                cfg.self_attention_depth,
+                cfg.self_attention_heads,
+                causal=cfg.causal,
+            )
+            if cfg.self_attention_depth > 0
+            else None
+        )
         self.latent_post = (
             LatentTemporalStack(cfg.latent_dim, cfg.latent_temporal_post_depth, activation=cfg.activation)
             if cfg.latent_temporal_post_depth > 0
+            else None
+        )
+        self.self_attn_post = (
+            LatentSelfAttentionStack(
+                cfg.latent_dim,
+                cfg.self_attention_post_depth,
+                cfg.self_attention_heads,
+                causal=cfg.causal,
+            )
+            if cfg.self_attention_post_depth > 0
             else None
         )
 
@@ -397,6 +580,8 @@ class CUDACodec(nn.Module):
             z = self.pre_vq_ln(z)
         if self.latent_pre is not None:
             z = self.latent_pre(z)
+        if self.self_attn_pre is not None:
+            z = self.self_attn_pre(z)
         return z
 
     def forward_full(
@@ -424,6 +609,8 @@ class CUDACodec(nn.Module):
         z_q, vq_loss, ent_pos, marg_ent, indices = self.rvq(z)
         if self.latent_post is not None:
             z_q = self.latent_post(z_q)
+        if self.self_attn_post is not None:
+            z_q = self.self_attn_post(z_q)
         q = min(1.0, max(0.0, float(quantize_blend)))
         if q < 1.0:
             z_q = z + q * (z_q - z)

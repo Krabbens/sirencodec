@@ -330,6 +330,74 @@ def multi_stft_spectral_terms(
     return tot_mag / w_den, tot_grad / w_den, tot_cos / w_den
 
 
+def _mean_stationary_logmag_excess(
+    lp: mx.array,
+    lq: mx.array,
+    *,
+    sample_rate: int,
+    margin: float,
+    fmin: float,
+    fmax: float,
+    hf_emphasis: float = 0.0,
+) -> mx.array:
+    """Penalize excess log-mag energy that stays present across time at the same frequency."""
+    excess = mx.maximum(mx.array(0.0, dtype=mx.float32), lp - lq - float(margin))
+    # Horizontal bands are persistent per-frequency excess, so average over time first.
+    stationary = mx.mean(excess, axis=2)
+    stationary = stationary * stationary
+    f_dim = int(lp.shape[1])
+    if f_dim <= 1:
+        return mx.mean(stationary)
+    nyq = float(sample_rate) * 0.5
+    hi = nyq if float(fmax) <= 0.0 else min(float(fmax), nyq)
+    lo = max(0.0, float(fmin))
+    if hi <= lo:
+        return mx.array(0.0, dtype=mx.float32)
+    freqs = mx.arange(f_dim, dtype=mx.float32) * (nyq / float(f_dim - 1))
+    band = (freqs >= lo).astype(mx.float32) * (freqs <= hi).astype(mx.float32)
+    if float(hf_emphasis) > 0.0:
+        fi = mx.arange(f_dim, dtype=mx.float32) / float(f_dim - 1)
+        band = band * (1.0 + float(hf_emphasis) * (fi * fi))
+    den = mx.sum(band) * float(stationary.shape[0]) + 1e-8
+    return mx.sum(stationary * mx.reshape(band, (1, f_dim))) / den
+
+
+def multi_stft_band_excess(
+    pred: mx.array,
+    tgt: mx.array,
+    scales: tuple[tuple[int, int], ...],
+    *,
+    sample_rate: int,
+    margin: float = 0.15,
+    fmin: float = 1200.0,
+    fmax: float = 0.0,
+    hf_emphasis: float = 0.0,
+    scale_weights: tuple[float, ...] | None = None,
+) -> mx.array:
+    """Multi-scale stationary excess penalty for artificial horizontal spectral bands."""
+    if not scales:
+        return mx.array(0.0)
+    ws = [1.0] * len(scales) if scale_weights is None else list(scale_weights)
+    if len(ws) != len(scales):
+        raise ValueError("scale_weights length must match stft_scales")
+    w_den = float(sum(ws))
+    if w_den <= 0:
+        raise ValueError("sum of STFT scale weights must be > 0")
+    total = mx.array(0.0)
+    for (n_fft, hop), w in zip(scales, ws):
+        lp, lq = _stft_log_mag_pair(pred, tgt, n_fft, hop)
+        total = total + float(w) * _mean_stationary_logmag_excess(
+            lp,
+            lq,
+            sample_rate=sample_rate,
+            margin=margin,
+            fmin=fmin,
+            fmax=fmax,
+            hf_emphasis=hf_emphasis,
+        )
+    return total / w_den
+
+
 def spectral_convergence(mp: mx.array, mq: mx.array, *, eps: float = 1e-8) -> mx.array:
     """Spectral convergence (Yamamoto et al., Parallel WaveGAN): ``‖|S(ŷ)|−|S(y)|‖_F / ‖|S(y)|‖_F``.
 
@@ -412,4 +480,3 @@ def marginal_code_entropy_from_dist(dist: mx.array, tau: float) -> mx.array:
     p = ex / (mx.sum(ex, axis=-1, keepdims=True) + 1e-8)
     avg = mx.mean(p, axis=(0, 1))
     return -mx.sum(avg * mx.log(avg + 1e-8))
-
