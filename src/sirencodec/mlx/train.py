@@ -1249,6 +1249,13 @@ def main() -> None:
         metavar="HZ",
         help="Target training/output sample rate. Disk audio is resampled before batching.",
     )
+    p.add_argument(
+        "--audio-lowpass-hz",
+        type=float,
+        default=0.0,
+        metavar="HZ",
+        help="Optional low-pass cutoff applied to disk audio after resampling (0=off).",
+    )
     p.add_argument("--segment", type=int, default=16384, help="Waveform length per sample (more latent frames helps RVQ)")
     p.add_argument("--lr", type=float, default=5e-4, help="Adam peak LR (warmup/plateau/cosine) or constant (--lr-schedule none)")
     p.add_argument(
@@ -1859,6 +1866,12 @@ def main() -> None:
     if args.sample_rate < 1000:
         print("--sample-rate must be >= 1000", file=sys.stderr)
         sys.exit(1)
+    if args.audio_lowpass_hz < 0.0:
+        print("--audio-lowpass-hz must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.audio_lowpass_hz > 0.0 and args.audio_lowpass_hz >= 0.5 * float(args.sample_rate):
+        print("--audio-lowpass-hz must be below Nyquist (sample_rate/2)", file=sys.stderr)
+        sys.exit(1)
     if args.lr_min_ratio < 0 or args.lr_min_ratio > 1.0:
         print("--lr-min-ratio must be in [0, 1]", file=sys.stderr)
         sys.exit(1)
@@ -2096,6 +2109,7 @@ def main() -> None:
 
     cfg = Config(
         sample_rate=args.sample_rate,
+        audio_lowpass_hz=args.audio_lowpass_hz,
         steps=args.steps,
         batch=args.batch,
         load_audio_threads=args.load_audio_threads,
@@ -2461,6 +2475,7 @@ def main() -> None:
     )
     print(
         f"Parameters: {n_params / 1e6:.2f}M{batch_info}  latent={cfg.latent_dim}  {lt_pre_post}  pre_vq_ln={cfg.pre_vq_layernorm}  enc_stride={st}×  "
+        f"sr={cfg.sample_rate}Hz  lp={cfg.audio_lowpass_hz:g}Hz  "
         f"s1/scale={cfg.stride1_blocks_per_scale}  act={cfg.activation}/{dec_act}  {dec_arch}  "
         f"grad_clip={cfg.grad_clip_norm}  {lr_info}  "
         f"~{nom_kbps:.1f} kbps nominal  "

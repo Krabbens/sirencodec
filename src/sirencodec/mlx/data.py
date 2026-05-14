@@ -12,12 +12,20 @@ from ..config import Config
 # ═══════════════════════════════════════════════════════════════════════════
 # 2. Synthetic + optional WAV data
 # ═══════════════════════════════════════════════════════════════════════════
+def _synth_f_hi(cfg: Config) -> float:
+    limit = 0.45 * float(cfg.sample_rate)
+    lowpass_hz = float(getattr(cfg, "audio_lowpass_hz", 0.0) or 0.0)
+    if lowpass_hz > 0.0:
+        limit = min(limit, lowpass_hz * 0.95)
+    return max(90.0, min(2000.0, limit))
+
+
 def synth_batch(cfg: Config, key: int) -> mx.array:
     """Mixture of sines + noise → [B, T, 1] float32."""
     mx.random.seed(key)
     b, t = cfg.batch, cfg.segment
     t_ax = mx.arange(t, dtype=mx.float32)[None, :, None] / float(cfg.sample_rate)
-    f_hi = max(90.0, min(2000.0, 0.45 * float(cfg.sample_rate)))
+    f_hi = _synth_f_hi(cfg)
     freqs = mx.random.uniform(low=80.0, high=f_hi, shape=(b, 1, 1))
     phases = mx.random.uniform(low=0.0, high=6.28318, shape=(b, 1, 1))
     x = mx.sin(2.0 * math.pi * freqs * t_ax + phases)
@@ -65,6 +73,33 @@ def _resample_np(wav, sr: int, target_sr: int):
         ).astype(np.float32)
 
 
+def _lowpass_np(wav, sample_rate: int, cutoff_hz: float):
+    import numpy as np
+
+    cutoff_hz = float(cutoff_hz or 0.0)
+    sample_rate = int(sample_rate)
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    nyq = 0.5 * float(sample_rate)
+    if cutoff_hz <= 0.0 or cutoff_hz >= nyq or wav.size == 0:
+        return wav.astype(np.float32, copy=False)
+    try:
+        from scipy.signal import butter, sosfilt, sosfiltfilt
+
+        sos = butter(8, cutoff_hz / nyq, btype="lowpass", output="sos")
+        if wav.size > 256:
+            return sosfiltfilt(sos, wav).astype(np.float32)
+        return sosfilt(sos, wav).astype(np.float32)
+    except Exception:
+        spec = np.fft.rfft(wav)
+        freqs = np.fft.rfftfreq(wav.size, d=1.0 / float(sample_rate))
+        spec[freqs > cutoff_hz] = 0.0
+        return np.fft.irfft(spec, n=wav.size).astype(np.float32)
+
+
+def _maybe_lowpass_np(wav, cfg: Config):
+    return _lowpass_np(wav, cfg.sample_rate, getattr(cfg, "audio_lowpass_hz", 0.0))
+
+
 def _skip_audio_path(p: Path) -> bool:
     """Ignore venv, pip/scipy test fixtures, and other non-dataset audio under a broad ``data/`` tree."""
     if _SKIP_PATH_PARTS.intersection(p.parts):
@@ -94,6 +129,7 @@ def _load_audio_row_np(
     n: int,
     need: int,
     sample_rate: int,
+    lowpass_hz: float,
     offset: int,
     row_i: int,
 ) -> tuple[int, object]:
@@ -120,6 +156,7 @@ def _load_audio_row_np(
         wav = _resample_np(wav[:, 0], sr, sample_rate)
     else:
         wav = wav[:, 0].astype(np.float32)
+    wav = _lowpass_np(wav, sample_rate, lowpass_hz)
     if wav.size < need:
         wav = np.pad(wav, (0, need - wav.size))
     wav = wav[:need]
@@ -137,14 +174,32 @@ def _load_audio_batch(cfg: Config, paths: list[Path], offset: int) -> mx.array:
     if th <= 1 or b <= 1:
         out = np.zeros((b, need, 1), dtype=np.float32)
         for i in range(b):
-            ri, row = _load_audio_row_np(paths, n, need, cfg.sample_rate, offset, i)
+            ri, row = _load_audio_row_np(
+                paths,
+                n,
+                need,
+                cfg.sample_rate,
+                cfg.audio_lowpass_hz,
+                offset,
+                i,
+            )
             out[ri, :, 0] = row
         return mx.array(out)
     wk = min(th, b, 32)
     out = np.zeros((b, need, 1), dtype=np.float32)
     with ThreadPoolExecutor(max_workers=wk) as ex:
         futs = [
-            ex.submit(_load_audio_row_np, paths, n, need, cfg.sample_rate, offset, i) for i in range(b)
+            ex.submit(
+                _load_audio_row_np,
+                paths,
+                n,
+                need,
+                cfg.sample_rate,
+                cfg.audio_lowpass_hz,
+                offset,
+                i,
+            )
+            for i in range(b)
         ]
         for fut in futs:
             ri, row = fut.result()
@@ -174,6 +229,7 @@ def _load_audio_viz_clip(cfg: Config, paths: list[Path], step: int, n_samples: i
         wav = _resample_np(wav[:, 0], sr, cfg.sample_rate)
     else:
         wav = wav[:, 0].astype(np.float32)
+    wav = _maybe_lowpass_np(wav, cfg)
     if wav.size < n_samples:
         wav = np.pad(wav, (0, n_samples - wav.size))
     if wav.size > n_samples:
@@ -190,7 +246,7 @@ def synth_viz_clip(cfg: Config, key: int, n_samples: int) -> mx.array:
     """Synthetic [1, n_samples, 1] for viz when no --data-dir."""
     mx.random.seed(key)
     t_ax = mx.arange(n_samples, dtype=mx.float32)[None, :, None] / float(cfg.sample_rate)
-    f_hi = max(90.0, min(2000.0, 0.45 * float(cfg.sample_rate)))
+    f_hi = _synth_f_hi(cfg)
     freqs = mx.random.uniform(low=80.0, high=f_hi, shape=(1, 1, 1))
     phases = mx.random.uniform(low=0.0, high=6.28318, shape=(1, 1, 1))
     x = mx.sin(2.0 * math.pi * freqs * t_ax + phases)
