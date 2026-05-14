@@ -232,18 +232,68 @@ def load_audio_mono(path: Path, target_sr: int, max_seconds: float | None) -> "n
     if wav.size == 0:
         raise ValueError(f"empty audio: {path}")
     if sr != target_sr:
-        n_new = max(1, int(round(wav.size * target_sr / sr)))
-        wav = np.interp(
-            np.linspace(0, wav.size - 1, num=n_new),
-            np.arange(wav.size),
-            wav,
-        ).astype(np.float32)
+        wav = resample_wave_np(wav, int(sr), int(target_sr))
     if max_seconds is not None:
         cap = int(target_sr * max_seconds)
         wav = wav[:cap]
     m = float(wav.max()) if wav.size else 1.0
     m = max(abs(m), float(-wav.min()) if wav.size else 1.0, 1e-5)
     return (wav / m).astype(np.float32)
+
+
+def resample_wave_np(wav_1d: "numpy.ndarray", src_sr: int, target_sr: int) -> "numpy.ndarray":
+    import numpy as np
+
+    x = np.asarray(wav_1d, dtype=np.float32).reshape(-1)
+    src_sr = int(src_sr)
+    target_sr = int(target_sr)
+    if src_sr == target_sr or x.size == 0:
+        return x.astype(np.float32, copy=False)
+    try:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        g = gcd(src_sr, target_sr)
+        return resample_poly(x, target_sr // g, src_sr // g).astype(np.float32)
+    except Exception:
+        n_new = max(1, int(round(x.size * float(target_sr) / float(src_sr))))
+        return np.interp(
+            np.linspace(0, x.size - 1, num=n_new, endpoint=True),
+            np.arange(x.size),
+            x,
+        ).astype(np.float32)
+
+
+def novasr_upsample_to_target(
+    wav_1d: "numpy.ndarray",
+    *,
+    src_sr: int,
+    target_sr: int,
+    repo_path: Path | None,
+) -> "numpy.ndarray":
+    """Final NovaSR pass: codec SR -> 16 kHz -> NovaSR 48 kHz -> target SR."""
+    import numpy as np
+
+    if repo_path is not None:
+        sys.path.insert(0, str(repo_path))
+    try:
+        import torch
+        from NovaSR import FastSR
+    except Exception as e:
+        print(f"[novasr] import failed ({e}); falling back to polyphase resample", file=sys.stderr)
+        return resample_wave_np(wav_1d, src_sr, target_sr)
+
+    model = FastSR(half=False)
+    low16 = resample_wave_np(wav_1d, src_sr, 16_000)
+    x = torch.from_numpy(low16.astype(np.float32)).reshape(1, 1, -1).to(model.device)
+    with torch.inference_mode():
+        y48 = model.infer(x).detach().cpu().float().numpy().reshape(-1)
+    y = resample_wave_np(y48, 48_000, target_sr)
+    peak = float(np.max(np.abs(y))) if y.size else 1.0
+    if peak > 1.0:
+        y = y / peak
+    return y.astype(np.float32)
 
 
 def spectral_noise_filter(
@@ -405,6 +455,7 @@ def main() -> None:
     )
     p.add_argument("--ae-only", action="store_true", help="Checkpoint trained without VQ")
     dcfg = tm.Config()
+    p.add_argument("--sample-rate", type=int, default=dcfg.sample_rate, help="Must match training")
     p.add_argument(
         "--enc-channels",
         type=str,
@@ -503,6 +554,13 @@ def main() -> None:
     p.add_argument("--noise-filter-min-gain", type=float, default=0.20, help="Lower mask gain in [0,1]")
     p.add_argument("--noise-filter-n-fft", type=int, default=1024)
     p.add_argument("--noise-filter-hop", type=int, default=256)
+    p.add_argument(
+        "--novasr-upsample-8k",
+        action="store_true",
+        help="Also write *_recon_novasr8k.wav: recon at codec SR -> NovaSR -> 8 kHz.",
+    )
+    p.add_argument("--novasr-target-sr", type=int, default=8000)
+    p.add_argument("--novasr-repo", type=Path, default=None, help="Optional local NovaSR package/repo path")
     args = p.parse_args()
 
     if not (0.0 <= args.noise_filter_strength <= 1.0):
@@ -516,6 +574,12 @@ def main() -> None:
         sys.exit(1)
     if args.noise_filter_n_fft < 16 or args.noise_filter_hop < 1:
         print("--noise-filter-n-fft must be >= 16 and --noise-filter-hop must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.sample_rate < 1000:
+        print("--sample-rate must be >= 1000", file=sys.stderr)
+        sys.exit(1)
+    if args.novasr_target_sr < 1000:
+        print("--novasr-target-sr must be >= 1000", file=sys.stderr)
         sys.exit(1)
 
     ck = args.checkpoint.resolve()
@@ -565,6 +629,7 @@ def main() -> None:
             )
             sys.exit(1)
     cfg = tm.Config(
+        sample_rate=args.sample_rate,
         enc_channels=enc_ch,
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
         latent_dim=args.latent_dim,
@@ -611,6 +676,7 @@ def main() -> None:
     recon_to_write = recon
     filtered_cos: float | None = None
     raw_recon_path: Path | None = None
+    novasr_path: Path | None = None
     if args.noise_filter:
         recon_to_write = spectral_noise_filter(
             recon,
@@ -638,6 +704,16 @@ def main() -> None:
         raw_recon_path = out_dir / f"{stem}_recon_raw.wav"
         sf.write(str(raw_recon_path), np.clip(recon, -1.0, 1.0), cfg.sample_rate, subtype="PCM_16")
     sf.write(str(r_path), np.clip(recon_to_write, -1.0, 1.0), cfg.sample_rate, subtype="PCM_16")
+    if args.novasr_upsample_8k:
+        up = novasr_upsample_to_target(
+            recon_to_write,
+            src_sr=cfg.sample_rate,
+            target_sr=args.novasr_target_sr,
+            repo_path=args.novasr_repo,
+        )
+        suffix = f"{args.novasr_target_sr // 1000}k" if args.novasr_target_sr % 1000 == 0 else str(args.novasr_target_sr)
+        novasr_path = out_dir / f"{stem}_recon_novasr{suffix}.wav"
+        sf.write(str(novasr_path), np.clip(up, -1.0, 1.0), args.novasr_target_sr, subtype="PCM_16")
 
     enc_stride = encoder_time_stride(cfg)
     codes_bin_path = out_dir / f"{stem}_codes.bin"
@@ -710,6 +786,8 @@ def main() -> None:
     if raw_recon_path is not None:
         print(f"            {raw_recon_path}")
     print(f"            {r_path}")
+    if novasr_path is not None:
+        print(f"            {novasr_path}")
     if codes is not None and not args.no_save_codes:
         print(f"            {codes_bin_path}  ({len(blob)} bytes)")
         if args.save_npz_codes:

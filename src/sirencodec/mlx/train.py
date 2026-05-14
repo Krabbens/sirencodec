@@ -1242,6 +1242,13 @@ def main() -> None:
         action="store_true",
         help="While the GPU runs step t, load batch t+1 on a side thread (only with --data-dir / --librispeech)",
     )
+    p.add_argument(
+        "--sample-rate",
+        type=int,
+        default=16_000,
+        metavar="HZ",
+        help="Target training/output sample rate. Disk audio is resampled before batching.",
+    )
     p.add_argument("--segment", type=int, default=16384, help="Waveform length per sample (more latent frames helps RVQ)")
     p.add_argument("--lr", type=float, default=5e-4, help="Adam peak LR (warmup/plateau/cosine) or constant (--lr-schedule none)")
     p.add_argument(
@@ -1849,6 +1856,9 @@ def main() -> None:
     if args.grad_accum_steps < 1:
         print("--grad-accum-steps must be >= 1", file=sys.stderr)
         sys.exit(1)
+    if args.sample_rate < 1000:
+        print("--sample-rate must be >= 1000", file=sys.stderr)
+        sys.exit(1)
     if args.lr_min_ratio < 0 or args.lr_min_ratio > 1.0:
         print("--lr-min-ratio must be in [0, 1]", file=sys.stderr)
         sys.exit(1)
@@ -1881,6 +1891,9 @@ def main() -> None:
         enc_ch = ()
     if len(enc_ch) < 1:
         print("--enc-channels must list at least one integer width (comma-separated)", file=sys.stderr)
+        sys.exit(1)
+    if args.segment < encoder_time_stride(Config(enc_channels=enc_ch)):
+        print("--segment must be at least one encoder stride for the chosen --enc-channels", file=sys.stderr)
         sys.exit(1)
 
     if args.lambda_stft_grad < 0:
@@ -2082,6 +2095,7 @@ def main() -> None:
         stft_scale_weights_resolved = Config().stft_scale_weights
 
     cfg = Config(
+        sample_rate=args.sample_rate,
         steps=args.steps,
         batch=args.batch,
         load_audio_threads=args.load_audio_threads,
@@ -2822,7 +2836,7 @@ def main() -> None:
                 o = np.array(batch0[0, :, 0], dtype=np.float64)
                 r = np.array(y_ev[0, :, 0], dtype=np.float64)
                 sisdr = eval_metrics_mod.si_sdr_db(o, r)
-                pesq_v = eval_metrics_mod.pesq_wb_16k(o, r)
+                pesq_v = eval_metrics_mod.pesq_wb_16k(o, r) if int(cfg.sample_rate) == 16_000 else None
                 pesq_s = f"{pesq_v:.3f}" if pesq_v is not None else "na"
                 print(f"  [eval] SI-SDR={sisdr:.2f} dB  PESQ_wb={pesq_s}", flush=True)
                 if cfg.log_mlx_tsv:
