@@ -82,6 +82,8 @@ class Config:
     """Defaults: LibriSpeech, GAN-free spectral recipe (SC + Complex STFT + multi-scale log-mag)."""
 
     sample_rate: int = 16000
+    # Optional dataset bandwidth limit after resampling. 0 = keep full Nyquist band.
+    audio_lowpass_hz: float = 0.0
     # Longer segment = more latent frames per chunk (helps RVQ stats at high time downsampling).
     segment: int = 16384  # 1.0 s @ 16 kHz
     # FastGAN preset: keep architecture, cut loss compute.
@@ -434,6 +436,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
     d: dict[str, object] = {
         "enc_channels": ",".join(str(x) for x in c.enc_channels),
         "sample_rate": c.sample_rate,
+        "audio_lowpass_hz": c.audio_lowpass_hz,
         "steps": c.steps,
         "batch": c.batch,
         "grad_accum_steps": c.grad_accum_steps,
