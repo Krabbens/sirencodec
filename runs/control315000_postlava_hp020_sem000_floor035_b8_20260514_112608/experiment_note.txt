@@ -1,0 +1,1 @@
+Start from floorcut codec_step315000. LavaSR-inspired post-waveform high-pass residual refiner after decoder; RVQ/bitrate unchanged; semantic off to isolate waveform post-refiner. Stop if fixed8 is worse than source by 10k.

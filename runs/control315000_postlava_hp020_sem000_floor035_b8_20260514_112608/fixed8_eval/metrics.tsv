@@ -1,0 +1,7 @@
+step	checkpoint	si_sdr_db	pesq_wb	stoi	lsd_db	l1	cos	beats_baseline_and_control
+317500	/Users/quo/sirencodec/runs/control315000_postlava_hp020_sem000_floor035_b8_20260514_112608/checkpoints/codec_step317500.npz	-0.156287	1.378368	0.660352	9.920310	0.036957	0.700672	no
+320000	/Users/quo/sirencodec/runs/control315000_postlava_hp020_sem000_floor035_b8_20260514_112608/checkpoints/codec_step320000.npz	-0.156822	1.375975	0.658886	9.837702	0.037046	0.700673	no
+322500	/Users/quo/sirencodec/runs/control315000_postlava_hp020_sem000_floor035_b8_20260514_112608/checkpoints/codec_step322500.npz	-0.036661	1.374678	0.659713	9.828245	0.036830	0.705729	no
+325000	/Users/quo/sirencodec/runs/control315000_postlava_hp020_sem000_floor035_b8_20260514_112608/checkpoints/codec_step325000.npz	-0.081380	1.363605	0.660571	9.845808	0.036900	0.703829	no
+327500	/Users/quo/sirencodec/runs/control315000_postlava_hp020_sem000_floor035_b8_20260514_112608/checkpoints/codec_step327500.npz	-0.159249	1.377156	0.658066	9.829287	0.036997	0.700605	no
+329999	/Users/quo/sirencodec/runs/control315000_postlava_hp020_sem000_floor035_b8_20260514_112608/checkpoints/codec_step329999.npz	-0.157373	1.363142	0.655484	9.765636	0.037064	0.700767	no

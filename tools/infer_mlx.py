@@ -246,6 +246,71 @@ def load_audio_mono(path: Path, target_sr: int, max_seconds: float | None) -> "n
     return (wav / m).astype(np.float32)
 
 
+def spectral_noise_filter(
+    wav_1d: "numpy.ndarray",
+    *,
+    strength: float = 0.35,
+    noise_percentile: float = 20.0,
+    min_gain: float = 0.20,
+    n_fft: int = 1024,
+    hop: int = 256,
+) -> "numpy.ndarray":
+    """Lightweight STFT-domain denoiser for post-decode inference output."""
+    import numpy as np
+
+    x = np.asarray(wav_1d, dtype=np.float32).reshape(-1)
+    if x.size == 0 or strength <= 0.0:
+        return x.copy()
+    n_fft = int(n_fft)
+    hop = int(hop)
+    if n_fft < 16 or hop < 1:
+        raise ValueError("noise filter requires n_fft >= 16 and hop >= 1")
+    strength = float(np.clip(strength, 0.0, 1.0))
+    noise_percentile = float(np.clip(noise_percentile, 0.0, 100.0))
+    min_gain = float(np.clip(min_gain, 0.0, 1.0))
+
+    win = np.hanning(n_fft).astype(np.float32)
+    starts = list(range(0, max(1, x.size), hop))
+    padded_len = starts[-1] + n_fft
+    padded = np.zeros(padded_len, dtype=np.float32)
+    padded[: x.size] = x
+
+    spec = []
+    for start in starts:
+        spec.append(np.fft.rfft(padded[start : start + n_fft] * win))
+    S = np.stack(spec, axis=0)
+    mag = np.abs(S).astype(np.float32)
+    noise = np.percentile(mag, noise_percentile, axis=0).astype(np.float32)
+    noise_power = (noise[None, :] * (1.0 + 2.0 * strength)) ** 2
+    raw_mask = (mag**2) / (mag**2 + noise_power + 1e-12)
+    raw_mask = np.maximum(raw_mask, min_gain)
+    mask = (1.0 - strength) + strength * raw_mask
+
+    y = np.zeros(padded_len, dtype=np.float32)
+    norm = np.zeros(padded_len, dtype=np.float32)
+    for frame_i, start in enumerate(starts):
+        frame = np.fft.irfft(S[frame_i] * mask[frame_i], n=n_fft).astype(np.float32)
+        y[start : start + n_fft] += frame * win
+        norm[start : start + n_fft] += win * win
+    good = norm > 1e-8
+    y[good] /= norm[good]
+    return y[: x.size].astype(np.float32)
+
+
+def numpy_cosine(a: "numpy.ndarray", b: "numpy.ndarray") -> float:
+    import numpy as np
+
+    n = min(int(a.shape[0]), int(b.shape[0]))
+    if n <= 0:
+        return 0.0
+    av = np.asarray(a[:n], dtype=np.float32).reshape(-1)
+    bv = np.asarray(b[:n], dtype=np.float32).reshape(-1)
+    denom = float(np.linalg.norm(av) * np.linalg.norm(bv))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.dot(av, bv) / denom)
+
+
 def infer_waveform(
     tm, model, cfg, wav_1d: "numpy.ndarray"
 ) -> tuple["numpy.ndarray", float, list["numpy.ndarray"] | None]:
@@ -276,9 +341,7 @@ def infer_waveform(
         valid = end - start
         y_np = np.array(y[0, :valid, 0], dtype=np.float32)
         outs.append(y_np)
-        cos = tm.batch_mean_cosine(x[:, :valid, :], y[:, :valid, :])
-        mx.eval(cos)
-        cos_vals.append(float(cos.item()))
+        cos_vals.append(numpy_cosine(wav_1d[start:end], y_np))
         start = end
 
     recon = np.concatenate(outs) if outs else np.zeros(0, dtype=np.float32)
@@ -355,6 +418,39 @@ def main() -> None:
         help="Must match training (stride-1 blocks per scale in encoder/decoder)",
     )
     p.add_argument("--latent-dim", type=int, default=dcfg.latent_dim, help="Must match training")
+    p.add_argument("--self-attention-depth", type=int, default=dcfg.self_attention_depth, help="Must match training")
+    p.add_argument(
+        "--self-attention-post-depth",
+        type=int,
+        default=dcfg.self_attention_post_depth,
+        help="Must match training",
+    )
+    p.add_argument("--self-attention-heads", type=int, default=dcfg.self_attention_heads, help="Must match training")
+    p.add_argument("--decoder-refine-depth", type=int, default=dcfg.decoder_refine_depth, help="Must match training")
+    p.add_argument("--decoder-refine-gain", type=float, default=dcfg.decoder_refine_gain, help="Must match training")
+    p.add_argument("--decoder-band-heads", type=int, default=dcfg.decoder_band_heads, help="Must match training")
+    p.add_argument("--decoder-band-depth", type=int, default=dcfg.decoder_band_depth, help="Must match training")
+    p.add_argument("--decoder-band-gain", type=float, default=dcfg.decoder_band_gain, help="Must match training")
+    p.add_argument("--post-lavasr-depth", type=int, default=dcfg.post_lavasr_depth, help="Must match training")
+    p.add_argument("--post-lavasr-channels", type=int, default=dcfg.post_lavasr_channels, help="Must match training")
+    p.add_argument("--post-lavasr-kernel", type=int, default=dcfg.post_lavasr_kernel, help="Must match training")
+    p.add_argument("--post-lavasr-gain", type=float, default=dcfg.post_lavasr_gain, help="Must match training")
+    p.add_argument(
+        "--post-lavasr-highpass",
+        action=argparse.BooleanOptionalAction,
+        default=dcfg.post_lavasr_highpass,
+        help="Must match training",
+    )
+    p.add_argument(
+        "--harmonic-source",
+        action=argparse.BooleanOptionalAction,
+        default=dcfg.harmonic_source,
+        help="Must match training",
+    )
+    p.add_argument("--harmonic-harmonics", type=int, default=dcfg.harmonic_harmonics, help="Must match training")
+    p.add_argument("--harmonic-amp", type=float, default=dcfg.harmonic_amp, help="Must match training")
+    p.add_argument("--harmonic-f0-min", type=float, default=dcfg.harmonic_f0_min, help="Must match training")
+    p.add_argument("--harmonic-f0-max", type=float, default=dcfg.harmonic_f0_max, help="Must match training")
     p.add_argument(
         "--pre-vq-layernorm",
         action=argparse.BooleanOptionalAction,
@@ -392,7 +488,35 @@ def main() -> None:
         action="store_true",
         help="Print stderr note on reaching ~1 kbps (36× lower than ~36 kbps nominal)",
     )
+    p.add_argument(
+        "--noise-filter",
+        action="store_true",
+        help="Apply a lightweight spectral noise gate to *_recon.wav; raw output is kept as *_recon_raw.wav",
+    )
+    p.add_argument("--noise-filter-strength", type=float, default=0.35, help="Denoise blend in [0,1]")
+    p.add_argument(
+        "--noise-filter-percentile",
+        type=float,
+        default=20.0,
+        help="Percentile over STFT frames used as the noise-floor estimate",
+    )
+    p.add_argument("--noise-filter-min-gain", type=float, default=0.20, help="Lower mask gain in [0,1]")
+    p.add_argument("--noise-filter-n-fft", type=int, default=1024)
+    p.add_argument("--noise-filter-hop", type=int, default=256)
     args = p.parse_args()
+
+    if not (0.0 <= args.noise_filter_strength <= 1.0):
+        print("--noise-filter-strength must be in [0, 1]", file=sys.stderr)
+        sys.exit(1)
+    if not (0.0 <= args.noise_filter_percentile <= 100.0):
+        print("--noise-filter-percentile must be in [0, 100]", file=sys.stderr)
+        sys.exit(1)
+    if not (0.0 <= args.noise_filter_min_gain <= 1.0):
+        print("--noise-filter-min-gain must be in [0, 1]", file=sys.stderr)
+        sys.exit(1)
+    if args.noise_filter_n_fft < 16 or args.noise_filter_hop < 1:
+        print("--noise-filter-n-fft must be >= 16 and --noise-filter-hop must be >= 1", file=sys.stderr)
+        sys.exit(1)
 
     ck = args.checkpoint.resolve()
     if not ck.is_file():
@@ -444,6 +568,24 @@ def main() -> None:
         enc_channels=enc_ch,
         stride1_blocks_per_scale=args.stride1_blocks_per_scale,
         latent_dim=args.latent_dim,
+        self_attention_depth=args.self_attention_depth,
+        self_attention_post_depth=args.self_attention_post_depth,
+        self_attention_heads=args.self_attention_heads,
+        decoder_refine_depth=args.decoder_refine_depth,
+        decoder_refine_gain=args.decoder_refine_gain,
+        decoder_band_heads=args.decoder_band_heads,
+        decoder_band_depth=args.decoder_band_depth,
+        decoder_band_gain=args.decoder_band_gain,
+        post_lavasr_depth=args.post_lavasr_depth,
+        post_lavasr_channels=args.post_lavasr_channels,
+        post_lavasr_kernel=args.post_lavasr_kernel,
+        post_lavasr_gain=args.post_lavasr_gain,
+        post_lavasr_highpass=bool(args.post_lavasr_highpass),
+        harmonic_source=bool(args.harmonic_source),
+        harmonic_harmonics=args.harmonic_harmonics,
+        harmonic_amp=args.harmonic_amp,
+        harmonic_f0_min=args.harmonic_f0_min,
+        harmonic_f0_max=args.harmonic_f0_max,
         pre_vq_layernorm=args.pre_vq_layernorm,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
@@ -453,14 +595,32 @@ def main() -> None:
     )
     model = tm.MLXCodec(cfg)
     try:
-        model.load_weights(str(ck))
+        model.load_weights(str(ck), strict=True)
     except Exception as e:
-        print(f"load_weights failed: {e}", file=sys.stderr)
-        print("Hint: training Config must match (try without --ae-only or with it).", file=sys.stderr)
-        sys.exit(1)
+        try:
+            model.load_weights(str(ck), strict=False)
+            print(f"[load] strict load failed; loaded matching weights with strict=False ({e})", file=sys.stderr)
+        except Exception as e2:
+            print(f"load_weights failed: {e}", file=sys.stderr)
+            print(f"  after strict=False retry: {e2}", file=sys.stderr)
+            print("Hint: training Config must match (try without --ae-only or with it).", file=sys.stderr)
+            sys.exit(1)
 
     wav = load_audio_mono(inp, cfg.sample_rate, args.max_seconds)
     recon, mean_cos, codes = infer_waveform(tm, model, cfg, wav)
+    recon_to_write = recon
+    filtered_cos: float | None = None
+    raw_recon_path: Path | None = None
+    if args.noise_filter:
+        recon_to_write = spectral_noise_filter(
+            recon,
+            strength=args.noise_filter_strength,
+            noise_percentile=args.noise_filter_percentile,
+            min_gain=args.noise_filter_min_gain,
+            n_fft=args.noise_filter_n_fft,
+            hop=args.noise_filter_hop,
+        )
+        filtered_cos = numpy_cosine(wav, recon_to_write)
 
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -474,7 +634,10 @@ def main() -> None:
     o_path = out_dir / f"{stem}_orig.wav"
     r_path = out_dir / f"{stem}_recon.wav"
     sf.write(str(o_path), np.clip(wav, -1.0, 1.0), cfg.sample_rate, subtype="PCM_16")
-    sf.write(str(r_path), np.clip(recon, -1.0, 1.0), cfg.sample_rate, subtype="PCM_16")
+    if args.noise_filter:
+        raw_recon_path = out_dir / f"{stem}_recon_raw.wav"
+        sf.write(str(raw_recon_path), np.clip(recon, -1.0, 1.0), cfg.sample_rate, subtype="PCM_16")
+    sf.write(str(r_path), np.clip(recon_to_write, -1.0, 1.0), cfg.sample_rate, subtype="PCM_16")
 
     enc_stride = encoder_time_stride(cfg)
     codes_bin_path = out_dir / f"{stem}_codes.bin"
@@ -534,8 +697,18 @@ def main() -> None:
             print(
                 f"            uint16-per-index storage ~{naive_kbps:.1f} kbps (wasteful vs variable bit-width packing)"
             )
-    print(f"mean cos:   {100.0 * mean_cos:.1f}%")
+    if args.noise_filter:
+        print(
+            f"denoise:    spectral gate strength={args.noise_filter_strength:g} "
+            f"p{args.noise_filter_percentile:g} min_gain={args.noise_filter_min_gain:g} "
+            f"nfft={args.noise_filter_n_fft} hop={args.noise_filter_hop}"
+        )
+        print(f"mean cos:   raw {100.0 * mean_cos:.1f}%  filtered {100.0 * float(filtered_cos):.1f}%")
+    else:
+        print(f"mean cos:   {100.0 * mean_cos:.1f}%")
     print(f"wrote:      {o_path}")
+    if raw_recon_path is not None:
+        print(f"            {raw_recon_path}")
     print(f"            {r_path}")
     if codes is not None and not args.no_save_codes:
         print(f"            {codes_bin_path}  ({len(blob)} bytes)")

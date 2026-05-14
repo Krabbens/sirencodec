@@ -71,6 +71,17 @@ def test_config_defaults_are_coherent():
     assert isinstance(cfg.eval_seed, int)
     assert cfg.disc_type in {"msd", "mpd", "msmpd"}
     assert all(p > 0 for p in cfg.disc_periods)
+    assert cfg.self_attention_depth >= 0
+    assert cfg.self_attention_post_depth >= 0
+    assert cfg.self_attention_heads >= 1
+    assert cfg.decoder_refine_depth >= 0
+    assert cfg.decoder_refine_gain >= 0
+    assert cfg.decoder_band_heads >= 1
+    assert cfg.decoder_band_depth >= 0
+    assert cfg.decoder_band_gain >= 0
+    assert cfg.harmonic_harmonics >= 1
+    assert cfg.harmonic_amp >= 0
+    assert 0 < cfg.harmonic_f0_min < cfg.harmonic_f0_max
 
 
 def test_argparse_defaults_cover_current_config():
@@ -83,6 +94,10 @@ def test_argparse_defaults_cover_current_config():
     assert defaults["lambda_preemph"] == Config().lambda_preemph
     assert defaults["lambda_fm"] == Config().lambda_fm
     assert defaults["disc_periods"] == ",".join(str(x) for x in Config().disc_periods)
+    assert defaults["self_attention_heads"] == Config().self_attention_heads
+    assert defaults["decoder_refine_depth"] == Config().decoder_refine_depth
+    assert defaults["decoder_band_heads"] == Config().decoder_band_heads
+    assert defaults["harmonic_source"] == Config().harmonic_source
 
 
 def test_stft_parsers_accept_valid_values_and_reject_bad_ones():
@@ -117,6 +132,19 @@ def test_infer_tool_module_loads():
     mod = _load_tool(ROOT / "tools" / "infer_mlx.py", "infer_mlx_smoke")
     assert hasattr(mod, "pack_vq_bitstream")
     assert hasattr(mod, "nominal_bitrate_bps")
+    assert hasattr(mod, "spectral_noise_filter")
+
+
+def test_infer_noise_filter_preserves_shape_and_is_finite():
+    import numpy as np
+
+    mod = _load_tool(ROOT / "tools" / "infer_mlx.py", "infer_mlx_noise_filter")
+    wav = np.zeros(2048, dtype=np.float32)
+    wav[200:260] = 0.5
+    wav += np.random.default_rng(0).normal(0.0, 0.01, wav.shape).astype(np.float32)
+    out = mod.spectral_noise_filter(wav, strength=0.6, n_fft=256, hop=64)
+    assert out.shape == wav.shape
+    assert np.isfinite(out).all()
 
 
 def test_curriculum_enters_phase_c_only_when_gan_is_enabled():
@@ -220,6 +248,54 @@ def test_forward_full_can_return_continuous_anchor():
     y, _, _, _, idx, y_cont = model.forward_full(x, return_continuous=True)
     assert y.shape == x.shape
     assert y_cont.shape == x.shape
+    assert idx is not None
+
+
+def test_latent_self_attention_forward_matches_audio_shape():
+    cfg = Config(
+        batch=1,
+        segment=64,
+        enc_channels=(4, 4),
+        latent_dim=8,
+        latent_temporal_depth=0,
+        latent_temporal_post_depth=0,
+        self_attention_depth=1,
+        self_attention_heads=2,
+        n_codebooks=1,
+        codebook_size=8,
+        rvq_code_dim=0,
+    )
+    model = CUDACodec(cfg)
+    x = torch.randn(1, 64, 1)
+    y, _, _, _, idx = model.forward_full(x)
+    assert y.shape == x.shape
+    assert idx is not None
+
+
+def test_decoder_architecture_branches_forward_match_audio_shape():
+    cfg = Config(
+        batch=1,
+        segment=64,
+        enc_channels=(4, 4),
+        latent_dim=8,
+        latent_temporal_depth=0,
+        latent_temporal_post_depth=0,
+        decoder_refine_depth=1,
+        decoder_refine_gain=0.05,
+        decoder_band_heads=3,
+        decoder_band_depth=1,
+        decoder_band_gain=0.03,
+        harmonic_source=True,
+        harmonic_harmonics=4,
+        harmonic_amp=0.02,
+        n_codebooks=1,
+        codebook_size=8,
+        rvq_code_dim=0,
+    )
+    model = CUDACodec(cfg)
+    x = torch.randn(1, 64, 1)
+    y, _, _, _, idx = model.forward_full(x)
+    assert y.shape == x.shape
     assert idx is not None
 
 
