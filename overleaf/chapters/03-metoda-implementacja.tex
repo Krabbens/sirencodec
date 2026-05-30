@@ -1,0 +1,35 @@
+\chapter{Metoda i implementacja systemu}
+\label{ch:metoda-implementacja}
+
+\section{Założenia projektowe proponowanego rozwiązania}
+\label{sec:zalozenia-projektowe}
+
+% TODO: Opisać wymagania projektowe kodeka: przepływność poniżej 1 kbps, sygnał mowy 16 kHz,
+% możliwość pracy w warunkach brzegowych, ograniczony koszt obliczeniowy, rekonstrukcja z dyskretnych indeksów
+% oraz rozdzielenie etapu uczenia od etapu inferencji.
+
+\section{Dobór reprezentacji sygnału wejściowego}
+\label{sec:reprezentacja-wejsciowa}
+
+% TODO: Uzasadnić pracę bezpośrednio na przebiegu czasowym oraz wykorzystanie reprezentacji STFT i mel
+% jako składników funkcji kosztu. Należy wskazać parametry segmentów, próbkowania i ewentualnego przygotowania danych.
+
+\section{Architektura kodera i dekodera}
+\label{sec:architektura-kodera-dekodera}
+
+% TODO: Opisać moduły SirenCodec: konwolucyjny koder z redukcją czasu, przestrzeń latentną,
+% residual vector quantization, dekoder z nadpróbkowaniem, aktywacje SnakeBeta oraz opcjonalne bloki
+% samouwagi, temporalne, pasmowe, harmoniczne i post-refiner.
+
+\section{Proces kompresji i rekonstrukcji sygnału}
+\label{sec:kompresja-rekonstrukcja}
+
+% TODO: Przedstawić przepływ danych: audio -> koder -> wektory latentne -> RVQ -> strumień indeksów
+% -> dekoder -> sygnał zrekonstruowany. Wzór na nominalną przepływność powinien wynikać z liczby słowników,
+% rozmiarów codebooków i częstotliwości ramek latentnych.
+
+\section{Implementacja systemu oraz wykorzystane technologie}
+\label{sec:implementacja-technologie}
+
+% TODO: Opisać strukturę repozytorium, backend CUDA/PyTorch, pomocniczy backend MLX, konfiguracje JSON,
+% skrypty treningowe, Docker, zapisywanie checkpointów, logów, spektrogramów i plików audio oraz testy automatyczne.

@@ -1,35 +1,277 @@
-@String{pub-AW          = "Ad{\-d}i{\-s}on-Wes{\-l}ey"}
-@String{pub-AW:adr      = "Reading, MA, USA"}
+% Bibliografia przygotowana na podstawie pliku overleaf/slr-nowy.pdf.
+% Klucze cytowan dobrano tak, aby mozna bylo latwo odwolac sie do zrodel
+% w rozdzialach pracy, np. \cite{Zeghidour2021SoundStream}.
 
-@Book{Knuth1986,
-  author =       "Donald E. Knuth",
-  title =        "The {\TeX}book",
-  publisher =    pub-AW,
-  address =      pub-AW:adr,
-  year =         "1986",
-  series =       "Computers and Typesetting",
-  ISBN =         "0-201-13447-0",
-  LCCN =         "Z253.4.T47 K58 1986",
-  pages =        "ix + 483",
-  bibdate =      "Wed Dec 15 10:36:52 1993",
+@article{Backstrom2017SparseLinearPrediction,
+  author  = {Tom B{\"a}ckstr{\"o}m and Carl M{\"a}gi},
+  title   = {Sparse Linear Prediction for Efficient Speech Coding at Low Bit Rates},
+  journal = {IEEE/ACM Transactions on Audio, Speech, and Language Processing},
+  year    = {2017},
+  volume  = {25},
+  number  = {4},
+  pages   = {789--800},
 }
 
-@Book{Lamport1985,
-  author =       "Leslie Lamport",
-  title =        "{\LaTeX} --- A Document Preparation System ---
-                 User's Guide and Reference Manual",
-  publisher =    pub-AW,
-  address =      pub-AW:adr,
-  year =         "1985",
-  ISBN =         "0-201-15790-X",
-  LCCN =         "Z253.4.L38 L35 1986",
-  pages =        "xiv + 242",
-  bibdate =      "Wed Dec 15 10:38:04 1993",
+@misc{Defossez2022Encodec,
+  author        = {Alexandre D{\'e}fossez and Jade Copet and Gabriel Synnaeve and Yossi Adi},
+  title         = {High Fidelity Neural Audio Compression},
+  year          = {2022},
+  eprint        = {2210.13438},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SD},
 }
 
-@misc{Drozdowski2006,
-  author = "Maciej Drozdowski",
-  title = "Jak pisać prace dyplomowe -- uwagi o formie",
-  howpublished = "[on-line] \url{http://www.cs.put.poznan.pl/mdrozdowski/dyd/txt/jak_mgr.html}",
-  year = {2006},
+@inproceedings{Garner2019SinusoidalCoding,
+  author    = {Philip N. Garner and Milo{\v{s}} Cernak},
+  title     = {Sinusoidal Coding for Low Bit-Rate Speech Synthesis},
+  booktitle = {Proceedings of Interspeech},
+  year      = {2019},
+  pages     = {1203--1207},
+}
+
+@inproceedings{Kankanahalli2018EndToEndSpeechCoding,
+  author    = {Srinivas Kankanahalli},
+  title     = {End-to-End Optimized Speech Coding with Deep Neural Networks},
+  booktitle = {Proceedings of IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  year      = {2018},
+  pages     = {2521--2525},
+}
+
+@inproceedings{Kleijn2018WaveNetLowRate,
+  author    = {W. B. Kleijn and F. S. Lim and A. Luebs and J. Skoglund and F. Stimberg and Q. Wang and T. C. Walters},
+  title     = {{WaveNet} Based Low Rate Speech Coding},
+  booktitle = {Proceedings of IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  year      = {2018},
+  pages     = {676--680},
+}
+
+@inproceedings{Morrison2022EfficientNeuralAudioCodecs,
+  author    = {Max Morrison and Justin Xu and Nicholas J. Bryan},
+  title     = {Efficient Neural Audio Codecs for Low-Latency Streaming on Edge Devices},
+  booktitle = {Proceedings of IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  year      = {2022},
+  pages     = {7862--7866},
+}
+
+@techreport{NATO2015STANAG4591,
+  author      = {{NATO Standardization Office}},
+  title       = {{STANAG} 4591: The {NATO} 600/1200/2400 bps Voice Coder},
+  institution = {NATO Standardization Office},
+  year        = {2015},
+  note        = {NATO STANAG},
+}
+
+@inproceedings{Polyak2021SpeechResynthesis,
+  author    = {Adam Polyak and Yossi Adi and Jade Copet and Eugene Kharitonov and Karan Lakhotia and Wei-Ning Hsu and others},
+  title     = {Speech Resynthesis from Discrete Disentangled Self-Supervised Representations},
+  booktitle = {Proceedings of Interspeech},
+  year      = {2021},
+  pages     = {3615--3619},
+}
+
+@inproceedings{Rowe2019Codec2,
+  author    = {David Rowe},
+  title     = {{Codec 2}: Open Source Low Bit Rate Speech Codec},
+  booktitle = {Proceedings of Linux.conf.au},
+  year      = {2019},
+}
+
+@techreport{Rowe2021Codec2450,
+  author      = {David Rowe},
+  title       = {{Codec 2} at 450 bit/s},
+  institution = {FreeDV Project},
+  year        = {2021},
+  note        = {Technical report},
+}
+
+@inproceedings{Valin2022UltraLowLatencySpeechEnhancement,
+  author    = {Jean-Marc Valin and Johannes B{\"u}the and Koen Vos},
+  title     = {Real-Time Ultra-Low Latency Speech Enhancement on {ARM} Processors},
+  booktitle = {Proceedings of IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  year      = {2022},
+  pages     = {7867--7871},
+}
+
+@inproceedings{Valin2019LPCNet,
+  author    = {Jean-Marc Valin and Jan Skoglund},
+  title     = {{LPCNet}: Improving Neural Speech Synthesis Through Linear Prediction},
+  booktitle = {Proceedings of IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  year      = {2019},
+  pages     = {5891--5895},
+}
+
+@misc{VanDenOord2016WaveNet,
+  author        = {Aaron van den Oord and Sander Dieleman and Heiga Zen and Karen Simonyan and Oriol Vinyals and Alex Graves and others},
+  title         = {{WaveNet}: A Generative Model for Raw Audio},
+  year          = {2016},
+  eprint        = {1609.03499},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SD},
+}
+
+@misc{Yang2023HiFiCodec,
+  author        = {Di Yang and Shuai Liu and Yao Zhou and Hao Zhang and Xing Li and Yao Wang and Furu Wei},
+  title         = {{HiFi-Codec}: Group-Residual Vector Quantization for High Fidelity Audio Codec},
+  year          = {2023},
+  eprint        = {2305.02765},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SD},
+}
+
+@article{Zeghidour2021SoundStream,
+  author  = {Neil Zeghidour and Aaron Luebs and Ahmed Omran and Jan Skoglund and Marco Tagliasacchi},
+  title   = {{SoundStream}: An End-to-End Neural Audio Codec},
+  journal = {IEEE/ACM Transactions on Audio, Speech, and Language Processing},
+  year    = {2021},
+  volume  = {30},
+  pages   = {495--507},
+}
+
+@misc{Zhang2023SpeechTokenizer,
+  author        = {Xiang Zhang and Xu Tan and Tao Qin and Sheng Chen and Tie-Yan Liu},
+  title         = {{SpeechTokenizer}: Unified Speech Tokenizer for Speech Language Models},
+  year          = {2023},
+  eprint        = {2308.16692},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+}
+
+@inproceedings{Zhu2021OptimizingLPCNet,
+  author    = {Yutong Zhu and Jean-Marc Valin},
+  title     = {Optimizing {LPCNet} for Embedded Devices},
+  booktitle = {Proceedings of Interspeech},
+  year      = {2021},
+  pages     = {1831--1835},
+}
+
+% Uzupelniajace zrodla do podstaw sieci neuronowych, autoenkoderow,
+% kwantyzacji wektorowej i implementacji uczenia.
+
+@book{Goodfellow2016DeepLearning,
+  author    = {Ian Goodfellow and Yoshua Bengio and Aaron Courville},
+  title     = {Deep Learning},
+  publisher = {MIT Press},
+  year      = {2016},
+  url       = {http://www.deeplearningbook.org},
+}
+
+@article{Rosenblatt1958Perceptron,
+  author  = {Frank Rosenblatt},
+  title   = {The Perceptron: A Probabilistic Model for Information Storage and Organization in the Brain},
+  journal = {Psychological Review},
+  year    = {1958},
+  volume  = {65},
+  number  = {6},
+  pages   = {386--408},
+  doi     = {10.1037/h0042519},
+}
+
+@article{Rumelhart1986Backprop,
+  author  = {David E. Rumelhart and Geoffrey E. Hinton and Ronald J. Williams},
+  title   = {Learning Representations by Back-Propagating Errors},
+  journal = {Nature},
+  year    = {1986},
+  volume  = {323},
+  pages   = {533--536},
+  doi     = {10.1038/323533a0},
+}
+
+@article{LeCun1998GradientBasedLearning,
+  author  = {Yann LeCun and L{\'e}on Bottou and Yoshua Bengio and Patrick Haffner},
+  title   = {Gradient-Based Learning Applied to Document Recognition},
+  journal = {Proceedings of the IEEE},
+  year    = {1998},
+  volume  = {86},
+  number  = {11},
+  pages   = {2278--2324},
+  doi     = {10.1109/5.726791},
+}
+
+@article{Hinton2006DimensionalityReduction,
+  author  = {Geoffrey E. Hinton and Ruslan R. Salakhutdinov},
+  title   = {Reducing the Dimensionality of Data with Neural Networks},
+  journal = {Science},
+  year    = {2006},
+  volume  = {313},
+  number  = {5786},
+  pages   = {504--507},
+  doi     = {10.1126/science.1127647},
+}
+
+@article{Gray1984VectorQuantization,
+  author  = {Robert M. Gray},
+  title   = {Vector Quantization},
+  journal = {IEEE ASSP Magazine},
+  year    = {1984},
+  volume  = {1},
+  number  = {2},
+  pages   = {4--29},
+}
+
+@inproceedings{VanDenOord2017NeuralDiscrete,
+  author    = {Aaron van den Oord and Oriol Vinyals and Koray Kavukcuoglu},
+  title     = {Neural Discrete Representation Learning},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2017},
+  volume    = {30},
+  eprint    = {1711.00937},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+}
+
+@inproceedings{He2016DeepResidualLearning,
+  author    = {Kaiming He and Xiangyu Zhang and Shaoqing Ren and Jian Sun},
+  title     = {Deep Residual Learning for Image Recognition},
+  booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2016},
+  pages     = {770--778},
+  eprint    = {1512.03385},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+}
+
+@misc{Ba2016LayerNormalization,
+  author        = {Jimmy Lei Ba and Jamie Ryan Kiros and Geoffrey E. Hinton},
+  title         = {Layer Normalization},
+  year          = {2016},
+  eprint        = {1607.06450},
+  archivePrefix = {arXiv},
+  primaryClass  = {stat.ML},
+}
+
+@article{Srivastava2014Dropout,
+  author  = {Nitish Srivastava and Geoffrey Hinton and Alex Krizhevsky and Ilya Sutskever and Ruslan Salakhutdinov},
+  title   = {Dropout: A Simple Way to Prevent Neural Networks from Overfitting},
+  journal = {Journal of Machine Learning Research},
+  year    = {2014},
+  volume  = {15},
+  number  = {56},
+  pages   = {1929--1958},
+}
+
+@inproceedings{Kingma2015Adam,
+  author    = {Diederik P. Kingma and Jimmy Ba},
+  title     = {Adam: A Method for Stochastic Optimization},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2015},
+  eprint    = {1412.6980},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+}
+
+@inproceedings{Paszke2019PyTorch,
+  author    = {Adam Paszke and Sam Gross and Francisco Massa and Adam Lerer and James Bradbury and Gregory Chanan and Trevor Killeen and Zeming Lin and Natalia Gimelshein and Luca Antiga and Alban Desmaison and Andreas Kopf and Edward Yang and Zachary DeVito and Martin Raison and Alykhan Tejani and Sasank Chilamkurthy and Benoit Steiner and Lu Fang and Junjie Bai and Soumith Chintala},
+  title     = {{PyTorch}: An Imperative Style, High-Performance Deep Learning Library},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2019},
+  volume    = {32},
+}
+
+@inproceedings{Yamamoto2020ParallelWaveGAN,
+  author    = {Ryuichi Yamamoto and Eunwoo Song and Jae-Min Kim},
+  title     = {Parallel {WaveGAN}: A Fast Waveform Generation Model Based on Generative Adversarial Networks with Multi-Resolution Spectrogram},
+  booktitle = {Proceedings of IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  year      = {2020},
+  pages     = {6199--6203},
+  doi       = {10.1109/ICASSP40776.2020.9053795},
 }

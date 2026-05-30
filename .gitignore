@@ -21,6 +21,23 @@ dist/
 build/
 *.egg-info/
 
+# LaTeX / Overleaf build artifacts
+/overleaf/*.aux
+/overleaf/*.bbl
+/overleaf/*.bcf
+/overleaf/*.blg
+/overleaf/*.fdb_latexmk
+/overleaf/*.fls
+/overleaf/*.lof
+/overleaf/*.log
+/overleaf/*.lot
+/overleaf/*.out
+/overleaf/*.run.xml
+/overleaf/*.synctex.gz
+/overleaf/*.toc
+/overleaf/*.pdf
+/overleaf/**/*-eps-converted-to.pdf
+
 # Root-level training TSV dumps
 /results.tsv
 /log_mlx.tsv

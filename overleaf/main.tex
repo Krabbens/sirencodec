@@ -6,9 +6,9 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 
-% Szkielet dla pracy licencjackiej pisanej w języku polskim.
+% Szkielet dla pracy magisterskiej pisanej w języku polskim.
 
-\documentclass[polish,master,a4paper,oneside]{ppfcmthesis}
+\documentclass[polish,a4paper,oneside]{ppfcmthesis}
 
 
 \usepackage[utf8]{inputenc}
@@ -57,13 +57,17 @@
 \mainmatter%
 \input{chapters/01-wstep.tex}
 \input{chapters/02-teoria.tex}
-\input{chapters/03-praca-wlasna.tex}
-\input{chapters/04-zakonczenie.tex}
+\input{chapters/03-metoda-implementacja.tex}
+\input{chapters/04-eksperymenty.tex}
+\input{chapters/05-zakonczenie.tex}
 
 %--------------------------------------
 % Literatura
 %--------------------------------------
 
+\cleardoublepage
+\phantomsection
+\addcontentsline{toc}{chapter}{Literatura}
 \bibliographystyle{plain}{\raggedright\sloppy\small\bibliography{bibliografia}}
 
 %--------------------------------------

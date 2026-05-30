@@ -1,36 +1,38 @@
-
 \chapter{Wstęp}
+\label{ch:wstep}
 
-Wstęp do pracy powinien zawierać następujące elementy:
-\begin{itemize}
-    \item krótkie uzasadnienie podjęcia tematu; 
-    \item cel pracy (patrz niżej); 
-    \item zakres (przedmiotowy, podmiotowy, czasowy) wyjaśniający, w jakim rozmiarze praca będzie realizowana; 
-    \item ewentualne hipotezy, które autor zamierza sprawdzić lub udowodnić; 
-    \item krótką charakterystykę źródeł, zwłaszcza literaturowych; 
-    \item układ pracy (patrz niżej), czyli zwięzłą charakterystykę zawartości poszczególnych rozdziałów; 
-    \item ewentualne uwagi dotyczące realizacji tematu pracy np.~trudności, które pojawiły się w trakcie 
-    realizacji poszczególnych zadań, uwagi dotyczące wykorzystywanego sprzętu, współpraca z firmami zewnętrznymi. 
-\end{itemize}
+\section{Wprowadzenie do problematyki kompresji dźwięku przy bardzo niskich przepływnościach}
+\label{sec:wprowadzenie-kompresja-ultra-low}
 
-\noindent
-\textbf{Wstęp do pracy musi się kończyć dwoma następującymi akapitami:}
-\begin{quote}
-Celem pracy jest opracowanie / wykonanie analizy / zaprojektowanie / ...........
-\end{quote}
-oraz:
-\begin{quote}
-Struktura pracy jest następująca. W rozdziale 2 przedstawiono przegląd literatury na temat ........ 
-Rozdział 3 jest poświęcony ....... (kilka zdań). 
-Rozdział 4 zawiera ..... (kilka zdań) ............ itd. 
-Rozdział X stanowi podsumowanie pracy. 
-\end{quote}
+% TODO: Wprowadzić problem kompresji mowy i dźwięku w warunkach przepływności poniżej 1 kbps.
+% Należy zarysować, dlaczego klasyczne zachowanie pełnej wierności sygnału jest w tym reżimie trudne
+% i dlaczego w przypadku mowy istotna staje się rekonstrukcja informacji fonetycznej oraz percepcyjnej.
 
-W przypadku prac inżynierskich zespołowych lub magisterskich 2-osobowych, po tych dwóch w/w akapitach 
-musi w pracy znaleźć się akapit, w którym będzie opisany udział w pracy poszczególnych członków zespołu. Na przykład:
+\section{Motywacja do podjęcia tematu}
+\label{sec:motywacja}
 
-\begin{quote}
-Jan Kowalski w ramach niniejszej pracy wykonał projekt tego i tego, opracował ......
-Grzegorz Brzęczyszczykiewicz wykonał ......, itd. 
-\end{quote}
+% TODO: Uzasadnić temat w kontekście przetwarzania brzegowego: ograniczona przepustowość,
+% energooszczędność, prywatność, praca lokalna oraz możliwość transmisji lub archiwizacji mowy
+% przy bardzo małym budżecie bitowym.
 
+\section{Cel i zakres pracy}
+\label{sec:cel-zakres}
+
+% TODO: Opisać cel, zakres przedmiotowy, zakres implementacyjny i zakres eksperymentów.
+% Zgodnie z wymaganiem szablonu końcowa część wstępu musi zawierać akapit zaczynający się od:
+% "Celem pracy jest ...".
+
+% TODO: Po akapicie celu należy dodać akapit zaczynający się od:
+% "Struktura pracy jest następująca. W rozdziale 2 ...".
+% Ten akapit powinien krótko opisać zawartość rozdziałów 2--5.
+
+\section{Podział prac}
+\label{sec:podzial-prac}
+
+Praca miała charakter zespołowy, dlatego podział zadań należy rozumieć jako podział odpowiedzialności merytorycznej za poszczególne obszary projektu, a nie jako prosty podział według historii zmian w repozytorium. Część decyzji projektowych, implementacyjnych i eksperymentalnych była podejmowana wspólnie podczas pracy przy jednym stanowisku. Było to szczególnie istotne przy iteracyjnym strojeniu architektury kodeka oraz interpretacji wyników odsłuchowych i metrycznych.
+
+Do zadań wspólnych należał przegląd literatury dotyczącej wykorzystania sieci neuronowych do budowy kodeków mowy, w szczególności metod opartych na autoenkoderach, kwantyzacji wektorowej i uczeniu reprezentacji dyskretnych. Wspólnie opracowano także koncepcję kodeka mowy oraz wymagania projektowe obejmujące docelową przepływność bitową, jakość rekonstrukcji, opóźnienie przetwarzania i warianty działania systemu. Na tej podstawie przygotowano ogólną architekturę rozwiązania, obejmującą koder sygnału, warstwę reprezentacji latentnej, moduł kwantyzacji oraz dekoder fali dźwiękowej. Wspólnie określono również protokół ewaluacji, obejmujący zarówno miary obiektywne, jak i analizę artefaktów rekonstrukcji, a końcowe wnioski sformułowano na podstawie wyników uzyskanych przez obie osoby.
+
+Jakub Aszyk odpowiadał za część związaną z koderem wejściowym, przygotowaniem danych oraz wdrożeniem systemu na platformie brzegowej. W ramach implementacji opracował konwolucyjny tor kodera, którego zadaniem było przekształcenie surowej fali mowy do krótszej sekwencji wektorów latentnych przekazywanych następnie do kwantyzacji. Obejmowało to dobór liczby etapów redukcji czasowej, szerokości kanałów, wymiaru reprezentacji latentnej oraz sposobu przygotowania wyjścia kodera pod moduł RVQ. Część ta była istotna, ponieważ bezpośrednio wpływała na nominalną przepływność bitową, pojemność informacyjną reprezentacji i koszt dalszego dekodowania. Jakub przygotował również pipeline danych dla korpusów mowy, mechanizmy konfiguracji eksperymentów oraz narzędzia do logowania przebiegów treningu i porządkowania artefaktów, takich jak checkpointy, spektrogramy i przykłady rekonstruowanego dźwięku. W części związanej z przetwarzaniem brzegowym odpowiadał za analizę czasu inferencji, wykorzystania pamięci i stabilności działania modelu, a także za przygotowanie wersji eksportowalnej, konwersję do TensorFlow Lite oraz testy zgodności wyników względem implementacji referencyjnej.
+
+Kosma Gąsiorowski odpowiadał za część modelową związaną z rekonstrukcją i kwantyzacją oraz za zasadniczą część badań jakościowych. W ramach implementacji rozwijał moduł rezydualnej kwantyzacji wektorowej, dekoder rekonstruujący przebieg czasowy oraz warianty poprawiające jakość odtwarzania, takie jak bloki temporalne w przestrzeni latentnej, elementy samouwagi, dodatkowe głowice dekodera, aktywacje okresowe oraz moduł rekonstrukcji wysokoczęstotliwościowych składowych sygnału. Kosma przygotował również funkcje kosztu wykorzystywane podczas uczenia, w tym straty czasowe, wieloskalowe straty STFT, straty melowe, składniki stabilizujące kwantyzację oraz kary związane z wykorzystaniem słowników kodowych. W części eksperymentalnej odpowiadał za strojenie hiperparametrów, porównania wariantów architektury, analizę ablacyjną, ocenę jakości odtworzonego dźwięku oraz interpretację błędów na podstawie metryk, spektrogramów i testów porównawczych. Do jego zakresu należało także porządkowanie wersji eksperymentów w repozytorium oraz opracowanie dokumentacji uzyskanych wyników i badań analitycznych.
