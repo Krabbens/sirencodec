@@ -1,35 +1,340 @@
 \chapter{Metoda i implementacja systemu}
 \label{ch:metoda-implementacja}
 
+\providecommand{\notatabeli}[1]{%
+\par\smallskip
+\begin{minipage}{0.90\textwidth}
+\footnotesize\raggedright\emph{#1}
+\end{minipage}\par
+}
+
+Rozdział przedstawia projekt i implementację neuronowego kodeka mowy opracowanego w ramach pracy. Punktem wyjścia są ograniczenia omówione w rozdziale 2: bardzo mała przepływność bitowa, konieczność zachowania zrozumiałości mowy oraz ograniczony koszt obliczeniowy po stronie inferencji. Proponowany system pracuje poniżej \(1\) kbps, a informacja przesyłana między koderem i dekoderem ma postać indeksów rezydualnej kwantyzacji wektorowej \cite{Gray1984VectorQuantization,Zeghidour2021SoundStream,Defossez2022Encodec}. Nie jest to więc kodek nastawiony na wierne odtworzenie przebiegu próbkowego. Jego zadaniem jest zachowanie tych cech sygnału, które mają największe znaczenie dla odbioru mowy. Do szczegółowego opisu przyjęto wariant wybrany po serii eksperymentów treningowych i odsłuchowych. Odwołuje się on do konkretnego checkpointu oraz zestawu parametrów modelu, dlatego w dalszej części rozdziału jest traktowany jako punkt odniesienia, a nie jako osobny standard kodowania. Model ma około \(7{,}98\) mln parametrów, pracuje na sygnale próbkowanym z częstotliwością \(16\ \mathrm{kHz}\), redukuje rozdzielczość czasową \(256\)-krotnie i wykorzystuje trzy słowniki RVQ po \(32\) kody. Z tak dobranych parametrów wynika nominalna przepływność \(0{,}938\) kbps dla samych indeksów, bez narzutu nagłówków, kontenera i ewentualnej synchronizacji ramek.
+
+Kolejność opisu odpowiada kolejnym decyzjom projektowym. Najpierw omówiono założenia dotyczące przepływności i zakresu informacji, która powinna przejść przez wąskie gardło kodeka. Następnie opisano reprezentację sygnału wejściowego, architekturę kodera i dekodera oraz sposób zapisu indeksów RVQ. Ostatnia część rozdziału dotyczy implementacji, w tym podziału kodu na backendy, skryptów inferencyjnych, demonstratora przeglądarkowego i testów automatycznych. W tekście rozróżniono tor wymagany w czasie inferencji od mechanizmów używanych tylko podczas treningu lub diagnostyki.
+
 \section{Założenia projektowe proponowanego rozwiązania}
 \label{sec:zalozenia-projektowe}
 
-% TODO: Opisać wymagania projektowe kodeka: przepływność poniżej 1 kbps, sygnał mowy 16 kHz,
-% możliwość pracy w warunkach brzegowych, ograniczony koszt obliczeniowy, rekonstrukcja z dyskretnych indeksów
-% oraz rozdzielenie etapu uczenia od etapu inferencji.
+System zaprojektowano jako neuronowy kodek mowy dla przepływności poniżej 1 kbps. Przy tak małej liczbie bitów na sekundę nie można traktować zgodności próbek jako podstawowego kryterium jakości. Kanał jest zbyt wąski, aby przenieść pełny opis przebiegu czasowego lub bogaty opis widmowy. Założono więc, że model powinien zachowywać przede wszystkim informację fonetyczną, rytm wypowiedzi, podstawową barwę głosu i zarys struktury harmonicznej. Szczegóły akustyczne o mniejszym znaczeniu percepcyjnym mogą być rekonstruowane jedynie w przybliżeniu. Model referencyjny przetwarza mowę próbkowaną z częstotliwością \(16\ \mathrm{kHz}\). Koder zmniejsza rozdzielczość czasową \(256\)-krotnie, dlatego jedna sekunda sygnału odpowiada \(62{,}5\) ramkom latentnym. Każda ramka jest opisywana przez trzy indeksy RVQ, po jednym z każdego słownika o rozmiarze \(32\). Pojedynczy indeks wymaga nominalnie \(5\) bitów, a cała ramka \(15\) bitów. Przepływność strumienia indeksów wynosi więc \(62{,}5 \cdot 15 = 937{,}5\) bit/s, czyli \(0{,}938\) kb/s. Jest to wartość odnosząca się wyłącznie do właściwego ładunku RVQ.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.38\textwidth} >{\raggedright\arraybackslash}p{0.50\textwidth}}
+\toprule
+Parametr & Wartość w przyjętym wariancie modelu \\
+\midrule
+Częstotliwość próbkowania & \(16\ \mathrm{kHz}\) \\
+Długość segmentu treningowego & \(16000\) próbek, czyli jedna sekunda audio \\
+Redukcja czasowa kodera & \(256\times\) względem fali wejściowej \\
+Częstość ramek latentnych & \(62{,}5\) ramki na sekundę \\
+Kwantyzacja & \(3\) słowniki RVQ po \(32\) kody \\
+Nominalna przepływność indeksów & \(937{,}5\) bit/s \\
+Liczba parametrów modelu & około \(7{,}98\) mln \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Parametry przyjętego wariantu modelu.}
+\label{tab:parametry-konfiguracja-referencyjna}
+\notatabeli{Źródło: opracowanie własne na podstawie pliku konfiguracyjnego i checkpointu modelu; liczba parametrów została wyznaczona przez zsumowanie parametrów warstw, a przepływność dotyczy nominalnego ładunku indeksów RVQ.}
+\end{center}
+
+Ograniczenie przepływności wpływa na cały układ modelu. Koder musi sprowadzić falę mowy do krótkiej sekwencji wektorów latentnych, a kwantyzer zamienia te wektory na indeksy ze skończonych słowników. Dekoder nie ma dostępu do oryginalnego sygnału ani do ciągłej reprezentacji przed kwantyzacją. Odtwarza przebieg czasowy wyłącznie ze skwantowanych latentów. Opisywany model łączy autoenkoderowy podział na koder i dekoder, rezydualną kwantyzację wektorową oraz jednowymiarowe warstwy konwolucyjne \cite{Zeghidour2021SoundStream,Defossez2022Encodec}. Do toru inferencji należą tylko koder, kwantyzer i dekoder. Wieloskalowe straty STFT, straty melowe, składniki semantyczne oparte na HuBERT lub ContentVec \cite{Hsu2021HuBERT,Qian2022ContentVec} oraz metryki wykorzystania słowników służą do uczenia i kontroli modelu, ale nie są przesyłane w strumieniu bitowym. Osobnym ograniczeniem jest stabilność kwantyzacji. Przy trzech słownikach po \(32\) kody zapadnięcie się jednego słownika zmniejsza rzeczywistą pojemność kanału, mimo że nominalna przepływność pozostaje taka sama \cite{VanDenOord2017NeuralDiscrete,Zeghidour2021SoundStream,Defossez2022Encodec}. Z tego powodu w eksperymentach śledzono wykorzystanie kodów, entropię słowników i składniki straty związane z RVQ. Projekt wymagał kompromisu między jakością rekonstrukcji, zgodnością widmową, stabilnością słowników i kosztem obliczeniowym. Większy model może lepiej rekonstruować mowę, ale gorzej odpowiada wymaganiom urządzeń brzegowych. Mniejsza liczba kodów ogranicza bitrate, lecz zwiększa ryzyko utraty zrozumiałości.
 
 \section{Dobór reprezentacji sygnału wejściowego}
 \label{sec:reprezentacja-wejsciowa}
 
-% TODO: Uzasadnić pracę bezpośrednio na przebiegu czasowym oraz wykorzystanie reprezentacji STFT i mel
-% jako składników funkcji kosztu. Należy wskazać parametry segmentów, próbkowania i ewentualnego przygotowania danych.
+Koder otrzymuje przebieg czasowy mowy. Reprezentacje widmowe pojawiają się dopiero w funkcji straty, gdzie służą do oceny błędów rekonstrukcji. Taki podział upraszcza strumień bitowy, a jednocześnie umożliwia karanie błędów słyszalnych w dziedzinie częstotliwości.
+
+\subsection{Fala mowy jako wejście modelu}
+
+Model otrzymuje na wejściu bezpośrednio przebieg czasowy mowy. Nie wprowadzono ręcznie wyznaczanych parametrów aparatu mowy, współczynników LPC ani spektrogramu jako wejścia kodera. Dla pojedynczej próbki treningowej sygnał można zapisać jako sekwencję
+\[
+x = (x_1, x_2, \ldots, x_T),
+\]
+gdzie \(T\) oznacza liczbę próbek w segmencie. W implementacji tensor audio ma układ \((B,T,1)\), czyli obejmuje mini-batch, oś czasu i jeden kanał sygnału. Ten sam format jest używany na wejściu kodera i na wyjściu dekodera.
+
+\subsection{Próbkowanie, segmentacja i normalizacja}
+
+Opisywany model pracuje na mowie próbkowanej z częstotliwością \(16\ \mathrm{kHz}\). Pasmo Nyquista wynosi wtedy \(8\ \mathrm{kHz}\), co odpowiada szerokopasmowej mowie i pozwala oceniać zarówno zrozumiałość, jak i podstawową naturalność rekonstrukcji. Wyższa częstotliwość próbkowania zwiększyłaby liczbę próbek przetwarzanych w każdej sekundzie, a tym samym koszt kodera i dekodera. Niższa częstotliwość ograniczyłaby pasmo jeszcze przed kodowaniem, przez co porównanie jakości byłoby mniej miarodajne. W głównych uruchomieniach treningowych stosowano segmenty o długości \(16000\) próbek, czyli jedną sekundę audio. Po redukcji czasowej \(256\times\) taki segment odpowiada około \(62{,}5\) ramkom latentnym.
+
+Pliki audio są ładowane rekurencyjnie z katalogu danych i sprowadzane do jednego kanału. Jeżeli nagranie ma więcej kanałów, wykorzystywany jest pierwszy z nich. Próbki krótsze od wymaganego segmentu są dopełniane zerami, a dłuższe są przycinane. Gdy częstotliwość próbkowania pliku różni się od wartości docelowej, sygnał jest dopasowywany do długości segmentu dla \(16\ \mathrm{kHz}\). Po wczytaniu każdy segment jest normalizowany względem maksymalnej wartości bezwzględnej amplitudy:
+\[
+x \leftarrow \frac{x}{\max_t |x_t| + 10^{-5}}.
+\]
+Normalizacja ogranicza wpływ różnic głośności między nagraniami i stabilizuje zakres wartości wejściowych. Nie usuwa lokalnej dynamiki wypowiedzi, ponieważ współczynnik skalowania jest wspólny dla całego segmentu.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.28\textwidth} >{\raggedright\arraybackslash}p{0.30\textwidth} >{\raggedright\arraybackslash}p{0.32\textwidth}}
+\toprule
+Reprezentacja & Miejsce użycia & Rola w systemie \\
+\midrule
+Fala audio \((B,T,1)\) & Wejście i wyjście kodeka & Podstawowy format inferencji i rekonstrukcji \\
+Latenty kodera & Przed RVQ & Zwarty opis sygnału przed dyskretyzacją \\
+Indeksy RVQ & Strumień kompresji & Informacja przesyłana między koderem i dekoderem \\
+STFT & Funkcja straty & Kontrola struktury widmowej w kilku skalach \\
+Skala mel & Funkcja straty & Pomocnicza ocena błędów zgodna z percepcją pasmową \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Reprezentacje sygnału wykorzystywane w treningu i inferencji.}
+\label{tab:reprezentacje-sygnalu}
+\notatabeli{Źródło: opracowanie własne na podstawie toru treningu i inferencji przyjętego w implementacji.}
+\end{center}
+
+\subsection{Reprezentacje pomocnicze w funkcji straty}
+
+Praca bezpośrednio na fali wymaga odpowiedniego doboru funkcji kosztu. Sama strata \(L_1\) w dziedzinie czasu wiąże fazę i amplitudę próbek, ale nie opisuje wprost jakości widmowej. Niewielkie przesunięcie fazowe może zwiększyć błąd próbkowy mimo podobnego brzmienia, a mały błąd w czasie nie gwarantuje zachowania struktury harmonicznej. W treningu zastosowano więc pomocnicze reprezentacje STFT i mel, liczone osobno dla sygnału oryginalnego i zrekonstruowanego \cite{Yamamoto2020ParallelWaveGAN,Zeghidour2021SoundStream,Defossez2022Encodec}. Model nie koduje ramek STFT ani mel-spektrogramu. Są one używane tylko do wyznaczania składników straty. W głównych ustawieniach eksperymentalnych stosowano wielorozdzielczą analizę STFT z parami \((n_\mathrm{fft}, h)\) równymi \((512,128)\), \((1024,256)\), \((2048,512)\) oraz \((4096,1024)\), gdzie \(h\) oznacza krok analizy. Krótsze okna opisują lokalne zmiany w czasie, natomiast dłuższe lepiej ujmują strukturę harmoniczną i rozkład energii w częstotliwości. Użyto także logarytmicznej reprezentacji melowej o \(80\) pasmach, liczonej dla \(n_\mathrm{fft}=1024\) i kroku \(256\). Wejście i wyjście kodeka pozostają zatem jednowymiarową falą mowy, a dodatkowe widoki sygnału występują tylko w procesie uczenia.
+
+\begin{center}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.14\textwidth} >{\raggedright\arraybackslash}p{0.23\textwidth} >{\raggedright\arraybackslash}p{0.13\textwidth} >{\raggedright\arraybackslash}p{0.36\textwidth}}
+\toprule
+Widok & Parametry & Waga & Znaczenie w treningu \\
+\midrule
+STFT & \(n_\mathrm{fft}=512,\ h=128\) & \(0{,}8\) & Krótkie zmiany lokalne i początek głosek \\
+STFT & \(n_\mathrm{fft}=1024,\ h=256\) & \(1{,}1\) & Podstawowy kompromis czasu i częstotliwości \\
+STFT & \(n_\mathrm{fft}=2048,\ h=512\) & \(1{,}8\) & Stabilizacja struktury harmonicznej \\
+STFT & \(n_\mathrm{fft}=4096,\ h=1024\) & \(3{,}0\) & Silniejsza kontrola dłuższych składowych widma \\
+Mel & \(80\) pasm, \(1024/256\) & \(\lambda=0{,}055\) & Percepcyjny rozkład błędów w paśmie \(0\)-\(8\ \mathrm{kHz}\) \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Widmowe reprezentacje pomocnicze używane w treningu.}
+\label{tab:widmowe-reprezentacje-referencyjne}
+\notatabeli{Źródło: opracowanie własne na podstawie ustawień funkcji straty. Parametry STFT i mel nie są elementami strumienia bitowego; służą wyłącznie do obliczania strat podczas treningu.}
+\end{center}
 
 \section{Architektura kodera i dekodera}
 \label{sec:architektura-kodera-dekodera}
 
-% TODO: Opisać moduły SirenCodec: konwolucyjny koder z redukcją czasu, przestrzeń latentną,
-% residual vector quantization, dekoder z nadpróbkowaniem, aktywacje SnakeBeta oraz opcjonalne bloki
-% samouwagi, temporalne, pasmowe, harmoniczne i post-refiner.
+Architektura ma postać autoenkodera z dyskretnym wąskim gardłem. Koder zamienia falę mowy na sekwencję latentów, kwantyzer ogranicza tę sekwencję do indeksów RVQ, a dekoder rekonstruuje przebieg czasowy. Taki układ odpowiada ogólnej konstrukcji neuronowych kodeków audio end-to-end \cite{Zeghidour2021SoundStream,Defossez2022Encodec}. Ogólny tor przetwarzania pokazano na Rysunku~\ref{fig:tor-kodeka}.
+
+\begin{center}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{c c c c c c c c c c c}
+\fbox{\parbox{0.092\textwidth}{\centering fala\\audio}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.092\textwidth}{\centering koder\\Conv1D}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.092\textwidth}{\centering latenty\\\(z\)}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.092\textwidth}{\centering RVQ\\indeksy}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.092\textwidth}{\centering dekoder\\Conv1D}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.092\textwidth}{\centering wyjście\\\(\hat{x}\)}} \\
+\end{tabular}
+\captionof{figure}{Ogólny tor kodowania i dekodowania w opisywanym modelu.}
+\label{fig:tor-kodeka}
+\end{center}
+
+\subsection{Tor kodera i reprezentacja latentna}
+
+Koder przekształca sygnał wejściowy \(x\) w sekwencję latentów \(z\). Następnie rezydualny kwantyzer wektorowy przypisuje te wektory do skończonych słowników, a dekoder odtwarza przebieg \(\hat{x}\). Zależność między modułami można zapisać następująco:
+\[
+z = E_\theta(x), \qquad z_q = Q(z), \qquad \hat{x} = D_\phi(z_q),
+\]
+gdzie \(E_\theta\) oznacza koder, \(Q\) moduł kwantyzacji, a \(D_\phi\) dekoder. Po stronie dekodera nie jest dostępny pełny wektor ciągły \(z\). Rekonstrukcja powstaje wyłącznie na podstawie \(z_q\), czyli reprezentacji zbudowanej z wybranych kodów RVQ.
+
+Koder składa się z jednowymiarowych warstw konwolucyjnych pracujących wzdłuż osi czasu. Każdy główny etap zmniejsza długość sekwencji dwukrotnie, dlatego osiem etapów daje całkowitą redukcję \(2^8=256\). W przyjętym wariancie szerokości kolejnych warstw wynoszą:
+\[
+(24, 32, 48, 64, 96, 128, 192, 256).
+\]
+Po ostatnim etapie konwolucyjnym wynik jest rzutowany do przestrzeni latentnej o wymiarze \(512\). Dla sygnału próbkowanego z częstotliwością \(16\ \mathrm{kHz}\) taka redukcja daje nominalnie \(62{,}5\) ramek latentnych na sekundę. W warstwach kodera zastosowano aktywację \texttt{snake\_beta}, która łączy składnik liniowy ze składnikiem sinusoidalnym \cite{Ziyin2020Snake,Kumar2023ImprovedRVQGAN}. Jest to użyteczne w modelu audio, ponieważ sygnał mowy zawiera struktury okresowe związane z drganiami fałdów głosowych i harmonicznymi.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{c c c c}
+\toprule
+Etap & Liczba kanałów & Redukcja po etapie & Czas jednej pozycji przy \(16\ \mathrm{kHz}\) \\
+\midrule
+1 & \(24\) & \(2\times\) & \(0{,}125\) ms \\
+2 & \(32\) & \(4\times\) & \(0{,}25\) ms \\
+3 & \(48\) & \(8\times\) & \(0{,}5\) ms \\
+4 & \(64\) & \(16\times\) & \(1\) ms \\
+5 & \(96\) & \(32\times\) & \(2\) ms \\
+6 & \(128\) & \(64\times\) & \(4\) ms \\
+7 & \(192\) & \(128\times\) & \(8\) ms \\
+8 & \(256\) & \(256\times\) & \(16\) ms \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Redukcja czasowa w kolejnych etapach kodera opisywanego modelu.}
+\label{tab:koder-redukcja-referencyjny}
+\notatabeli{Źródło: opracowanie własne na podstawie architektury kodera; czasy wynikają z próbkowania \(16\ \mathrm{kHz}\).}
+\end{center}
+
+\subsection{Kontekst latentny i kwantyzacja RVQ}
+
+Za koderem umieszczono krótki tor przetwarzania latentów. Przyjęty wariant wykorzystuje dwa bloki temporalne przed RVQ oraz dwa bloki po RVQ. Są to rezydualne konwolucje dylatowane działające na sekwencji latentnej. Zwiększają kontekst czasowy bez zmiany liczby ramek i bez zwiększenia nominalnej przepływności \cite{He2016DeepResidualLearning}. Przed kwantyzacją zastosowano także pojedynczy blok samouwagi z dwoma głowami, aby powiązać bardziej odległe fragmenty krótkiego segmentu latentnego \cite{Vaswani2017Attention}. Kwantyzator składa się z trzech etapów rezydualnej kwantyzacji wektorowej. Pierwszy etap wybiera kod przybliżający latent, drugi koduje resztę po pierwszym przybliżeniu, a trzeci resztę pozostałą po dwóch wcześniejszych etapach. Każdy etap ma słownik o \(32\) kodach. Mechanizm ten rozwija klasyczną kwantyzację wektorową i jest typowy dla współczesnych kodeków neuronowych z dyskretnym wąskim gardłem \cite{Gray1984VectorQuantization,VanDenOord2017NeuralDiscrete,Zeghidour2021SoundStream}. W implementacji użyto odległości cosinusowej oraz projekcji kodów do wymiaru \(8\). Dobór indeksu odbywa się więc w przestrzeni pomocniczej o niższym wymiarze, a wynik kwantyzacji jest rzutowany z powrotem do wymiaru latentnego dekodera. Takie rozwiązanie zmniejsza koszt słowników bez zmiany liczby transmitowanych indeksów.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.31\textwidth} >{\raggedright\arraybackslash}p{0.22\textwidth} >{\raggedright\arraybackslash}p{0.37\textwidth}}
+\toprule
+Element & Wartość & Konsekwencja dla kodeka \\
+\midrule
+Liczba etapów RVQ & \(3\) & Każda ramka ma trzy indeksy dyskretne \\
+Rozmiar słownika & \(32\) kody & Jeden indeks wymaga \(5\) bitów \\
+Bitów na ramkę latentną & \(15\) bitów & \(3 \cdot \log_2 32\) dla każdej ramki \\
+Wymiar latentny & \(512\) & Wymiar reprezentacji przekazywanej do toru RVQ \\
+Wymiar kodu RVQ & \(8\) & Wybór kodu odbywa się w mniejszej przestrzeni pomocniczej \\
+Metryka wyboru kodu & cosinusowa & Dobór kodu zależy od kierunku wektora latentnego \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Parametry kwantyzacji RVQ w opisywanym modelu.}
+\label{tab:rvq-parametry-referencyjne}
+\notatabeli{Źródło: opracowanie własne na podstawie parametrów kwantyzatora RVQ w opisywanym modelu.}
+\end{center}
+
+\newpage
+
+\subsection{Dekoder konwolucyjny i post-filtr}
+
+Dekoder wykonuje operację odwrotną do redukcji czasowej kodera. Na wejściu otrzymuje sekwencję skwantowanych latentów i przeprowadza osiem etapów zwiększania rozdzielczości czasowej. W tym wariancie zastosowano tryb \texttt{repeat\_conv}: próbki w osi czasu są najpierw powielane, a następnie wygładzane konwolucją jednowymiarową. Rozwiązanie to jest prostsze od transponowanej konwolucji i ogranicza ryzyko regularnych artefaktów związanych z nierównomiernym pokryciem próbek. Liczba kanałów dekodera zmienia się w odwrotnej kolejności względem kodera, od \(256\) do \(24\), a ostatnia konwolucja sprowadza wynik do jednego kanału audio. Po głównym torze dekodera zastosowano niewielki rezydualny blok korekcyjny oraz post-filtr działający już na fali wyjściowej. Blok dekodera ma głębokość \(1\) i wagę rezydualną \(0{,}018\), dlatego pełni rolę lokalnej korekty, a nie osobnego generatora. Post-filtr składa się z dwóch bloków konwolucyjnych, ma \(24\) kanały, jądro długości \(15\) oraz wagę \(0{,}02\). Jego reszta jest filtrowana wysokoprzepustowo przed dodaniem do rekonstrukcji. Implementacja zawiera również mechanizmy opcjonalne, między innymi głowice pasmowe dekodera, źródło harmoniczne, tryb przyczynowy i pomocnicze głowice sterujące resztą mowy. Nie są one jednak częścią podstawowego toru opisywanego wariantu.
+
+Znaczenie toru dekodera jest inne niż w klasycznym autoenkoderze bez kompresji. Dekoder nie może polegać na tym, że latent zawiera szczegółowy opis fali, ponieważ po stronie odbiornika pozostają wyłącznie trzy indeksy dla każdej ramki. Pojedyncza ramka odpowiada około \(16\) ms mowy, a więc obejmuje fragment, w którym mogą występować krótkie przejścia artykulacyjne. Z tego powodu kolejne etapy zwiększania rozdzielczości muszą jednocześnie odtwarzać gładki przebieg czasowy i nie zacierać szybkich zmian energii. W praktyce oznacza to, że dekoder jest odpowiedzialny za dużą część lokalnego modelowania akustycznego, natomiast kwantyzer decyduje o tym, jaka informacja może w ogóle zostać przekazana do tego modelowania. Wariant \texttt{repeat\_conv} wybrano również ze względu na kontrolę artefaktów. Transponowana konwolucja może wprowadzać regularne wzory w sygnale wyjściowym, jeżeli jądro i krok nie pokrywają osi czasu równomiernie. Przy mowie takie artefakty bywają słyszane jako chropowatość, metaliczność albo okresowe szumy w tle. Powielanie próbek przed konwolucją nie usuwa wszystkich problemów rekonstrukcji, ale oddziela samo zwiększenie długości sekwencji od późniejszego wygładzania. Dzięki temu łatwiej analizować, czy błąd pochodzi z kwantyzacji, z upsamplingu, czy z ostatnich warstw generujących falę. Niewielka waga post-filtru była celową decyzją. Przy większym wzmocnieniu filtr mógłby poprawiać pozorną ostrość sygnału, ale jednocześnie zwiększać energię szumu i maskować błędy wynikające z wcześniejszych etapów. W opisywanym wariancie post-filtr ma korygować drobną resztę wysokoczęstotliwościową po rekonstrukcji, a nie zastępować dekoder. Taki układ jest też korzystny dla diagnostyki: podstawową jakość modelu można oceniać na wyjściu głównego dekodera, a wpływ post-filtru pozostaje ograniczony i łatwy do wyłączenia w eksperymencie kontrolnym.
+
+\newpage
 
 \section{Proces kompresji i rekonstrukcji sygnału}
 \label{sec:kompresja-rekonstrukcja}
 
-% TODO: Przedstawić przepływ danych: audio -> koder -> wektory latentne -> RVQ -> strumień indeksów
-% -> dekoder -> sygnał zrekonstruowany. Wzór na nominalną przepływność powinien wynikać z liczby słowników,
-% rozmiarów codebooków i częstotliwości ramek latentnych.
+W trybie plikowym kompresja polega na zamianie segmentów audio na ciąg indeksów RVQ. Rekonstrukcja wykonuje operację odwrotną: odczytuje indeksy, odtwarza skwantowane latenty i przekazuje je do dekodera. Oba etapy muszą zachować zgodność długości sygnału, parametrów segmentacji oraz formatu pakowania indeksów. Schemat procesu pokazano na Rysunku~\ref{fig:proces-kompresji}. Opis procesu rozdzielono od samej architektury, ponieważ w praktycznym kodeku równie ważne jak model są operacje wykonywane przed i po nim. Segmentacja decyduje o tym, jak długie fragmenty trafiają do kodera. Pakowanie indeksów decyduje o rzeczywistej objętości zapisu. Odtworzenie długości sygnału decyduje natomiast o tym, czy rekonstrukcja może być porównana z nagraniem wejściowym bez dodatkowych przesunięć lub dopełnień. Te elementy nie zwiększają liczby parametrów modelu, ale mogą zmienić wynik pomiaru przepływności i jakość odsłuchową krótkich nagrań.
+
+\begin{center}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{c c c c c c c c c}
+\fbox{\parbox{0.115\textwidth}{\centering segment\\audio}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.115\textwidth}{\centering indeksy\\RVQ}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.115\textwidth}{\centering pakowanie\\bitów}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.115\textwidth}{\centering odczyt\\kodów}} &
+\(\rightarrow\) &
+\fbox{\parbox{0.115\textwidth}{\centering fala\\wyjściowa}} \\
+\end{tabular}
+\captionof{figure}{Kolejne etapy kompresji i rekonstrukcji sygnału w trybie plikowym.}
+\label{fig:proces-kompresji}
+\end{center}
+
+\subsection{Przygotowanie i kodowanie segmentu}
+
+Kompresja rozpoczyna się od przygotowania fragmentu sygnału audio. W implementacji ma on postać tensora \((1,T,1)\). W trybie plikowym dłuższe nagranie jest dzielone na segmenty o długości zgodnej z ustawieniami treningu. W opisywanym wariancie jest to \(16000\) próbek. Jeżeli ostatni segment jest krótszy, zostaje dopełniony zerami tylko na czas przejścia przez model. Po rekonstrukcji zachowywana jest część odpowiadająca rzeczywistej długości wejścia, aby zapisany wynik nie zawierał sztucznego ogona wynikającego z dopełnienia.
+
+Właściwe kodowanie zaczyna się od przejścia przez koder:
+\[
+z = E_\theta(x).
+\]
+Sekwencja \(z\) ma mniejszą rozdzielczość czasową niż fala wejściowa. Dla redukcji \(256\times\) jedna ramka latentna odpowiada w przybliżeniu \(256\) próbkom sygnału, czyli \(16\) ms przy próbkowaniu \(16\ \mathrm{kHz}\). Następnie każda ramka latentna trafia do RVQ. Dla ramki \(t\) kwantyzer zwraca zestaw indeksów:
+\[
+i_t = (i_{t,1}, i_{t,2}, i_{t,3}),
+\]
+gdzie każdy indeks wskazuje jeden kod z odpowiedniego słownika. Pierwszy słownik opisuje główne przybliżenie wektora latentnego, a kolejne słowniki opisują resztę po poprzednich etapach. W strumieniu kompresji zapisywane są indeksy \(i_{t,j}\), nie zaś same wektory kodowe.
+
+Długość segmentu \(16000\) próbek przyjęto jako kompromis między kosztem treningu i długością kontekstu. Jednosekundowy fragment zawiera zwykle kilka głosek lub krótką frazę, więc model widzi przejścia między elementami wypowiedzi, a nie tylko izolowane wycinki sygnału. Jednocześnie taki segment jest na tyle krótki, że pozwala utrzymać rozsądny rozmiar mini-batcha i często zapisywać próbki odsłuchowe. W trybie plikowym granice segmentów nie są osobno kodowane jako informacja semantyczna. Są tylko technicznym podziałem nagrania na porcje możliwe do przetworzenia przez model. Dopełnianie ostatniego segmentu zerami wymaga ostrożnego obcięcia rekonstrukcji. Jeżeli dopełnienie pozostałoby w pliku wynikowym, obiektywne metryki porównujące sygnał wejściowy i wyjściowy liczyłyby również fragment, którego nie było w oryginale. Z tego powodu liczba rzeczywistych próbek jest przechowywana w metadanych strumienia i wykorzystywana przy zapisie fali wyjściowej. W demonstratorze przeglądarkowym podobny problem występuje przy porcjach mikrofonowych: bufor może gromadzić próbki krócej niż jedna sekunda, ale model nadal musi otrzymać poprawnie uformowany tensor i zwrócić rekonstrukcję o kontrolowanej długości.
+
+\subsection{Przepływność nominalna i pakowanie indeksów}
+
+Nominalna przepływność zależy od liczby ramek latentnych na sekundę oraz liczby bitów potrzebnych do zapisu indeksów. Dla ogólnego przypadku można ją zapisać jako:
+\[
+R = \frac{f_s}{S} \sum_{j=1}^{N_q} \log_2 K_j,
+\]
+gdzie \(f_s\) jest częstotliwością próbkowania, \(S\) całkowitym współczynnikiem redukcji czasowej, \(N_q\) liczbą słowników RVQ, a \(K_j\) rozmiarem \(j\)-tego słownika. Dla przyjętych parametrów wartości te wynoszą \(f_s=16000\), \(S=256\), \(N_q=3\) oraz \(K_j=32\). Otrzymuje się zatem:
+\[
+R = \frac{16000}{256}(5+5+5) = 937{,}5\ \mathrm{bit/s}.
+\]
+Jest to wartość nominalna dla samych indeksów. Nie obejmuje nagłówka pliku, synchronizacji ramek, zabezpieczeń transmisji ani dodatkowych znaczników wymaganych przez protokół zapisu.
+
+W implementacji inferencyjnej indeksy mogą być zapisane do pliku \texttt{*\_codes.bin}. Nie są wtedy przechowywane jako liczby 16- lub 32-bitowe. Zamiast tego stosowane jest pakowanie z szerokością równą \(\lceil \log_2 K_j \rceil\). Dla słownika \(K=32\) oznacza to \(5\) bitów na indeks i \(15\) bitów na ramkę latentną. Plik zawiera również nagłówek z metadanymi: liczbą słowników, rozmiarem słownika, liczbą ramek latentnych, częstotliwością próbkowania i liczbą próbek audio. Format ten wykorzystano do porównywania przepływności nominalnej z rozmiarem praktycznego zapisu.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.25\textwidth} >{\raggedright\arraybackslash}p{0.18\textwidth} >{\raggedright\arraybackslash}p{0.47\textwidth}}
+\toprule
+Pole & Rozmiar & Znaczenie \\
+\midrule
+Identyfikator formatu & \(4\) bajty & Rozpoznanie pliku z indeksami kodeka \\
+Wersja & \(1\) bajt & Wariant nagłówka; dla równych słowników używana jest wersja \(1\) \\
+Liczba słowników & \(2\) bajty & Liczba etapów RVQ zapisanych w każdej ramce \\
+Rozmiar słownika & \(4\) bajty & Wspólne \(K\) dla wszystkich etapów RVQ \\
+Liczba ramek latentnych & \(4\) bajty & Długość zakodowanej sekwencji indeksów \\
+Częstotliwość próbkowania & \(4\) bajty & Częstotliwość rekonstrukcji audio \\
+Liczba próbek audio & \(4\) bajty & Rzeczywista długość sygnału przed dopełnieniem segmentu \\
+Liczba bitów na indeks & \(1\) bajt & Dla \(K=32\) jest to \(5\) bitów \\
+Ładunek z indeksami & zmienna & Kolejne indeksy \(q_0,q_1,q_2\) pakowane bit po bicie \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Pola zapisu \texttt{*\_codes.bin} dla równych rozmiarów słowników RVQ.}
+\label{tab:format-codes-bin}
+\notatabeli{Źródło: opracowanie własne na podstawie formatu pakowania implementowanego w narzędziu inferencyjnym.}
+\end{center}
+
+Nagłówek jest mały względem dłuższych nagrań, ale ma znaczenie przy bardzo krótkich próbkach testowych. Dlatego w wynikach inferencji rozróżniano przepływność nominalną i przepływność praktycznego zapisu. Pierwsza wynika bezpośrednio z liczby ramek oraz rozmiaru słowników. Druga obejmuje rzeczywistą liczbę bajtów w pliku \texttt{*\_codes.bin}. Dla kilkusekundowej próbki różnica między tymi wartościami jest niewielka, natomiast dla pojedynczego krótkiego zdania stały nagłówek może chwilowo zawyżyć pomiar. Z tego powodu nominalny bitrate jest lepszą miarą własności modelu, a rozmiar pliku lepiej opisuje koszt konkretnego zapisu. Zapis indeksów jako liczb 16-bitowych byłby prostszy, ale nie odpowiadałby założeniom pracy. Dla trzech słowników po \(32\) kody każda ramka potrzebuje \(15\) bitów. Zapis \texttt{uint16} zużywałby \(48\) bitów na ramkę, czyli podnosiłby sam ładunek indeksów do \(3\) kbps przy tej samej architekturze. Pakowanie bitowe usuwa ten narzut i pozwala sprawdzić, czy model rzeczywiście mieści się poniżej progu \(1\) kbps. Jest to szczególnie ważne przy porównywaniu wariantów różniących się rozmiarem słowników, ponieważ samo zmniejszenie liczby kodów nie daje efektu, jeżeli późniejszy format zapisu marnuje stałą szerokość typu całkowitego.
+
+\subsection{Rekonstrukcja po stronie dekodera}
+
+Dekodowanie rozpoczyna się od odczytania indeksów i odtworzenia odpowiadających im wektorów ze słowników RVQ. Dekoder nie otrzymuje oryginalnych latentów \(z\), lecz wyłącznie \(z_q\) zbudowane ze skwantowanych wkładów. Następnie działa tor post-RVQ i dekoder konwolucyjny:
+\[
+\hat{x} = D_\phi(z_q).
+\]
+Dekoder zwiększa rozdzielczość czasową przez kolejne etapy \texttt{repeat\_conv}, sprowadza wynik do jednego kanału audio i ogranicza zakres amplitudy funkcją \(\tanh\). Jeżeli aktywny jest post-filtr fali, działa dopiero po podstawowej rekonstrukcji. Nie zmienia strumienia indeksów ani nominalnej przepływności, ponieważ po stronie transmisji nie pojawia się dodatkowa informacja. Przy przepływności subkilobitowej rekonstrukcja nie jest odtworzeniem próbkowym wejścia. Jest wynikiem działania modelu, który ma zachować treść wypowiedzi i podstawowe cechy brzmienia mimo bardzo małej liczby bitów przypadających na ramkę latentną.
+
+W praktycznej implementacji dekoder musi także odtworzyć kształt sekwencji latentnej. Liczba ramek zapisana w nagłówku strumienia określa, ile zestawów indeksów należy odczytać z ładunku bitowego. Liczba próbek audio określa natomiast, do jakiej długości przyciąć falę po przejściu przez model. Te dwie wartości nie są zamienne. Liczba ramek wynika z pracy kodera i redukcji czasowej, a liczba próbek opisuje oryginalny sygnał przed dopełnieniem. Rozdzielenie tych pól ułatwia obsługę nagrań, których długość nie jest wielokrotnością kroku kodera. Format strumienia nie zawiera mechanizmów korekcji błędów. Jeżeli bit w ładunku zostanie uszkodzony, może zmienić indeks jednego ze słowników dla danej ramki. W trybie plikowym zakłada się poprawny zapis i odczyt danych, więc taki przypadek jest traktowany jako błąd warstwy transportowej. Dla transmisji sieciowej należałoby dodać osobny mechanizm wykrywania utraty porcji, numerowania ramek lub sum kontrolnych. Nie zmienia to architektury kodeka, ale wpływa na protokół otaczający model. W demonstratorze mikrofonowym tę rolę częściowo pełnią numery sekwencji porcji oraz statystyki kolejki, utraconych pakietów i niedopełnień bufora.
+
+Ograniczenie do samych indeksów RVQ ma też konsekwencje jakościowe. Dekoder może wygenerować sygnał spójny akustycznie, ale nie ma dostępu do informacji, której kwantyzator nie przeniósł. Jeżeli wąskie gardło utraci rozróżnienie między podobnymi fragmentami fonetycznymi, późniejsze warstwy mogą jedynie wybrać najbardziej prawdopodobną rekonstrukcję dla danego kodu. Z tego powodu analiza modelu nie może kończyć się na działaniu dekodera. Trzeba równolegle oceniać wykorzystanie słowników, stabilność wyboru kodów i to, czy kolejne etapy RVQ rzeczywiście kodują resztę po poprzednich etapach. Wariant plikowy nie wymusza ścisłej przyczynowości. Koder i dekoder mogą korzystać z kontekstu dostępnego w przetwarzanym segmencie, a wynik jest zapisywany dopiero po zakończeniu przejścia przez model. Wariant strumieniowy ma ostrzejsze ograniczenia, ponieważ opóźnienie zależy od długości porcji mikrofonowej, czasu resamplingu, inferencji i przesłania odpowiedzi przez WebSocket. Dlatego w demonstratorze mierzono nie tylko nominalny bitrate, ale także czas ścienny, RTF, szybkość względem czasu rzeczywistego oraz długość kolejki. Te wielkości pokazują, czy model nadaje się do interaktywnego użycia, a nie tylko do przetwarzania gotowego pliku.
 
 \section{Implementacja systemu oraz wykorzystane technologie}
 \label{sec:implementacja-technologie}
 
-% TODO: Opisać strukturę repozytorium, backend CUDA/PyTorch, pomocniczy backend MLX, konfiguracje JSON,
-% skrypty treningowe, Docker, zapisywanie checkpointów, logów, spektrogramów i plików audio oraz testy automatyczne.
+Implementację przygotowano tak, aby jeden zestaw ustawień mógł opisywać trening, inferencję i narzędzia diagnostyczne. Repozytorium zawiera backend CUDA/PyTorch, pomocniczy backend MLX, skrypty inferencyjne, lokalny demonstrator przeglądarkowy oraz testy automatyczne \cite{Nvidia2026Cuda,Paszke2019PyTorch,Apple2026MLX}. Główne elementy tej struktury zestawiono w Tabeli~\ref{tab:implementacja-moduly}.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.27\textwidth} >{\raggedright\arraybackslash}p{0.63\textwidth}}
+\toprule
+Element & Rola w projekcie \\
+\midrule
+\texttt{config.py} & Wspólna konfiguracja architektury, treningu i obliczania przepływności \\
+\texttt{cuda/} & Backend PyTorch/CUDA, model, dane, straty i trening \\
+\texttt{mlx/} & Backend pomocniczy używany do lokalnych eksperymentów i inferencji na Apple Silicon \\
+\texttt{tools/} & Skrypty inferencji, konwersji checkpointów i demonstratora przeglądarkowego \\
+\texttt{runs/}, \texttt{experiments/} & Katalogi wynikowe z checkpointami, logami, spektrogramami i plikami audio \\
+\texttt{Dockerfile} & Opis środowiska uruchomieniowego dla treningu CUDA \\
+\texttt{tests/} & Testy konfiguracji, pakowania indeksów, protokołu demonstratora i kontrolnych przejść modelu \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Moduły i artefakty implementacji systemu.}
+\label{tab:implementacja-moduly}
+\notatabeli{Źródło: opracowanie własne na podstawie struktury repozytorium projektu.}
+\end{center}
+
+\subsection{Układ repozytorium i backendy}
+
+System zaimplementowano jako pakiet Pythona \texttt{sirencodec} w układzie katalogów \texttt{src/}. Kod podzielono na część wspólną, backend treningowy CUDA/PyTorch, pomocniczy backend MLX oraz narzędzia uruchomieniowe. Podział ten wynikał ze sposobu prowadzenia eksperymentów. Najbardziej obciążające uruchomienia wykonywano na maszynie z kartą NVIDIA, natomiast krótsze testy odsłuchowe i inferencję lokalną prowadzono na Apple Silicon \cite{Apple2026MLX}. Wspólne pozostały ustawienia kodeka, obliczanie przepływności, liczba słowników RVQ i geometria kodera. Główny backend znajduje się w katalogu \texttt{cuda/} i korzysta z bibliotek PyTorch oraz Torchaudio \cite{Paszke2019PyTorch,PyTorch2026Torchaudio}. Warstwa danych używa standardowych plików audio, a operacje pomocnicze wykorzystują między innymi \texttt{numpy}, \texttt{soundfile} i \texttt{matplotlib} \cite{Harris2020ArrayProgramming,SoundFile2026Documentation,Hunter2007Matplotlib}. PyTorch odpowiada za model, funkcje strat, propagację gradientu i zapis stanu treningu. Główny wariant rozwijano przede wszystkim w backendzie MLX z katalogu \texttt{mlx/}. Backend ten odtwarza tę samą strukturę kodeka, lecz jest dostosowany do uruchomień na Apple Silicon. Służył do szybkiej inferencji, odsłuchu kolejnych checkpointów i lokalnych eksperymentów z ustawieniami strat.
+
+\newpage
+
+\subsection{Artefakty treningu i inferencja}
+
+Uruchomienia treningowe tworzą katalogi wynikowe w \texttt{runs/} lub \texttt{experiments/}. Zapisywane są w nich checkpointy, logi tekstowe, logi tabelaryczne, pliki \texttt{results.tsv}, konfiguracja treningu, stan wznowienia oraz materiały odsłuchowe. Dla wybranych kroków eksportowane są spektrogramy i pary plików audio z sygnałem oryginalnym oraz zrekonstruowanym. Rozdzielenie tych artefaktów było konieczne, ponieważ sam spadek funkcji kosztu nie wystarczał do oceny kodeka mowy. Logi pozwalały śledzić wykorzystanie słowników, straty widmowe i koszt kwantyzacji, a pliki audio służyły do kontroli słyszalnych artefaktów. Inferencję plikową wydzielono do narzędzi pomocniczych. Skrypt \texttt{infer\_mlx.py} ładuje checkpoint MLX, dzieli nagranie na segmenty zgodne z ustawieniami treningu, wykonuje kodowanie i dekodowanie, a następnie zapisuje rekonstrukcję. Może także zapisać indeksy RVQ w postaci spakowanego strumienia \texttt{*\_codes.bin}. Do testowania pracy interaktywnej przygotowano lokalny demonstrator przeglądarkowy. Moduł \texttt{web\_streaming.py} definiuje format porcji audio przesyłanych z przeglądarki do backendu, a skrypt \texttt{web\_stream\_demo.py} ładuje wybrany checkpoint, odbiera porcje przez WebSocket, wykonuje resampling i zwraca rekonstrukcję wraz z podstawowymi statystykami czasu przetwarzania.
+
+W repozytorium rozróżniono checkpointy pełne i checkpointy przeznaczone do inferencji. Pliki \texttt{.safetensors} przechowują stan treningu w formie potrzebnej do wznowienia eksperymentu, natomiast pliki \texttt{codec\_step*.npz} są wygodnym formatem dla backendu MLX i narzędzi odsłuchowych. Obok checkpointów zapisywane są pliki metadanych, komenda treningowa i konfiguracja uruchomienia. Takie rozdzielenie zmniejsza ryzyko pomylenia modelu gotowego do inferencji ze stanem optymalizatora albo wariantem, który powstał tylko jako pośredni punkt treningu. Materiały odsłuchowe były zapisywane regularnie, zwykle razem ze spektrogramami. Para plików \texttt{orig.wav} i \texttt{recon.wav} pozwalała szybko sprawdzić, czy poprawa liczby w logu rzeczywiście przekłada się na mowę. W tym projekcie było to potrzebne, ponieważ część strat może poprawiać wybrane metryki i jednocześnie pogarszać odbiór rekonstrukcji. Przykładem jest nadmierne wzmacnianie składowych wysokoczęstotliwościowych, które może zmniejszać błąd widmowy w pewnym zakresie, ale w odsłuchu daje szorstki szum. Z tego powodu checkpoint referencyjny wybierano nie tylko na podstawie pojedynczej wartości funkcji kosztu. Demonstrator przeglądarkowy pełnił rolę testu wdrożeniowego. Przeglądarka zbiera próbki z mikrofonu, wysyła je w porcjach przez WebSocket, a backend odsyła zrekonstruowane audio i statystyki. W logu interfejsu widoczna jest liczba wysłanych porcji, długość kolejki, spadki, niedopełnienia bufora, nominalna przepływność, praktyczna przepływność ładunku oraz RTF. Te dane pozwalają szybko rozdzielić problemy modelu od problemów transportu. Jeżeli rośnie kolejka, ograniczeniem jest czas przetwarzania albo komunikacja. Jeżeli kolejka jest pusta, a pojawiają się niedopełnienia, problem dotyczy dostarczania lub harmonogramu odtwarzania audio po stronie przeglądarki.
+
+\newpage
+
+\subsection{Środowisko uruchomieniowe i testy}
+
+Środowisko uruchomieniowe opisano w pliku \texttt{Dockerfile}. Obraz bazuje na Pythonie 3.12, instaluje \texttt{ffmpeg}, \texttt{git-lfs}, bibliotekę \texttt{libsndfile} oraz menedżer \texttt{uv}, a następnie odtwarza zależności z pliku blokady \cite{Docker2026DockerfileReference,FFmpeg2026Documentation,GitLFS2026Documentation,LibSndFile2026Documentation,Astral2026Uv}. Kontener jest przeznaczony przede wszystkim do uruchomień CUDA z użyciem NVIDIA Container Toolkit i z katalogiem danych montowanym z hosta \cite{Nvidia2026ContainerToolkit}. Nie zastępuje konfiguracji eksperymentu, ale ułatwia odtworzenie środowiska narzędziowego. Repozytorium zawiera testy automatyczne uruchamiane przez \texttt{pytest} \cite{Pytest2026Documentation}. Obejmują one spójność domyślnej konfiguracji, parsery argumentów, obliczanie przepływności, obsługę rozmiarów słowników RVQ, pakowanie indeksów, protokół demonstratora oraz kontrolne przejścia przez uproszczone warianty modelu. Testy nie zastępują odsłuchu ani metryk jakości mowy. Ich zadaniem jest wykrywanie regresji w elementach, które łatwo naruszyć podczas zmian architektury i skryptów treningowych.
+
+Kontener i testy pełnią różne funkcje. Kontener ogranicza zmienność środowiska: wersję Pythona, dostępność narzędzi audio, obsługę plików dźwiękowych i integrację z bibliotekami CUDA. Testy sprawdzają natomiast, czy kod zachowuje podstawowe kontrakty po zmianie konfiguracji. W kodeku z RVQ szczególnie łatwo o błąd, który nie powoduje awarii programu, ale zmienia przepływność albo kolejność indeksów. Taki błąd mógłby prowadzić do poprawnie wyglądającego pliku audio, który nie odpowiada już deklarowanemu strumieniowi bitowemu. Najbardziej wrażliwe testy dotyczą obliczania bitrate'u i pakowania indeksów. Wzór na przepływność musi obsługiwać zarówno równe słowniki, jak i warianty z różnymi rozmiarami słowników. Pakowanie musi zachować kolejność indeksów w ramce i poprawnie odczytywać szerokość bitową wynikającą z rozmiaru kodownika. Osobno testowany jest protokół demonstratora, ponieważ błąd w nagłówku porcji audio może objawić się dopiero po połączeniu przeglądarki, WebSocketu i backendu inferencyjnego. Testy jednostkowe są tu szybsze niż każdorazowe ręczne uruchamianie całego interfejsu. Ostatnim elementem kontroli jest zgodność między konfiguracją, checkpointem i narzędziem inferencji. Skrypt inferencyjny musi odtworzyć tę samą liczbę słowników, wymiar kodu RVQ, typ aktywacji i sposób zwiększania rozdzielczości czasowej, które były użyte podczas treningu. Niezgodność tych parametrów może dać rekonstrukcję słabej jakości nawet wtedy, gdy plik z wagami zostanie poprawnie załadowany. Dlatego parametry przyjętego wariantu zostały opisane liczbowo w rozdziale, a nie tylko nazwane ścieżką do checkpointu.
