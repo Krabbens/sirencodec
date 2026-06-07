@@ -1,0 +1,172 @@
+\chapter{Podstawy teoretyczne}
+\label{ch:podstawy-teoretyczne}
+
+Rozdział przedstawia podstawy teoretyczne potrzebne do uzasadnienia projektu neuronowego kodeka mowy o bardzo niskiej przepływności bitowej. Zagadnienie to znajduje się na przecięciu klasycznego kodowania mowy, przetwarzania sygnałów, uczenia reprezentacji dyskretnych oraz optymalizacji modeli pod urządzenia o ograniczonych zasobach. Z tego względu w pierwszej kolejności omówiono literaturę dotyczącą kodeków parametrycznych, hybrydowych i neuronowych, a następnie scharakteryzowano aktualny stan technologii w zakresie przepływności poniżej 1 kbps \cite{Rowe2019Codec2,Valin2019LPCNet,Zeghidour2021SoundStream,Defossez2022Encodec}. Dalsze części rozdziału stanowią podstawę do opisu zaproponowanego rozwiązania, ponieważ wyjaśniają właściwości sygnału mowy, cyfrową reprezentację audio, znaczenie przepływności bitowej, podstawy neuronowej kompresji sygnału oraz metryki stosowane do oceny jakości rekonstrukcji.
+
+Warto zaznaczyć, że literatura dotycząca kodeków mowy o ultra-niskiej przepływności nie tworzy jednorodnego pola badawczego. Część prac koncentruje się na klasycznym modelowaniu źródła mowy, część na neuronowym generowaniu sygnału z niewielkiej liczby parametrów, a część na pełnych kodekach uczonych end-to-end. Porównanie tych podejść wymaga ostrożności, ponieważ poszczególne prace stosują różne zbiory danych, różne procedury testów odsłuchowych oraz różne metryki obiektywne. W pracy przyjęto więc perspektywę projektową: istotne są nie tylko raportowane wartości MOS, PESQ lub ViSQOL, ale także możliwość uzyskania niskiej przepływności, stabilność kwantyzacji oraz koszt inferencji na platformie brzegowej.
+
+\section{Analiza literatury zagadnienia}
+\label{sec:analiza-literatury}
+
+\subsection{Zakres przeglądu i kryteria porównania}
+\label{subsec:zakres-przegladu-literatury}
+
+Przegląd literatury w niniejszej pracy obejmuje publikacje dotyczące ultra-niskobitowej kompresji mowy, neuronowych kodeków audio oraz wdrażania modeli przetwarzania sygnałów na urządzeniach brzegowych. Uwzględniono przede wszystkim prace z lat 2015--2024, ze szczególnym naciskiem na rozwiązania działające przy przepływnościach rzędu pojedynczych kilobitów na sekundę lub niższych. Analizie poddano architekturę kodeka, technikę kwantyzacji, sposób parametryzacji sygnału mowy, metryki jakości oraz wymagania zasobowe. Takie kryteria są istotne, ponieważ w projektowanym systemie sama deklaracja niskiego bitrate'u nie wystarcza; konieczne jest także określenie, czy rozwiązanie może działać w warunkach ograniczonej pamięci, ograniczonej mocy obliczeniowej i małego dopuszczalnego opóźnienia.
+
+Na poziomie technologicznym przegląd wskazuje trzy główne klasy rozwiązań. Pierwszą z nich są kodeki parametryczne, które opisują mowę za pomocą niewielkiego zestawu parametrów, takich jak współczynniki predykcji liniowej, częstotliwość podstawowa i energia. Drugą grupę stanowią kodeki hybrydowe, łączące klasyczne modelowanie mowy z lekkim komponentem neuronowym. Trzecią grupą są kodeki neuronowe end-to-end, w których koder, kwantyzer i dekoder są uczone jako jeden system \cite{Rowe2019Codec2,Valin2019LPCNet,Zeghidour2021SoundStream,Defossez2022Encodec}. Każda z tych rodzin rozwiązań ma inne ograniczenia: kodeki parametryczne są zwykle bardzo lekkie, ale mniej naturalne percepcyjnie; kodeki hybrydowe oferują kompromis między jakością i kosztem; natomiast rozwiązania end-to-end mogą uzyskiwać wysoką jakość, lecz często wymagają większych modeli i kosztowniejszego treningu.
+
+\subsection{Kodeki parametryczne i hybrydowe}
+\label{subsec:kodeki-parametryczne-hybrydowe}
+
+Najniższe przepływności osiągają rozwiązania parametryczne, w których nie rekonstruuje się bezpośrednio pełnego przebiegu audio, lecz przesyła parametry modelu mowy. Przykładem takiego podejścia jest Codec 2, rozwijany jako otwarty kodek niskobitowy i raportowany w wariantach rzędu 700 bit/s oraz 450 bit/s \cite{Rowe2019Codec2,Rowe2021Codec2450}. Tak niska przepływność jest możliwa dzięki silnemu wykorzystaniu założeń o strukturze mowy, jednak wiąże się z ograniczoną naturalnością rekonstrukcji. Zbliżoną rodzinę rozwiązań reprezentuje standard MELPe, opisany w STANAG 4591, który działa w trybach 600, 1200 i 2400 bit/s \cite{NATO2015STANAG4591}. Warto zauważyć, że te rozwiązania pozostają ważnym punktem odniesienia dla pracy, ponieważ pokazują dolną granicę możliwej przepływności, ale nie odpowiadają bezpośrednio na pytanie, jak wykorzystać sieci neuronowe do poprawy jakości odtwarzanego sygnału.
+
+Innym nurtem w tej grupie są metody oparte na predykcji liniowej i efektywnym kodowaniu parametrów. Backstrom i Magi zaproponowali rzadką predykcję liniową jako sposób poprawy efektywności kodowania przy niskich przepływnościach \cite{Backstrom2017SparseLinearPrediction}. W takim podejściu nadal wykorzystuje się klasyczny opis sygnału mowy, ale modyfikuje się sposób reprezentacji i kodowania parametrów. Rozwiązania tego typu są istotne dla projektowanego systemu, ponieważ wskazują, że ograniczenie liczby przesyłanych informacji może być osiągane nie tylko przez zmniejszenie modelu, lecz także przez odpowiedni dobór reprezentacji wejściowej i słownika kodowego.
+
+Kodeki hybrydowe próbują połączyć zalety klasycznego modelowania mowy z większą elastycznością modeli neuronowych. Przykładem jest LPCNet, w którym predykcja liniowa jest wykorzystywana do ograniczenia zadania stojącego przed siecią neuronową, a sam model odpowiada za generowanie lub poprawę sygnału mowy \cite{Valin2019LPCNet}. Valin, Büthe i Vos pokazali również, że rozwiązania oparte na lekkich strukturach rekurencyjnych mogą być optymalizowane pod procesory ARM i pracę w czasie rzeczywistym \cite{Valin2022UltraLowLatencySpeechEnhancement}. Uzupełnieniem tego kierunku jest praca Zhu i Valina, w której opisano optymalizacje LPCNet dla urządzeń embedded \cite{Zhu2021OptimizingLPCNet}. Znaczenie tych prac polega na tym, że nie traktują modelu neuronowego jako pełnego zamiennika klasycznego kodeka, lecz jako komponent poprawiający jakość przy zachowaniu niskiej złożoności.
+
+\subsection{Neuronowe kodeki end-to-end i reprezentacje dyskretne}
+\label{subsec:neuronowe-kodeki-reprezentacje-dyskretne}
+
+Rozwój neuronowych kodeków audio znacząco zmienił sposób projektowania systemów kompresji. SoundStream zaproponował architekturę end-to-end obejmującą koder, rezydualną kwantyzację wektorową oraz dekoder generujący sygnał audio \cite{Zeghidour2021SoundStream}. Podobny kierunek rozwinięto w EnCodec, gdzie zastosowano wysokiej jakości neuronową kompresję audio i wielostopniową kwantyzację latentów \cite{Defossez2022Encodec}. Prace te są szczególnie istotne dla niniejszej pracy, ponieważ pokazują, że reprezentacja latentna i RVQ mogą tworzyć efektywny mechanizm zamiany sygnału audio na strumień dyskretnych indeksów. Jednocześnie należy zauważyć, że raportowane warianty tych kodeków zwykle działają przy przepływnościach wyższych niż skrajnie niskie zakresy poniżej 1 kbps, a ich koszt obliczeniowy może być problematyczny dla prostych urządzeń brzegowych.
+
+W literaturze występują również próby poprawy kwantyzacji i jakości rekonstrukcji przez modyfikację struktury słowników. HiFi-Codec wprowadza grupową rezydualną kwantyzację wektorową, która ma zwiększać wierność rekonstrukcji przy kontrolowanej liczbie kodów \cite{Yang2023HiFiCodec}. Z kolei prace oparte na dyskretnych reprezentacjach samonadzorowanych pokazują, że sygnał mowy może być rekonstruowany z tokenów lub cech oderwanych częściowo od pełnej postaci fali \cite{Polyak2021SpeechResynthesis}. SpeechTokenizer rozwija ten kierunek, łącząc reprezentacje semantyczne i akustyczne w kontekście modeli mowy \cite{Zhang2023SpeechTokenizer}. Z perspektywy kodeka o ultra-niskiej przepływności podejścia semantyczne są obiecujące, ponieważ mogą redukować liczbę przesyłanych informacji do treści fonetycznej lub lingwistycznej. Ich ograniczeniem pozostaje jednak koszt ekstrakcji cech i ryzyko utraty informacji potrzebnych do naturalnej rekonstrukcji barwy, prozodii i szczegółów artykulacyjnych.
+
+Osobną grupę stanowią prace, które nie są bezpośrednio pełnymi kodekami mowy, lecz wywarły wpływ na projektowanie neuronowych generatorów audio. WaveNet pokazał, że autoregresyjne modele fali mogą generować wysokiej jakości sygnał audio, choć kosztem znacznej złożoności obliczeniowej \cite{VanDenOord2016WaveNet}. Kleijn i inni zastosowali podejście WaveNet do niskobitowego kodowania mowy \cite{Kleijn2018WaveNetLowRate}. Kankanahalli zaproponował natomiast kodowanie mowy optymalizowane end-to-end z wykorzystaniem głębokich sieci neuronowych \cite{Kankanahalli2018EndToEndSpeechCoding}. W kontekście urządzeń brzegowych istotna jest również praca Morrisona, Xu i Bryana, dotycząca efektywnych neuronowych kodeków audio dla strumieniowania o małym opóźnieniu \cite{Morrison2022EfficientNeuralAudioCodecs}. Uzupełniającym punktem odniesienia są metody sinusoidalne, w których sygnał reprezentowany jest przez składowe harmoniczne i szumowe \cite{Garner2019SinusoidalCoding}. Łącznie prace te pokazują, że wysoka jakość neuronowej rekonstrukcji jest możliwa, ale wymaga szczególnej kontroli złożoności, jeżeli system ma działać na brzegu sieci.
+
+\section{Aktualny stan technologii kodowania mowy i dźwięku poniżej 1 kbps}
+\label{sec:stan-technologii-ponizej-1kbps}
+
+\subsection{Rozwiązania rzeczywiście pracujące w zakresie subkilobitowym}
+\label{subsec:rozwiazania-subkilobitowe}
+
+W zakresie poniżej 1 kbps dominują obecnie przede wszystkim rozwiązania parametryczne. Codec 2 w wariancie 700 bit/s oraz eksperymentalny wariant 450 bit/s pokazują, że mowa może być przesyłana przy bardzo małej liczbie bitów, jeśli koder wykorzystuje silne założenia o strukturze sygnału \cite{Rowe2019Codec2,Rowe2021Codec2450}. Podobny charakter ma najniższy tryb MELPe pracujący przy 600 bit/s \cite{NATO2015STANAG4591}. Rozwiązania te pozostają praktyczne pod względem zasobów, jednak ich jakość percepcyjna jest ograniczona. W praktyce oznacza to, że bardzo niski bitrate uzyskuje się kosztem naturalności, szerokości pasma, szczegółów artykulacyjnych i odporności na nietypowe głosy lub warunki akustyczne.
+
+Warto zaznaczyć, że subkilobitowe kodowanie mowy rzadko polega na zachowaniu pełnej informacji akustycznej. Częściej jest to kodowanie informacji wystarczającej do zrozumienia wypowiedzi, a nie do wiernej rekonstrukcji naturalnego brzmienia. Z tego powodu klasyczne kodeki parametryczne są nadal konkurencyjne w najniższych zakresach bitrate'u, mimo że nie odpowiadają współczesnym oczekiwaniom dotyczącym jakości dźwięku. W kontekście niniejszej pracy oznacza to, że neuronowy kodek poniżej 1 kbps musi rozwiązać trudniejszy problem niż kodeki pracujące przy kilku kilobitach na sekundę: powinien utrzymać zrozumiałość mowy, a jednocześnie ograniczyć artefakty typowe dla nadmiernie uproszczonego modelu źródła.
+
+\subsection{Granica między kodekami subkilobitowymi a neuronowymi}
+\label{subsec:granica-subkilobit-neural}
+
+Neuronowe kodeki end-to-end, takie jak SoundStream i EnCodec, wyznaczają obecnie ważny kierunek technologiczny, ale ich typowe konfiguracje nie są projektowane przede wszystkim dla zakresu poniżej 1 kbps \cite{Zeghidour2021SoundStream,Defossez2022Encodec}. EnCodec raportuje m.in. tryb 1{,}5 kbps, co jest już bliskie zakresowi ultra-niskiemu, lecz nadal przekracza próg 1 kbps i wymaga większych zasobów niż klasyczne kodeki parametryczne \cite{Defossez2022Encodec}. SoundStream i HiFi-Codec pokazują natomiast, że RVQ oraz warianty grupowej kwantyzacji są skuteczne przy budowie dyskretnych reprezentacji audio, ale przeniesienie tych metod do zakresu subkilobitowego wymaga znacznego zmniejszenia liczby przesyłanych indeksów lub rozmiarów słowników \cite{Zeghidour2021SoundStream,Yang2023HiFiCodec}.
+
+Istotną luką technologiczną pozostaje więc zakres między klasycznymi kodekami parametrycznymi a dużymi neuronowymi kodekami audio. Kodeki parametryczne działają poniżej 1 kbps, ale oferują ograniczoną jakość. Kodeki neuronowe oferują wyższą jakość, ale zwykle przy większym bitrate i wyższym koszcie obliczeniowym. Podejścia hybrydowe, takie jak LPCNet, stanowią próbę wypełnienia tej luki, ponieważ wykorzystują parametryczny opis mowy do ograniczenia zadania stawianego sieci neuronowej \cite{Valin2019LPCNet,Zhu2021OptimizingLPCNet}. Wciąż jednak większość praktycznych wariantów hybrydowych raportowana jest dla przepływności około 1{,}6 kbps lub wyższej, co oznacza, że zejście poniżej 1 kbps wymaga dalszej redukcji informacji przesyłanej przez kanał.
+
+\subsection{Podejścia semantyczne i ograniczenia urządzeń brzegowych}
+\label{subsec:podejscia-semantyczne-edge}
+
+Jednym z najbardziej interesujących kierunków dla przyszłych kodeków subkilobitowych są reprezentacje semantyczne. SpeechTokenizer oraz prace dotyczące rekonstrukcji mowy z dyskretnych reprezentacji samonadzorowanych sugerują, że część informacji akustycznej można zastąpić tokenami opisującymi treść lub strukturę fonetyczną wypowiedzi \cite{Zhang2023SpeechTokenizer,Polyak2021SpeechResynthesis}. Takie podejście może być korzystne przy bardzo niskiej przepływności, ponieważ liczba tokenów semantycznych może być mniejsza niż liczba informacji potrzebnych do pełnej rekonstrukcji fali. Jednocześnie metoda ta wprowadza nowe ograniczenia: model ekstrakcji reprezentacji semantycznej bywa duży, a rekonstrukcja naturalnego brzmienia wymaga dodatkowych informacji akustycznych, których nie da się łatwo zmieścić w bardzo małym budżecie bitowym.
+
+W przypadku przetwarzania brzegowego kluczowe znaczenie mają opóźnienie, pamięć i możliwość pracy bez akceleratora GPU. Prace dotyczące optymalizacji LPCNet i modeli mowy na procesorach ARM pokazują, że lekkie architektury oraz wykorzystanie instrukcji SIMD/NEON mogą istotnie zmniejszyć koszt inferencji \cite{Valin2022UltraLowLatencySpeechEnhancement,Zhu2021OptimizingLPCNet}. Z kolei badania nad efektywnymi neuronowymi kodekami audio dla strumieniowania o małym opóźnieniu wskazują, że architektura modelu musi być projektowana razem z wymaganiami wdrożeniowymi, a nie dopiero optymalizowana po zakończeniu treningu \cite{Morrison2022EfficientNeuralAudioCodecs}. Dla projektowanego kodeka oznacza to konieczność kontrolowania nie tylko jakości rekonstrukcji, ale także długości okna kodowania, liczby operacji w koderze i dekoderze oraz rozmiaru pamięci potrzebnej do przechowywania parametrów modelu.
+
+Podsumowując, aktualny stan technologii pokazuje, że poniżej 1 kbps najpewniejszym punktem odniesienia pozostają kodeki parametryczne, natomiast rozwiązania neuronowe nadal wymagają kompromisów. Najbardziej uzasadnionym kierunkiem dla pracy jest więc projekt inspirowany neuronowymi kodekami end-to-end, ale silnie ograniczony pod względem przepływności i złożoności. W praktyce oznacza to wykorzystanie kodera generującego bardzo zwartą reprezentację latentną, kwantyzacji RVQ lub jej uproszczonego wariantu oraz dekodera zaprojektowanego tak, aby przy małej liczbie bitów rekonstruował przede wszystkim informację istotną percepcyjnie dla sygnału mowy.
+
+\section{Charakterystyka sygnału mowy i dźwięku}
+\label{sec:charakterystyka-sygnalu-mowy}
+
+% TODO: Opisać cechy mowy istotne dla kompresji: strukturę czasowo-częstotliwościową,
+% składowe harmoniczne, formanty, bezdźwięczne fragmenty, dynamikę i elementy percepcji słuchowej.
+
+\section{Podstawy cyfrowej reprezentacji sygnału audio}
+\label{sec:cyfrowa-reprezentacja-audio}
+
+% TODO: Wyjaśnić próbkowanie, kwantyzację, PCM, reprezentację fali, widmo STFT,
+% skalę melową oraz konsekwencje pracy z sygnałem 16 kHz.
+
+\section{Przepływność bitowa i jej wpływ na jakość dźwięku}
+\label{sec:przeplywnosc-jakosc}
+
+% TODO: Zdefiniować przepływność, opisać zależność między liczbą bitów na sekundę,
+% częstotliwością ramek latentnych, rozmiarem słowników RVQ i jakością rekonstrukcji.
+
+\section{Podstawy neuronowej kompresji sygnału}
+\label{sec:podstawy-neuronowej-kompresji}
+
+Neuronowa kompresja sygnału audio polega na zastąpieniu części ręcznie projektowanych etapów kodeka modelem uczonym na danych. W klasycznych systemach kodowania znaczną część struktury narzuca projektant: wybiera transformację, parametry modelu mowy, sposób kwantyzacji i reguły rekonstrukcji. W podejściu neuronowym część tych decyzji zostaje przeniesiona do procesu uczenia, w którym model optymalizuje reprezentację pośrednią tak, aby umożliwiała rekonstrukcję sygnału przy ograniczonej liczbie przesyłanych informacji \cite{Goodfellow2016DeepLearning,Zeghidour2021SoundStream,Defossez2022Encodec}. Nie oznacza to jednak rezygnacji z wiedzy dziedzinowej. W praktyce architektura modelu nadal musi narzucać odpowiednie ograniczenia: małą częstotliwość ramek latentnych, skończony słownik kodów, ograniczoną liczbę warstw oraz możliwość uruchomienia na urządzeniu o małych zasobach.
+
+Z punktu widzenia niniejszej pracy najważniejsze są te elementy uczenia głębokiego, które bezpośrednio wpływają na konstrukcję kodeka: autoenkoderowy podział na koder i dekoder, konwolucyjne przetwarzanie przebiegu czasowego, zwarta reprezentacja latentna, kwantyzacja wektorowa oraz dobór funkcji strat. Omówienie tych zagadnień ma charakter użytkowy. Celem nie jest pełny opis teorii sieci neuronowych, lecz wskazanie, dlaczego dana klasa mechanizmów jest przydatna przy kompresji mowy poniżej 1 kbps.
+
+\subsection{Sieci neuronowe jako modele przetwarzania sygnałów}
+\label{subsec:sieci-neuronowe-przetwarzanie-sygnalow}
+
+Podstawową jednostką sieci neuronowej jest neuron obliczeniowy, który tworzy kombinację liniową wejść, dodaje przesunięcie, a następnie stosuje funkcję nieliniową. Historycznie jednym z pierwszych formalnych modeli tego typu był perceptron Rosenblatta \cite{Rosenblatt1958Perceptron}. Współczesne sieci głębokie składają się jednak z wielu warstw takich przekształceń, dzięki czemu mogą modelować zależności nieliniowe znacznie bardziej złożone niż pojedynczy klasyfikator liniowy \cite{Goodfellow2016DeepLearning}. Dla sygnałów audio jest to istotne, ponieważ zależność między przebiegiem czasowym, strukturą harmoniczną, artykulacją i percepcyjną jakością dźwięku nie jest prosta ani lokalnie liniowa.
+
+Uczenie sieci polega na minimalizacji funkcji kosztu względem parametrów modelu. W praktyce wykorzystuje się algorytm propagacji wstecznej błędu, który umożliwia obliczanie gradientów dla kolejnych warstw modelu \cite{Rumelhart1986Backprop}. Parametry aktualizowane są następnie przez metodę optymalizacji, często w wariancie adaptacyjnym, takim jak Adam \cite{Kingma2015Adam}. W projektach implementacyjnych istotne są również biblioteki automatycznego różniczkowania, ponieważ pozwalają definiować złożone modele i funkcje strat bez ręcznego wyprowadzania pochodnych; przykładem takiego środowiska jest PyTorch \cite{Paszke2019PyTorch}. Z punktu widzenia kodeka mowy sam mechanizm uczenia jest jednak tylko narzędziem. Kluczowe pozostaje to, jakie ograniczenia zostaną narzucone reprezentacji pośredniej i czy model nauczy się przenosić przez wąski kanał informacje ważne percepcyjnie.
+
+\subsection{Autoenkodery i wąskie gardło informacyjne}
+\label{subsec:autoenkodery-waskie-gardlo}
+
+Autoenkoder jest modelem złożonym z dwóch głównych części: kodera oraz dekodera. Koder przekształca sygnał wejściowy \(x\) do reprezentacji pośredniej \(z\), natomiast dekoder rekonstruuje sygnał \(\hat{x}\) na podstawie tej reprezentacji:
+
+\begin{equation}
+    z = f_{\theta}(x), \qquad \hat{x} = g_{\phi}(z).
+\end{equation}
+
+Parametry \(\theta\) i \(\phi\) są dobierane tak, aby zminimalizować błąd rekonstrukcji. Autoenkodery były szeroko wykorzystywane jako narzędzie uczenia reprezentacji i redukcji wymiarowości danych \cite{Hinton2006DimensionalityReduction,Goodfellow2016DeepLearning}. W kompresji ich rola jest szczególnie naturalna: koder odpowiada za wyodrębnienie informacji istotnej z punktu widzenia rekonstrukcji, a dekoder za odtworzenie sygnału z ograniczonego opisu.
+
+Samo zastosowanie autoenkodera nie wystarcza jeszcze do zbudowania kodeka. Jeżeli reprezentacja \(z\) jest ciągła i ma dużą pojemność, może przechowywać bardzo dokładny opis wejścia, ale nie tworzy bezpośrednio skończonego strumienia bitów. Dlatego w systemach kompresji wprowadza się wąskie gardło informacyjne: zmniejsza się częstotliwość ramek latentnych, ogranicza wymiar wektorów, stosuje kwantyzację albo łączy te mechanizmy. W neuronowych kodekach audio, takich jak SoundStream i EnCodec, autoenkoder stanowi podstawę architektury, ale dopiero kwantyzacja wektorowa zamienia reprezentację latentną na dyskretny strumień indeksów \cite{Zeghidour2021SoundStream,Defossez2022Encodec}. W przypadku mowy poniżej 1 kbps wąskie gardło musi być bardzo silne, dlatego projekt kodera i kwantyzatora staje się ważniejszy niż sama zdolność dekodera do generowania naturalnego brzmienia.
+
+\subsection{Konwolucje jednowymiarowe w analizie sygnału audio}
+\label{subsec:konwolucje-jednowymiarowe-audio}
+
+Konwolucje są jednym z podstawowych mechanizmów przetwarzania sygnałów przez sieci neuronowe. W ujęciu ogólnym warstwa konwolucyjna przesuwa niewielkie jądro po sygnale i stosuje ten sam zestaw wag w wielu położeniach. W sieciach przetwarzających obrazy konwolucje zostały spopularyzowane m.in. w pracach LeCuna i współautorów \cite{LeCun1998GradientBasedLearning}, natomiast w przypadku audio analogiczny mechanizm stosuje się wzdłuż osi czasu. Konwolucja jednowymiarowa może wykrywać lokalne wzorce w przebiegu, takie jak narastanie energii, struktury okresowe, fragmenty bezdźwięczne lub szybkie zmiany fazy. Współdzielenie wag jest korzystne, ponieważ te same lokalne zjawiska mogą występować w różnych momentach wypowiedzi.
+
+W kodekach neuronowych konwolucje pełnią zwykle dwie funkcje. Po pierwsze, pozwalają budować lokalny opis sygnału, który jest odporniejszy na drobne przesunięcia w czasie niż analiza pojedynczych próbek. Po drugie, warstwy konwolucyjne z krokiem większym niż jeden umożliwiają redukcję długości sekwencji, a więc zmniejszenie liczby ramek, które trzeba później zakodować. W dekoderze analogiczną rolę pełni nadpróbkowanie, realizowane na przykład przez transponowane konwolucje lub przez powtarzanie próbek połączone z wygładzającą konwolucją. Przy projektowaniu kodeka strumieniowego istotne są również konwolucje przyczynowe, ponieważ ograniczają wykorzystanie informacji z przyszłości i zmniejszają opóźnienie.
+
+W głębszych modelach konwolucyjnych często stosuje się połączenia rezydualne, które ułatwiają przepływ gradientu i pozwalają budować głębsze bloki bez tak silnej degradacji uczenia \cite{He2016DeepResidualLearning}. W audio podobny mechanizm może być używany w torze latentnym albo w dekoderze jako korekta rekonstrukcji. Należy jednak zachować ostrożność: większa liczba warstw poprawia pojemność modelu, ale jednocześnie zwiększa koszt inferencji, pamięć potrzebną na parametry oraz ryzyko przekroczenia ograniczeń urządzenia brzegowego.
+
+\subsection{Reprezentacja latentna i redukcja czasowa}
+\label{subsec:reprezentacja-latentna-redukcja-czasowa}
+
+Reprezentacja latentna jest pośrednim opisem sygnału tworzonym przez koder. W przypadku kompresji audio ma ona zwykle postać sekwencji wektorów, a nie pojedynczego wektora dla całego nagrania. Jeżeli sygnał wejściowy ma długość \(T\) próbek, a koder zmniejsza rozdzielczość czasową \(S\)-krotnie, to liczba ramek latentnych wynosi w przybliżeniu \(T/S\). Dla sygnału próbkowanego z częstotliwością \(F_s\) częstotliwość ramek latentnych można zapisać jako:
+
+\begin{equation}
+    f_{\mathrm{lat}} = \frac{F_s}{S}.
+\end{equation}
+
+Ta zależność ma bezpośrednie znaczenie dla przepływności bitowej. Jeżeli koder wytwarza mniej ramek na sekundę, to kwantyzator musi przesłać mniej indeksów. Z drugiej strony zbyt silna redukcja czasowa może usunąć informacje potrzebne do wiernej rekonstrukcji spółgłosek, przejść między fonemami i szybkich zmian energii. W praktyce projektowanie reprezentacji latentnej wymaga więc kompromisu między pojemnością informacyjną, opóźnieniem i kosztem dekodowania.
+
+Wymiar wektora latentnego wpływa na to, ile informacji może zostać przechowane w pojedynczej ramce przed kwantyzacją. Nie jest on jednak równoważny przepływności bitowej, ponieważ w kodeku dyskretnym transmitowany jest indeks kodu, a nie pełny wektor zmiennoprzecinkowy. Można więc zwiększać wymiar latentny, aby ułatwić pracę koderowi i dekoderowi, zachowując tę samą nominalną liczbę bitów, o ile liczba słowników i liczba kodów w słownikach pozostają bez zmian. Takie rozróżnienie jest ważne w neuronowych kodekach end-to-end, ponieważ jakość rekonstrukcji zależy zarówno od geometrii przestrzeni latentnej, jak i od dyskretnej pojemności kwantyzatora \cite{Zeghidour2021SoundStream,Defossez2022Encodec}.
+
+\subsection{Kwantyzacja wektorowa i rezydualna kwantyzacja wektorowa}
+\label{subsec:kwantyzacja-wektorowa-rvq}
+
+Kwantyzacja wektorowa polega na zastąpieniu ciągłego wektora jednym z elementów skończonego słownika kodowego. Dla słownika \(\mathcal{C} = \{e_1, e_2, \ldots, e_K\}\) wektor latentny jest przypisywany do najbliższego kodu, a do strumienia bitów trafia tylko indeks wybranego elementu. Klasyczna teoria kwantyzacji wektorowej była rozwijana znacznie wcześniej niż współczesne kodeki neuronowe \cite{Gray1984VectorQuantization}, ale w modelach głębokich problem ten pojawia się ponownie jako sposób uczenia dyskretnych reprezentacji. VQ-VAE pokazał, że kwantyzację można włączyć do autoenkodera i trenować reprezentacje dyskretne z użyciem estymatora prostego przejścia gradientu oraz dodatkowych składników stabilizujących słownik \cite{VanDenOord2017NeuralDiscrete}.
+
+Jeżeli pojedynczy słownik ma \(K\) kodów, to jeden indeks wymaga nominalnie \(\log_2 K\) bitów. Dla wielu słowników, stosowanych w każdej ramce latentnej, przepływność indeksów można zapisać jako:
+
+\begin{equation}
+    R = f_{\mathrm{lat}} \sum_{i=1}^{N_q} \log_2 K_i,
+\end{equation}
+
+gdzie \(N_q\) oznacza liczbę etapów kwantyzacji, a \(K_i\) liczbę kodów w \(i\)-tym słowniku. Widać z tego, że przepływność zależy bezpośrednio od częstotliwości ramek latentnych, liczby słowników oraz ich rozmiaru. Przy projektowaniu kodeka poniżej 1 kbps nawet niewielka zmiana tych parametrów może mieć duże znaczenie, ponieważ budżet bitowy jest bardzo mały.
+
+Rezydualna kwantyzacja wektorowa rozwija ten mechanizm przez użycie wielu etapów. Pierwszy słownik koduje przybliżenie wektora, kolejny koduje błąd pozostały po pierwszym etapie, następny koduje kolejną resztę i tak dalej. Dzięki temu można zwiększyć dokładność rekonstrukcji latentów bez gwałtownego zwiększania rozmiaru pojedynczego słownika. Taki mechanizm jest wykorzystywany w kodekach SoundStream i EnCodec, a warianty grupowej rezydualnej kwantyzacji pojawiają się również w HiFi-Codec \cite{Zeghidour2021SoundStream,Defossez2022Encodec,Yang2023HiFiCodec}. Ograniczeniem RVQ jest możliwość nierównego wykorzystania kodów, czyli sytuacja, w której model wybiera tylko niewielką część słownika. Z tego powodu podczas treningu stosuje się dodatkowe straty, regularyzację wykorzystania kodów albo procedury przeciwdziałające zapadaniu się słowników.
+
+\subsection{Funkcje aktywacji, normalizacja i regularyzacja}
+\label{subsec:aktywacje-normalizacja-regularyzacja}
+
+Funkcje aktywacji wprowadzają nieliniowość między kolejnymi warstwami sieci. Bez nich złożenie wielu warstw liniowych nadal byłoby przekształceniem liniowym, a model nie mógłby opisywać złożonych zależności obecnych w sygnale mowy. W praktyce stosuje się różne funkcje aktywacji, takie jak ReLU, GELU, sigmoid, tangens hiperboliczny lub aktywacje dostosowane do struktur okresowych. Wybór aktywacji wpływa na stabilność gradientów, zakres wartości pośrednich oraz zdolność modelu do odtwarzania drobnych szczegółów sygnału \cite{Goodfellow2016DeepLearning}. W kodeku audio nie jest to wyłącznie decyzja numeryczna: zbyt agresywna nieliniowość może prowadzić do zniekształceń, a zbyt łagodna może ograniczyć zdolność modelu do rekonstrukcji szybkich zmian w przebiegu.
+
+Normalizacja służy stabilizacji uczenia przez kontrolowanie rozkładu aktywacji. W przetwarzaniu sekwencji często stosuje się normalizację warstwową, która oblicza statystyki dla pojedynczego przykładu, a nie dla całego mini-batcha \cite{Ba2016LayerNormalization}. Może to być korzystne w modelach audio, ponieważ długość sygnałów, dynamika głośności i zróżnicowanie mówców powodują duże zmiany skali cech. Jednocześnie normalizacja umieszczona bezpośrednio przed kwantyzacją może zmieniać geometrię przestrzeni latentnej, dlatego jej wpływ na stabilność RVQ wymaga weryfikacji eksperymentalnej.
+
+Regularyzacja obejmuje techniki ograniczające przeuczenie i niestabilność modelu. Klasycznym przykładem jest dropout, który losowo wyłącza część aktywacji podczas treningu \cite{Srivastava2014Dropout}. W kodekach audio stosowanie takiej regularyzacji wymaga jednak ostrożności, ponieważ celem nie jest klasyfikacja, lecz precyzyjna rekonstrukcja sygnału. Naturalną formą regularyzacji jest również samo wąskie gardło kompresyjne: ograniczona liczba kodów, ograniczona liczba ramek latentnych oraz kary związane z kwantyzacją zmuszają model do wyboru informacji najważniejszych dla rekonstrukcji. W tym sensie architektura kodeka pełni funkcję regularyzującą równie istotną jak klasyczne techniki uczenia głębokiego.
+
+\subsection{Funkcje strat stosowane w rekonstrukcji audio}
+\label{subsec:funkcje-strat-rekonstrukcja-audio}
+
+Funkcja straty określa, jakie błędy model ma uznawać za najważniejsze podczas treningu. W najprostszym przypadku można minimalizować różnicę między przebiegiem oryginalnym i zrekonstruowanym bezpośrednio w dziedzinie czasu, na przykład za pomocą normy \(L_1\) lub \(L_2\). Takie podejście dobrze wiąże fazę i amplitudę próbek, ale bywa niewystarczające percepcyjnie. Dwa sygnały o podobnym brzmieniu mogą różnić się punktowo w czasie, a z kolei niski błąd próbkowy nie gwarantuje zachowania struktury harmonicznej i barwy.
+
+Z tego powodu w modelach generujących lub rekonstruujących mowę często stosuje się straty widmowe. Porównują one sygnały po transformacji STFT, dzięki czemu model otrzymuje informację o błędach w dziedzinie czasu i częstotliwości. Szczególnie użyteczne są straty wielorozdzielcze, w których porównanie wykonywane jest dla kilku długości okna i kilku kroków analizy. Takie podejście zostało wykorzystane m.in. w Parallel WaveGAN, gdzie wielorozdzielcza strata spektrogramowa wspierała generowanie fali dźwiękowej \cite{Yamamoto2020ParallelWaveGAN}. W kodekach neuronowych podobną rolę pełnią straty rekonstrukcyjne, widmowe, percepcyjne i adwersarialne, łączone w celu poprawy naturalności odtwarzanego sygnału \cite{Zeghidour2021SoundStream,Defossez2022Encodec}.
+
+W systemie z kwantyzacją konieczne są również składniki związane z samym słownikiem kodowym. Strata przywiązania do kodu, określana w literaturze jako \emph{commitment loss}, ogranicza odrywanie się reprezentacji latentnej od wybranych kodów, natomiast składniki promujące wykorzystanie słownika przeciwdziałają sytuacji, w której większość kodów pozostaje nieużywana. Dodatkowe straty, takie jak podobieństwo kosinusowe przebiegów, straty melowe lub kary za nadmiarową energię w wybranych pasmach, mogą poprawiać wybrane aspekty rekonstrukcji, ale każda z nich wprowadza własny kompromis. Zbyt duża waga strat widmowych może prowadzić do sztucznego wygładzenia lub wzrostu szumu tła, natomiast zbyt silne wymuszanie zgodności w czasie może pogarszać naturalność brzmienia. Dlatego dobór funkcji strat w neuronowym kodeku mowy jest częścią projektu systemu, a nie jedynie technicznym detalem treningu.
+
+\section{Metody kodowania dźwięku przy bardzo niskich przepływnościach}
+\label{sec:metody-kodowania-ultra-low}
+
+% TODO: Porównać podejścia parametryczne, transformacyjne, predykcyjne, autoenkoderowe,
+% wektorowo-kwantyzowane i semantyczne. Wskazać, które idee zostały wykorzystane w projekcie SirenCodec.
+
+\section{Metryki oceny jakości rekonstrukcji dźwięku}
+\label{sec:metryki-jakosci}
+
+% TODO: Opisać metryki wykorzystywane w projekcie: SI-SDR, PESQ, STOI, ViSQOL MOS-LQO,
+% log-spectral distance, L1 oraz kosinusowe podobieństwo przebiegów. Wyjaśnić ich ograniczenia.

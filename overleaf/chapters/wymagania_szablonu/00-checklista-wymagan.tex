@@ -1,0 +1,79 @@
+\chapter*{Checklista wymagań z szablonu}
+
+\section*{Strona tytułowa i układ dokumentu}
+\begin{itemize}
+    \item Praca ma być złożona jako praca dyplomowa magisterska w języku polskim.
+    \item Strona tytułowa powinna zawierać autorów z numerami albumów, tytuł pracy, promotora oraz rok złożenia pracy.
+    \item Tytuł pracy należy sprawdzić wizualnie: powinien mieć maksymalnie dwa wiersze i nie powinien być łamany w nielogicznym miejscu.
+    \item Dokument używa formatu A4, układu jednostronnego, marginesów zdefiniowanych w klasie oraz interlinii półtorej.
+    \item Praca składa się z rozdziałów i podrozdziałów; nie należy schodzić głębiej niż do poziomu \texttt{subsubsection}.
+\end{itemize}
+
+\section*{Wstęp}
+\begin{itemize}
+    \item Wstęp powinien krótko uzasadniać podjęcie tematu.
+    \item We wstępie należy podać cel pracy.
+    \item We wstępie należy określić zakres pracy: przedmiotowy, podmiotowy i czasowy, jeżeli ma zastosowanie.
+    \item Można wskazać hipotezy, które autorzy zamierzają sprawdzić lub udowodnić.
+    \item Należy krótko scharakteryzować źródła, zwłaszcza literaturowe.
+    \item Należy opisać układ pracy, czyli zawartość poszczególnych rozdziałów.
+    \item Można dodać uwagi dotyczące realizacji tematu, np. trudności, sprzętu lub współpracy z podmiotami zewnętrznymi.
+    \item Wstęp musi zawierać akapit rozpoczynający się od słów: „Celem pracy jest ...”.
+    \item Wstęp musi zawierać akapit rozpoczynający się od słów: „Struktura pracy jest następująca. ...”.
+    \item W przypadku dwuosobowej pracy magisterskiej po tych akapitach należy opisać wkład poszczególnych członków zespołu.
+\end{itemize}
+
+\section*{Podstawy teoretyczne i literatura}
+\begin{itemize}
+    \item Rozdział teoretyczny powinien stanowić przegląd literatury naświetlający aktualny stan wiedzy.
+    \item W tekście pracy muszą wystąpić odwołania do wszystkich pozycji z wykazu literatury.
+    \item Odnośników do literatury nie należy umieszczać w stopkach stron.
+    \item Należy wskazywać źródła pochodzenia informacji, rysunków, tabel i fragmentów kodu.
+    \item Dla źródeł internetowych należy podać adresy stron.
+\end{itemize}
+
+\section*{Praca własna, implementacja i wyniki}
+\begin{itemize}
+    \item Praca musi zawierać elementy pracy własnej autorów adekwatne do wiedzy praktycznej uzyskanej w czasie studiów.
+    \item Za pracę własną można uznać m.in. aplikację, fragment aplikacji, algorytm, projekt systemu, analizę lub ocenę technologii.
+    \item Należy udokumentować założenia, sposób realizacji zadań, ocenę wykonania i napotkane problemy.
+    \item Dla pracy projektowo-implementacyjnej należy przygotować dokumentację techniczną i użytkową systemu.
+    \item Nie należy zamieszczać w pracy całego kodu źródłowego.
+    \item Kod, oprogramowanie i wyniki eksperymentów powinny zostać umieszczone w dodatku lub innym załączniku.
+\end{itemize}
+
+\section*{Styl tekstu}
+\begin{itemize}
+    \item Należy stosować formę bezosobową, np. „w pracy rozważono” albo „w ramach pracy zaprojektowano”.
+    \item Należy unikać długich zdań.
+    \item Nie należy używać zwrotów potocznych.
+    \item Należy używać precyzyjnej terminologii informatycznej.
+    \item Nie wolno pisać pracy metodą kopiuj-wklej; zagadnienia trzeba opisywać własnymi słowami.
+    \item Przy informacjach pochodzących z zewnątrz zawsze należy wskazywać źródło.
+\end{itemize}
+
+\section*{Zakończenie}
+\begin{itemize}
+    \item Zakończenie powinno odnosić się do zadań wskazanych we wstępie.
+    \item Należy odnieść się szczególnie do celu i zakresu pracy.
+    \item Należy porównać założenia z faktycznymi wynikami pracy.
+    \item Należy jasno określić stopień realizacji celów oraz wyniki samodzielnej pracy autorów.
+    \item Dodatki, aneksy i załączniki są integralną częścią pracy.
+\end{itemize}
+
+\section*{Zasady składu w LaTeX}
+\begin{itemize}
+    \item Akapity rozdziela się co najmniej jedną pustą linią.
+    \item Wyróżnienia należy wykonywać poleceniem \texttt{\textbackslash emph}; pogrubienie nie jest zalecane jako zwykłe wyróżnienie.
+    \item Po jednoliterowych spójnikach warto stosować twardą spację, czyli znak tyldy.
+    \item Należy używać poprawnych polskich cudzysłowów i konsekwentnego zapisu pauz oraz półpauz.
+    \item Rysunki należy umieszczać w środowisku \texttt{figure}, z podpisem pod rysunkiem.
+    \item Rysunki powinny być umieszczane u góry strony; nie zaleca się modyfikatora \texttt{[h]}.
+    \item Tabele należy umieszczać w środowisku \texttt{table}, z podpisem nad tabelą.
+    \item Podpisy rysunków i tabel powinny kończyć się kropką.
+    \item Można używać makr \texttt{\textbackslash definicja}, \texttt{\textbackslash akronim} i \texttt{\textbackslash english}.
+    \item Nazwy plików, katalogów, ścieżek, zmiennych, klas i metod należy formatować poleceniem \texttt{\textbackslash texttt}.
+    \item Przypisów nie należy używać zbyt często; warto rozważyć włączenie treści przypisu do tekstu głównego.
+    \item Po zmianach należy sprawdzić ostrzeżenia \texttt{overfull} i \texttt{underfull boxes}.
+    \item Po ostatniej redakcji należy sprawdzić wiszące spójniki i wstawić twarde spacje tam, gdzie są potrzebne.
+\end{itemize}

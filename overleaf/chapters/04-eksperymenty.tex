@@ -1,0 +1,40 @@
+\chapter{Eksperymenty i analiza wyników}
+\label{ch:eksperymenty}
+
+\section{Opis zbioru danych wykorzystanego w badaniach}
+\label{sec:zbior-danych}
+
+% TODO: Opisać użyty korpus mowy, np. LibriSpeech train-clean-100 lub train-clean-360, sposób podziału danych,
+% przygotowanie próbek, długość segmentów i ograniczenia wynikające z dostępności danych.
+
+\section{Konfiguracja eksperymentów}
+\label{sec:konfiguracja-eksperymentow}
+
+% TODO: Udokumentować konfiguracje treningu: liczbę kroków, batch, akumulację gradientu, architekturę,
+% parametry RVQ, funkcje kosztu, checkpointy i sprzęt. Warto odwołać się do plików w katalogach configs oraz runs.
+
+\section{Wpływ przepływności bitowej na jakość rekonstrukcji}
+\label{sec:wplyw-przeplywnosci}
+
+% TODO: Porównać warianty różniące się liczbą słowników, rozmiarem codebooków lub krokiem czasowym kodera.
+% Należy zestawić nominalną przepływność z metrykami jakości oraz z obserwacjami odsłuchowymi.
+
+\section{Wpływ parametrów modelu na skuteczność kompresji}
+\label{sec:wplyw-parametrow-modelu}
+
+% TODO: Przeanalizować znaczenie wybranych parametrów: wymiaru latentnego, rvq-code-dim, funkcji aktywacji,
+% strat STFT/mel, stabilizacji RVQ, bloków dekodera i post-refinera.
+
+\section{Ocena jakości odtworzonego dźwięku}
+\label{sec:ocena-jakosci}
+
+% TODO: Zaprezentować wyniki metryk SI-SDR, PESQ, STOI, ViSQOL, LSD, L1 i cos.
+% W przypadku przykładów audio należy wskazać lokalizację plików w dodatkach lub repozytorium,
+% zamiast wklejać obszerne dane binarne do pracy.
+
+\section{Dyskusja wyników}
+\label{sec:dyskusja-wynikow}
+
+% TODO: Omówić kompromisy między przepływnością, zrozumiałością, naturalnością, stabilnością treningu
+% i kosztem obliczeniowym. Należy wskazać, które wyniki potwierdzają realizację celu pracy,
+% a które ujawniają ograniczenia metody.
