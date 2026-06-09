@@ -3,6 +3,7 @@
 #include "sirencodec/metrics.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -29,7 +30,7 @@ void print_usage(const char *argv0) {
       << "usage: " << argv0 << " --input audio.wav [--full-model file] "
       << "[--compress-model file --decompress-model file] [options]\n\n"
       << "options:\n"
-      << "  --litert-lib FILE    libLiteRt.so path (default: env/path probe)\n"
+      << "  --litert-lib FILE    libLiteRt path (default: env/path probe)\n"
       << "  --sample-rate N      Audio sample rate for exported shape (default: 16000)\n"
       << "  --num-threads N      XNNPACK CPU threads via LiteRT opaque options\n"
       << "  --tolerance X        Max full-vs-codec absolute diff when both are provided (default: 1e-3)\n";
@@ -157,8 +158,9 @@ int main(int argc, char **argv) {
       print_specs("full inputs", full.input_specs());
       print_specs("full outputs", full.output_specs());
       reference_audio = load_audio_for_spec(args, full.input_specs().at(0));
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(full.input_specs().at(0), reference_audio);
-      full_recon = full.run({input}).at(0).as_floats();
+      const std::array<sirencodec::LiteRtTensorValue, 1> input{
+          sirencodec::LiteRtTensorValue::from_floats(full.input_specs().at(0), reference_audio)};
+      full_recon = full.run(input).at(0).as_floats();
       full_recon.resize(reference_audio.size());
       require_finite(full_recon, "full reconstruction");
     }
@@ -172,8 +174,9 @@ int main(int argc, char **argv) {
       print_specs("decompress outputs", decompress.output_specs());
 
       auto audio = load_audio_for_spec(args, compress.input_specs().at(0));
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(compress.input_specs().at(0), audio);
-      auto packet = compress.run({input});
+      const std::array<sirencodec::LiteRtTensorValue, 1> input{
+          sirencodec::LiteRtTensorValue::from_floats(compress.input_specs().at(0), audio)};
+      auto packet = compress.run(input);
       if (packet.size() != 2 || packet[0].spec.dtype != sirencodec::LiteRtDataType::Int32 ||
           packet[1].spec.dtype != sirencodec::LiteRtDataType::Float32) {
         throw std::runtime_error("compress model did not return int32 indices and float32 norms");

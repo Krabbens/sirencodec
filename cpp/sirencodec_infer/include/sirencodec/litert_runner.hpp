@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -61,7 +62,9 @@ public:
   [[nodiscard]] const std::vector<LiteRtTensorSpec> &output_specs() const;
   [[nodiscard]] const std::filesystem::path &model_path() const;
 
-  [[nodiscard]] std::vector<LiteRtTensorValue> run(const std::vector<LiteRtTensorValue> &inputs) const;
+  [[nodiscard]] std::vector<LiteRtTensorValue> run(std::span<const LiteRtTensorValue> inputs) const;
+  void run_into(std::span<const LiteRtTensorValue> inputs,
+                std::vector<LiteRtTensorValue> &outputs) const;
 
 private:
   class Impl;

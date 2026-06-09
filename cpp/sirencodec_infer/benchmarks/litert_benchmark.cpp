@@ -3,6 +3,7 @@
 #include "sirencodec/metrics.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -42,11 +44,6 @@ struct TimingSummary {
   double x_realtime{};
 };
 
-struct TimedOutput {
-  std::vector<sirencodec::LiteRtTensorValue> outputs;
-  double seconds{0.0};
-};
-
 void print_usage(const char *argv0) {
   std::cerr
       << "usage: " << argv0 << " --input audio.wav --profile full|codec|all [options]\n\n"
@@ -55,7 +52,7 @@ void print_usage(const char *argv0) {
       << "  --compress-model FILE    waveform->indices,norms .tflite model\n"
       << "  --decompress-model FILE  indices,norms->waveform .tflite model\n"
       << "  --output-dir DIR         Output directory (default: artifacts/benchmarks/litert_single_file)\n"
-      << "  --litert-lib FILE        libLiteRt.so path (default: env/path probe)\n"
+      << "  --litert-lib FILE        libLiteRt path (default: env/path probe)\n"
       << "  --sample-rate N          Audio sample rate for exported shape (default: 16000)\n"
       << "  --num-threads N          XNNPACK CPU threads via LiteRT opaque options\n"
       << "  --preload-runs N         Untimed warmups (default: 1)\n"
@@ -153,12 +150,13 @@ void print_specs(const std::string &label, const std::vector<sirencodec::LiteRtT
   std::cout << '\n';
 }
 
-TimedOutput run_timed(const sirencodec::LiteRtRunner &runner,
-                      const std::vector<sirencodec::LiteRtTensorValue> &inputs) {
+double run_timed_into(const sirencodec::LiteRtRunner &runner,
+                      std::span<const sirencodec::LiteRtTensorValue> inputs,
+                      std::vector<sirencodec::LiteRtTensorValue> &outputs) {
   const auto start = std::chrono::steady_clock::now();
-  auto outputs = runner.run(inputs);
+  runner.run_into(inputs, outputs);
   const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  return {std::move(outputs), elapsed};
+  return elapsed;
 }
 
 TimingSummary summarize(std::vector<double> seconds, double audio_seconds) {
@@ -242,21 +240,23 @@ int main(int argc, char **argv) {
 
       const auto original = load_audio_for_spec(args, full.input_specs().at(0));
       audio_seconds = static_cast<double>(original.size()) / static_cast<double>(args.sample_rate);
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(full.input_specs().at(0), original);
+      const std::array<sirencodec::LiteRtTensorValue, 1> inputs{
+          sirencodec::LiteRtTensorValue::from_floats(full.input_specs().at(0), original)};
+      std::vector<sirencodec::LiteRtTensorValue> outputs;
 
       for (int i = 0; i < args.preload_runs; ++i) {
-        (void)full.run({input});
+        full.run_into(inputs, outputs);
       }
 
       std::vector<double> seconds;
       seconds.reserve(static_cast<std::size_t>(args.benchmark_runs));
       for (int i = 0; i < args.benchmark_runs; ++i) {
-        auto run = run_timed(full, {input});
+        const double elapsed = run_timed_into(full, inputs, outputs);
         if (i + 1 == args.benchmark_runs) {
           quality_original = original;
-          quality_recon = run.outputs.at(0).as_floats();
+          quality_recon = outputs.at(0).as_floats();
         }
-        seconds.push_back(run.seconds);
+        seconds.push_back(elapsed);
       }
       reports.emplace("full", summarize(std::move(seconds), audio_seconds));
     }
@@ -271,11 +271,14 @@ int main(int argc, char **argv) {
 
       const auto original = load_audio_for_spec(args, compress.input_specs().at(0));
       audio_seconds = static_cast<double>(original.size()) / static_cast<double>(args.sample_rate);
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(compress.input_specs().at(0), original);
+      const std::array<sirencodec::LiteRtTensorValue, 1> compress_inputs{
+          sirencodec::LiteRtTensorValue::from_floats(compress.input_specs().at(0), original)};
+      std::vector<sirencodec::LiteRtTensorValue> packet;
+      std::vector<sirencodec::LiteRtTensorValue> decoded;
 
       for (int i = 0; i < args.preload_runs; ++i) {
-        auto packet = compress.run({input});
-        (void)decompress.run(packet);
+        compress.run_into(compress_inputs, packet);
+        decompress.run_into(packet, decoded);
       }
 
       std::vector<double> compress_seconds;
@@ -286,15 +289,15 @@ int main(int argc, char **argv) {
       full_seconds.reserve(static_cast<std::size_t>(args.benchmark_runs));
 
       for (int i = 0; i < args.benchmark_runs; ++i) {
-        auto packet = run_timed(compress, {input});
-        auto decoded = run_timed(decompress, packet.outputs);
+        const double compress_elapsed = run_timed_into(compress, compress_inputs, packet);
+        const double decompress_elapsed = run_timed_into(decompress, packet, decoded);
         if (i + 1 == args.benchmark_runs) {
           quality_original = original;
-          quality_recon = decoded.outputs.at(0).as_floats();
+          quality_recon = decoded.at(0).as_floats();
         }
-        compress_seconds.push_back(packet.seconds);
-        decompress_seconds.push_back(decoded.seconds);
-        full_seconds.push_back(packet.seconds + decoded.seconds);
+        compress_seconds.push_back(compress_elapsed);
+        decompress_seconds.push_back(decompress_elapsed);
+        full_seconds.push_back(compress_elapsed + decompress_elapsed);
       }
 
       reports.emplace("compress_only", summarize(std::move(compress_seconds), audio_seconds));

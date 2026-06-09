@@ -3,6 +3,7 @@
 #include "sirencodec/metrics.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -43,11 +45,6 @@ struct TimingSummary {
   double p90_seconds{};
   double max_seconds{};
   double x_realtime{};
-};
-
-struct TimedOutput {
-  std::vector<sirencodec::LiteRtTensorValue> outputs;
-  double seconds{};
 };
 
 struct MemorySnapshot {
@@ -164,12 +161,13 @@ std::vector<float> load_audio_for_spec(const std::filesystem::path &path,
   return samples;
 }
 
-TimedOutput run_timed(const sirencodec::LiteRtRunner &runner,
-                      const std::vector<sirencodec::LiteRtTensorValue> &inputs) {
+double run_timed_into(const sirencodec::LiteRtRunner &runner,
+                      std::span<const sirencodec::LiteRtTensorValue> inputs,
+                      std::vector<sirencodec::LiteRtTensorValue> &outputs) {
   const auto start = std::chrono::steady_clock::now();
-  auto outputs = runner.run(inputs);
+  runner.run_into(inputs, outputs);
   const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  return {std::move(outputs), elapsed};
+  return elapsed;
 }
 
 TimingSummary summarize(std::vector<double> values, double audio_seconds) {
@@ -292,35 +290,40 @@ int main(int argc, char **argv) {
     std::vector<sirencodec::QualityMetrics> quality;
 
     const auto warmup = static_cast<std::size_t>(std::min(args.warmup_files, static_cast<int>(audio.size())));
+    std::vector<sirencodec::LiteRtTensorValue> full_outputs;
+    std::vector<sirencodec::LiteRtTensorValue> packet_outputs;
+    std::vector<sirencodec::LiteRtTensorValue> decoded_outputs;
     for (std::size_t i = 0; i < warmup; ++i) {
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(input_spec, audio[i]);
+      const std::array<sirencodec::LiteRtTensorValue, 1> input_values{
+          sirencodec::LiteRtTensorValue::from_floats(input_spec, audio[i])};
       if (full) {
-        (void)full->run({input});
+        full->run_into(input_values, full_outputs);
       }
       if (compress && decompress) {
-        auto packet = compress->run({input});
-        (void)decompress->run(packet);
+        compress->run_into(input_values, packet_outputs);
+        decompress->run_into(packet_outputs, decoded_outputs);
       }
     }
     memory_snapshots.push_back(memory_snapshot("after_warmup"));
 
     for (std::size_t i = 0; i < audio.size(); ++i) {
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(input_spec, audio[i]);
+      const std::array<sirencodec::LiteRtTensorValue, 1> input_values{
+          sirencodec::LiteRtTensorValue::from_floats(input_spec, audio[i])};
       std::vector<float> recon;
       if (full) {
-        auto y = run_timed(*full, {input});
-        full_seconds.push_back(y.seconds);
+        const double elapsed = run_timed_into(*full, input_values, full_outputs);
+        full_seconds.push_back(elapsed);
         if (!compress) {
-          recon = y.outputs.at(0).as_floats();
+          recon = full_outputs.at(0).as_floats();
         }
       }
       if (compress && decompress) {
-        auto packet = run_timed(*compress, {input});
-        auto decoded = run_timed(*decompress, packet.outputs);
-        compress_seconds.push_back(packet.seconds);
-        decompress_seconds.push_back(decoded.seconds);
-        codec_seconds.push_back(packet.seconds + decoded.seconds);
-        recon = decoded.outputs.at(0).as_floats();
+        const double compress_elapsed = run_timed_into(*compress, input_values, packet_outputs);
+        const double decompress_elapsed = run_timed_into(*decompress, packet_outputs, decoded_outputs);
+        compress_seconds.push_back(compress_elapsed);
+        decompress_seconds.push_back(decompress_elapsed);
+        codec_seconds.push_back(compress_elapsed + decompress_elapsed);
+        recon = decoded_outputs.at(0).as_floats();
       }
       if (i < static_cast<std::size_t>(args.quality_files) && !recon.empty()) {
         recon.resize(audio[i].size());

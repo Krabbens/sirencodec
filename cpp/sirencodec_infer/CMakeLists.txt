@@ -8,6 +8,11 @@ project(sirencodec_infer
 option(SIRENCODEC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(SIRENCODEC_ENABLE_TFLITE "Also link LiteRT/TensorFlow Lite headers/library when provided" OFF)
 option(SIRENCODEC_NATIVE_OPT "Enable native CPU tuning flags for Release builds" ON)
+option(SIRENCODEC_ARM_OPT "Enable Apple Silicon/AArch64 tuned Release flags" ON)
+option(SIRENCODEC_ENABLE_IPO "Enable Release interprocedural optimization when supported" ON)
+
+include(CheckCXXCompilerFlag)
+include(CheckIPOSupported)
 
 add_library(sirencodec_common STATIC
   src/audio_wav.cpp
@@ -62,6 +67,14 @@ set(SIRENCODEC_INSTALL_TARGETS
   sirencodec_litert_benchmark
   sirencodec_tests)
 
+function(sirencodec_add_release_compile_option target option)
+  string(MAKE_C_IDENTIFIER "SIRENCODEC_HAS_${option}" option_var)
+  check_cxx_compiler_flag("${option}" "${option_var}")
+  if (${option_var})
+    target_compile_options(${target} PRIVATE "$<$<CONFIG:Release>:${option}>")
+  endif()
+endfunction()
+
 find_path(SNDFILE_INCLUDE_DIR sndfile.h)
 find_library(SNDFILE_LIBRARY NAMES sndfile)
 if (SNDFILE_INCLUDE_DIR AND SNDFILE_LIBRARY)
@@ -110,9 +123,31 @@ else()
 endif()
 
 if (SIRENCODEC_NATIVE_OPT AND NOT MSVC)
-  foreach(target IN LISTS SIRENCODEC_ALL_TARGETS)
-    target_compile_options(${target} PRIVATE -march=native -mtune=native -ffast-math)
-  endforeach()
+  if (SIRENCODEC_ARM_OPT AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"))
+    foreach(target IN LISTS SIRENCODEC_ALL_TARGETS)
+      sirencodec_add_release_compile_option(${target} -mcpu=native)
+      sirencodec_add_release_compile_option(${target} -ffast-math)
+      sirencodec_add_release_compile_option(${target} -ffp-contract=fast)
+      sirencodec_add_release_compile_option(${target} -fomit-frame-pointer)
+    endforeach()
+  else()
+    foreach(target IN LISTS SIRENCODEC_ALL_TARGETS)
+      sirencodec_add_release_compile_option(${target} -march=native)
+      sirencodec_add_release_compile_option(${target} -mtune=native)
+      sirencodec_add_release_compile_option(${target} -ffast-math)
+    endforeach()
+  endif()
+endif()
+
+if (SIRENCODEC_ENABLE_IPO)
+  check_ipo_supported(RESULT SIRENCODEC_IPO_SUPPORTED OUTPUT SIRENCODEC_IPO_OUTPUT)
+  if (SIRENCODEC_IPO_SUPPORTED)
+    foreach(target IN LISTS SIRENCODEC_ALL_TARGETS)
+      set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endforeach()
+  else()
+    message(STATUS "IPO/LTO not enabled: ${SIRENCODEC_IPO_OUTPUT}")
+  endif()
 endif()
 
 install(TARGETS ${SIRENCODEC_INSTALL_TARGETS} RUNTIME DESTINATION bin)

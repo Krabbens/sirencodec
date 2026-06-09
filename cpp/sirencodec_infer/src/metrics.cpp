@@ -7,10 +7,90 @@
 #include <sstream>
 #include <stdexcept>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+#include <arm_neon.h>
+#define SIRENCODEC_HAVE_NEON 1
+#else
+#define SIRENCODEC_HAVE_NEON 0
+#endif
+
 namespace sirencodec {
 namespace {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
+
+#if SIRENCODEC_HAVE_NEON
+float hsum_f32(float32x4_t v) {
+#if defined(__aarch64__)
+  return vaddvq_f32(v);
+#else
+  const float32x2_t hi = vget_high_f32(v);
+  const float32x2_t lo = vget_low_f32(v);
+  const float32x2_t s = vadd_f32(lo, hi);
+  return vget_lane_f32(vpadd_f32(s, s), 0);
+#endif
+}
+
+double waveform_l1_neon(const float *reference, const float *estimate, std::size_t n) {
+  std::size_t i = 0;
+  float32x4_t acc0 = vdupq_n_f32(0.0F);
+  float32x4_t acc1 = vdupq_n_f32(0.0F);
+  for (; i + 8 <= n; i += 8) {
+    const float32x4_t r0 = vld1q_f32(reference + i);
+    const float32x4_t e0 = vld1q_f32(estimate + i);
+    const float32x4_t r1 = vld1q_f32(reference + i + 4);
+    const float32x4_t e1 = vld1q_f32(estimate + i + 4);
+    acc0 = vaddq_f32(acc0, vabdq_f32(r0, e0));
+    acc1 = vaddq_f32(acc1, vabdq_f32(r1, e1));
+  }
+  double total = static_cast<double>(hsum_f32(vaddq_f32(acc0, acc1)));
+  for (; i < n; ++i) {
+    total += std::abs(static_cast<double>(reference[i]) - static_cast<double>(estimate[i]));
+  }
+  return total;
+}
+
+struct DotNormSums {
+  double dot{};
+  double reference_norm{};
+  double estimate_norm{};
+};
+
+DotNormSums dot_norms_neon(const float *reference, const float *estimate, std::size_t n) {
+  std::size_t i = 0;
+  float32x4_t dot0 = vdupq_n_f32(0.0F);
+  float32x4_t dot1 = vdupq_n_f32(0.0F);
+  float32x4_t ref0 = vdupq_n_f32(0.0F);
+  float32x4_t ref1 = vdupq_n_f32(0.0F);
+  float32x4_t est0 = vdupq_n_f32(0.0F);
+  float32x4_t est1 = vdupq_n_f32(0.0F);
+  for (; i + 8 <= n; i += 8) {
+    const float32x4_t r0 = vld1q_f32(reference + i);
+    const float32x4_t e0 = vld1q_f32(estimate + i);
+    const float32x4_t r1 = vld1q_f32(reference + i + 4);
+    const float32x4_t e1 = vld1q_f32(estimate + i + 4);
+    dot0 = vmlaq_f32(dot0, r0, e0);
+    dot1 = vmlaq_f32(dot1, r1, e1);
+    ref0 = vmlaq_f32(ref0, r0, r0);
+    ref1 = vmlaq_f32(ref1, r1, r1);
+    est0 = vmlaq_f32(est0, e0, e0);
+    est1 = vmlaq_f32(est1, e1, e1);
+  }
+  DotNormSums sums{
+      static_cast<double>(hsum_f32(vaddq_f32(dot0, dot1))),
+      static_cast<double>(hsum_f32(vaddq_f32(ref0, ref1))),
+      static_cast<double>(hsum_f32(vaddq_f32(est0, est1))),
+  };
+  for (; i < n; ++i) {
+    const double r = reference[i];
+    const double e = estimate[i];
+    sums.dot += r * e;
+    sums.reference_norm += r * r;
+    sums.estimate_norm += e * e;
+  }
+  return sums;
+}
+#endif
 
 void fft_inplace(std::vector<std::complex<double>> &a) {
   const auto n = a.size();
@@ -95,9 +175,13 @@ double waveform_l1(const std::vector<float> &reference, const std::vector<float>
     return 0.0;
   }
   double total = 0.0;
+#if SIRENCODEC_HAVE_NEON
+  total = waveform_l1_neon(reference.data(), estimate.data(), n);
+#else
   for (std::size_t i = 0; i < n; ++i) {
     total += std::abs(static_cast<double>(reference[i]) - static_cast<double>(estimate[i]));
   }
+#endif
   return total / static_cast<double>(n);
 }
 
@@ -109,6 +193,12 @@ double waveform_cosine(const std::vector<float> &reference, const std::vector<fl
   double dot = 0.0;
   double ref_norm = 0.0;
   double est_norm = 0.0;
+#if SIRENCODEC_HAVE_NEON
+  const auto sums = dot_norms_neon(reference.data(), estimate.data(), n);
+  dot = sums.dot;
+  ref_norm = sums.reference_norm;
+  est_norm = sums.estimate_norm;
+#else
   for (std::size_t i = 0; i < n; ++i) {
     const double r = reference[i];
     const double e = estimate[i];
@@ -116,6 +206,7 @@ double waveform_cosine(const std::vector<float> &reference, const std::vector<fl
     ref_norm += r * r;
     est_norm += e * e;
   }
+#endif
   return dot / (std::sqrt(ref_norm) * std::sqrt(est_norm) + 1.0e-12);
 }
 

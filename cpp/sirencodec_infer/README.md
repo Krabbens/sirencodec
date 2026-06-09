@@ -1,8 +1,8 @@
 # SirenCodec C++20 TFLite Inference
 
 This project is TFLite/LiteRT-only. Deployment goes through fixed-shape
-`.tflite` files and `libLiteRt.so`; the previous manual native runtime has been
-removed from the C++ project.
+`.tflite` files and `libLiteRt.so`/`libLiteRt.dylib`; the previous manual native
+runtime has been removed from the C++ project.
 
 The runtime path is:
 
@@ -25,9 +25,25 @@ cmake -S cpp/sirencodec_infer -B build/sirencodec_infer -DCMAKE_BUILD_TYPE=Relea
 cmake --build build/sirencodec_infer -j
 ```
 
-The LiteRT runner uses a RAII dynamic-loader wrapper around `libLiteRt.so`, so a
+The LiteRT runner uses a RAII dynamic-loader wrapper around `libLiteRt`, so a
 regular build does not need LiteRT headers. The library path can be passed with
-`--litert-lib` or with `SIRENCODEC_LITERT_LIB`.
+`--litert-lib` or with `SIRENCODEC_LITERT_LIB`. If no path is provided, the
+runner probes `.venv` and `.venv-tflite` wheels for Python 3.10-3.13 and uses
+`libLiteRt.dylib` on macOS.
+
+Apple Silicon/AArch64 Release builds enable native ARM tuning by default:
+
+```bash
+cmake -S cpp/sirencodec_infer -B build/sirencodec_infer_arm \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSIRENCODEC_ARM_OPT=ON \
+  -DSIRENCODEC_ENABLE_IPO=ON
+cmake --build build/sirencodec_infer_arm -j
+```
+
+On the local Apple M5 Pro, the 1 s `czat.wav` codec split exported from
+`codec_step329999` was fastest at `--num-threads 5`; larger thread counts added
+overhead on the decoder.
 
 ## Export TFLite Models
 

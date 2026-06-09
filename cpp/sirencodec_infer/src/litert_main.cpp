@@ -2,12 +2,14 @@
 #include "sirencodec/litert_runner.hpp"
 #include "sirencodec/metrics.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -35,7 +37,7 @@ void print_usage(const char *argv0) {
       << "  --compress-model FILE    waveform->indices,norms .tflite model\n"
       << "  --decompress-model FILE  indices,norms->waveform .tflite model\n"
       << "  --output-dir DIR         Output directory (default: artifacts/inference/litert)\n"
-      << "  --litert-lib FILE        libLiteRt.so path (default: env/path probe)\n"
+      << "  --litert-lib FILE        libLiteRt path (default: env/path probe)\n"
       << "  --sample-rate N          Audio sample rate for exported shape (default: 16000)\n"
       << "  --num-threads N          XNNPACK CPU threads via LiteRT opaque options\n";
 }
@@ -141,7 +143,7 @@ struct TimedOutput {
 };
 
 TimedOutput run_timed(const sirencodec::LiteRtRunner &runner,
-                      const std::vector<sirencodec::LiteRtTensorValue> &inputs) {
+                      std::span<const sirencodec::LiteRtTensorValue> inputs) {
   const auto start = std::chrono::steady_clock::now();
   auto outputs = runner.run(inputs);
   const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -173,8 +175,9 @@ int main(int argc, char **argv) {
       print_specs("full inputs", full.input_specs());
       print_specs("full outputs", full.output_specs());
       original = load_audio_for_spec(args, full.input_specs().at(0));
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(full.input_specs().at(0), original);
-      auto run = run_timed(full, {input});
+      const std::array<sirencodec::LiteRtTensorValue, 1> inputs{
+          sirencodec::LiteRtTensorValue::from_floats(full.input_specs().at(0), original)};
+      auto run = run_timed(full, inputs);
       recon = run.outputs.at(0).as_floats();
       full_seconds = run.seconds;
     } else {
@@ -185,9 +188,10 @@ int main(int argc, char **argv) {
       print_specs("decompress inputs", decompress.input_specs());
       print_specs("decompress outputs", decompress.output_specs());
       original = load_audio_for_spec(args, compress.input_specs().at(0));
-      const auto input = sirencodec::LiteRtTensorValue::from_floats(compress.input_specs().at(0), original);
+      const std::array<sirencodec::LiteRtTensorValue, 1> inputs{
+          sirencodec::LiteRtTensorValue::from_floats(compress.input_specs().at(0), original)};
 
-      auto packet = run_timed(compress, {input});
+      auto packet = run_timed(compress, inputs);
       auto decoded = run_timed(decompress, packet.outputs);
       recon = decoded.outputs.at(0).as_floats();
       compress_seconds = packet.seconds;

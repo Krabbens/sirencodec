@@ -10,6 +10,13 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+#include <arm_neon.h>
+#define SIRENCODEC_HAVE_NEON 1
+#else
+#define SIRENCODEC_HAVE_NEON 0
+#endif
+
 #if defined(SIRENCODEC_HAVE_SNDFILE)
 #include <sndfile.h>
 #endif
@@ -44,6 +51,50 @@ std::int32_t read_s24(const unsigned char *p) {
   }
   return value;
 }
+
+#if SIRENCODEC_HAVE_NEON
+float hmax_f32(float32x4_t v) {
+#if defined(__aarch64__)
+  return vmaxvq_f32(v);
+#else
+  const float32x2_t hi = vget_high_f32(v);
+  const float32x2_t lo = vget_low_f32(v);
+  const float32x2_t m = vpmax_f32(lo, hi);
+  return vget_lane_f32(vpmax_f32(m, m), 0);
+#endif
+}
+
+float max_abs_neon(const float *data, std::size_t size) {
+  std::size_t i = 0;
+  float32x4_t peak4 = vdupq_n_f32(0.0F);
+  for (; i + 16 <= size; i += 16) {
+    const float32x4_t a = vabsq_f32(vld1q_f32(data + i));
+    const float32x4_t b = vabsq_f32(vld1q_f32(data + i + 4));
+    const float32x4_t c = vabsq_f32(vld1q_f32(data + i + 8));
+    const float32x4_t d = vabsq_f32(vld1q_f32(data + i + 12));
+    peak4 = vmaxq_f32(peak4, vmaxq_f32(vmaxq_f32(a, b), vmaxq_f32(c, d)));
+  }
+  float peak = hmax_f32(peak4);
+  for (; i < size; ++i) {
+    peak = std::max(peak, std::abs(data[i]));
+  }
+  return peak;
+}
+
+void scale_neon(const float *input, float *output, std::size_t size, float scale) {
+  std::size_t i = 0;
+  const float32x4_t scale4 = vdupq_n_f32(scale);
+  for (; i + 16 <= size; i += 16) {
+    vst1q_f32(output + i, vmulq_f32(vld1q_f32(input + i), scale4));
+    vst1q_f32(output + i + 4, vmulq_f32(vld1q_f32(input + i + 4), scale4));
+    vst1q_f32(output + i + 8, vmulq_f32(vld1q_f32(input + i + 8), scale4));
+    vst1q_f32(output + i + 12, vmulq_f32(vld1q_f32(input + i + 12), scale4));
+  }
+  for (; i < size; ++i) {
+    output[i] = input[i] * scale;
+  }
+}
+#endif
 
 } // namespace
 
@@ -227,15 +278,23 @@ std::vector<float> resample_linear(const std::vector<float> &samples, int source
 }
 
 std::vector<float> normalize_peak(const std::vector<float> &samples) {
+#if SIRENCODEC_HAVE_NEON
+  float peak = max_abs_neon(samples.data(), samples.size());
+#else
   float peak = 0.0F;
   for (float x : samples) {
     peak = std::max(peak, std::abs(x));
   }
+#endif
   peak = std::max(peak, 1.0e-5F);
   std::vector<float> out(samples.size());
+#if SIRENCODEC_HAVE_NEON
+  scale_neon(samples.data(), out.data(), samples.size(), 1.0F / peak);
+#else
   for (std::size_t i = 0; i < samples.size(); ++i) {
     out[i] = samples[i] / peak;
   }
+#endif
   return out;
 }
 

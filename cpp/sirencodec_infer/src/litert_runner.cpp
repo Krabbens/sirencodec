@@ -1,6 +1,7 @@
 #include "sirencodec/litert_runner.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -479,12 +480,31 @@ std::filesystem::path default_litert_library_path() {
   if (const char *env = std::getenv("SIRENCODEC_LITERT_LIB"); env != nullptr && env[0] != '\0') {
     return env;
   }
-  const std::filesystem::path wheel_path =
-      ".venv-tflite/lib/python3.12/site-packages/ai_edge_litert/libLiteRt.so";
-  if (std::filesystem::exists(wheel_path)) {
-    return wheel_path;
+  constexpr std::array venvs{".venv", ".venv-tflite"};
+  constexpr std::array python_versions{"python3.13", "python3.12", "python3.11", "python3.10"};
+#if defined(__APPLE__)
+  constexpr std::array library_names{"libLiteRt.dylib", "libLiteRt.so"};
+#else
+  constexpr std::array library_names{"libLiteRt.so"};
+#endif
+
+  for (const char *venv : venvs) {
+    for (const char *python_version : python_versions) {
+      for (const char *library_name : library_names) {
+        const std::filesystem::path wheel_path =
+            std::filesystem::path(venv) / "lib" / python_version / "site-packages" /
+            "ai_edge_litert" / library_name;
+        if (std::filesystem::exists(wheel_path)) {
+          return wheel_path;
+        }
+      }
+    }
   }
+#if defined(__APPLE__)
+  return "libLiteRt.dylib";
+#else
   return "libLiteRt.so";
+#endif
 }
 
 class LiteRtRunner::Impl {
@@ -525,7 +545,14 @@ public:
     create_buffers(false);
   }
 
-  [[nodiscard]] std::vector<LiteRtTensorValue> run(const std::vector<LiteRtTensorValue> &inputs) const {
+  [[nodiscard]] std::vector<LiteRtTensorValue> run(std::span<const LiteRtTensorValue> inputs) const {
+    std::vector<LiteRtTensorValue> outputs;
+    run_into(inputs, outputs);
+    return outputs;
+  }
+
+  void run_into(std::span<const LiteRtTensorValue> inputs,
+                std::vector<LiteRtTensorValue> &outputs) const {
     if (inputs.size() != input_specs_.size()) {
       throw std::runtime_error("wrong number of LiteRT inputs");
     }
@@ -546,17 +573,16 @@ public:
                                          output_buffers_.size(), output_buffers_.data()),
                  "LiteRtRunCompiledModel");
 
-    std::vector<LiteRtTensorValue> outputs;
-    outputs.reserve(output_specs_.size());
+    outputs.resize(output_specs_.size());
     for (std::size_t i = 0; i < output_specs_.size(); ++i) {
-      LiteRtTensorValue value;
-      value.spec = output_specs_[i];
+      auto &value = outputs[i];
+      if (value.spec.dtype != output_specs_[i].dtype || value.spec.shape != output_specs_[i].shape) {
+        value.spec = output_specs_[i];
+      }
       value.bytes.resize(output_specs_[i].byte_size());
       LockedBuffer lock(api_, output_buffers_[i], kLiteRtTensorBufferLockModeRead);
       std::memcpy(value.bytes.data(), lock.get(), value.bytes.size());
-      outputs.push_back(std::move(value));
     }
-    return outputs;
   }
 
   void create_buffers(bool inputs) {
@@ -622,8 +648,13 @@ const std::filesystem::path &LiteRtRunner::model_path() const {
   return impl_->model_path_;
 }
 
-std::vector<LiteRtTensorValue> LiteRtRunner::run(const std::vector<LiteRtTensorValue> &inputs) const {
+std::vector<LiteRtTensorValue> LiteRtRunner::run(std::span<const LiteRtTensorValue> inputs) const {
   return impl_->run(inputs);
+}
+
+void LiteRtRunner::run_into(std::span<const LiteRtTensorValue> inputs,
+                            std::vector<LiteRtTensorValue> &outputs) const {
+  impl_->run_into(inputs, outputs);
 }
 
 } // namespace sirencodec
