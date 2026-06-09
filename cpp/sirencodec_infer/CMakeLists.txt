@@ -34,6 +34,9 @@ target_link_libraries(sirencodec_litert PRIVATE sirencodec_litert_core)
 add_executable(sirencodec_benchmark benchmarks/litert_benchmark.cpp)
 target_link_libraries(sirencodec_benchmark PRIVATE sirencodec_litert_core)
 
+add_executable(sirencodec_dataset_benchmark benchmarks/litert_dataset_benchmark.cpp)
+target_link_libraries(sirencodec_dataset_benchmark PRIVATE sirencodec_litert_core)
+
 # Compatibility name for older benchmark commands.
 add_executable(sirencodec_litert_benchmark benchmarks/litert_benchmark.cpp)
 target_link_libraries(sirencodec_litert_benchmark PRIVATE sirencodec_litert_core)
@@ -47,6 +50,7 @@ set(SIRENCODEC_ALL_TARGETS
   sirencodec_infer
   sirencodec_litert
   sirencodec_benchmark
+  sirencodec_dataset_benchmark
   sirencodec_litert_benchmark
   sirencodec_tests)
 
@@ -54,6 +58,7 @@ set(SIRENCODEC_INSTALL_TARGETS
   sirencodec_infer
   sirencodec_litert
   sirencodec_benchmark
+  sirencodec_dataset_benchmark
   sirencodec_litert_benchmark
   sirencodec_tests)
 

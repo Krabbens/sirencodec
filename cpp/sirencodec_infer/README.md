@@ -38,18 +38,19 @@ python3 -m venv .venv-tflite
 
 .venv-tflite/bin/python tools/export_litert_models.py \
   runs/control315000_postlava_hp020_sem000_floor035_b8_20260514_112608/checkpoints/codec_step329999_cuda.pt \
-  --input sztyks2_orig.wav \
+  --input sample_16k.wav \
+  --samples 32000 \
   --models compress_packet,decompress_packet,full_recon \
-  --out-dir './c++outputs/litert_export_sztyks2' \
+  --out-dir './artifacts/models/litert_trainclean100_2s' \
   --benchmark-runs 5 \
   --num-threads 16
 ```
 
-Generated `sztyks2` models:
+Generated 2 s models:
 
-- `compress_packet_1x110933x1.tflite` - waveform to RVQ indices and residual norms
-- `decompress_packet_1x3x434.tflite` - packet to waveform
-- `full_recon_1x110933x1.tflite` - waveform to reconstructed waveform
+- `compress_packet_1x32000x1.tflite` - waveform to RVQ indices and residual norms
+- `decompress_packet_1x3x125.tflite` - packet to waveform
+- `full_recon_1x32000x1.tflite` - waveform to reconstructed waveform
 
 ## Inference
 
@@ -58,12 +59,12 @@ Codec split:
 ```bash
 build/sirencodec_infer/sirencodec_infer \
   --mode codec \
-  --input sztyks2_orig.wav \
-  --compress-model './c++outputs/litert_export_sztyks2/compress_packet_1x110933x1.tflite' \
-  --decompress-model './c++outputs/litert_export_sztyks2/decompress_packet_1x3x434.tflite' \
+  --input sample_16k.wav \
+  --compress-model './artifacts/models/litert_trainclean100_2s/compress_packet_1x32000x1.tflite' \
+  --decompress-model './artifacts/models/litert_trainclean100_2s/decompress_packet_1x3x125.tflite' \
   --litert-lib '.venv-tflite/lib/python3.12/site-packages/ai_edge_litert/libLiteRt.so' \
   --num-threads 16 \
-  --output-dir './c++outputs/tflite_codec_sztyks2'
+  --output-dir './artifacts/inference/litert_codec_sample'
 ```
 
 Single full reconstruction model:
@@ -71,11 +72,11 @@ Single full reconstruction model:
 ```bash
 build/sirencodec_infer/sirencodec_infer \
   --mode full \
-  --input sztyks2_orig.wav \
-  --full-model './c++outputs/litert_export_sztyks2/full_recon_1x110933x1.tflite' \
+  --input sample_16k.wav \
+  --full-model './artifacts/models/litert_trainclean100_2s/full_recon_1x32000x1.tflite' \
   --litert-lib '.venv-tflite/lib/python3.12/site-packages/ai_edge_litert/libLiteRt.so' \
   --num-threads 16 \
-  --output-dir './c++outputs/tflite_full_sztyks2'
+  --output-dir './artifacts/inference/litert_full_sample'
 ```
 
 `sirencodec_infer` performs one inference. Use `sirencodec_benchmark` for warmed
@@ -86,23 +87,24 @@ throughput numbers.
 ```bash
 build/sirencodec_infer/sirencodec_benchmark \
   --profile all \
-  --input sztyks2_orig.wav \
-  --full-model './c++outputs/litert_export_sztyks2/full_recon_1x110933x1.tflite' \
-  --compress-model './c++outputs/litert_export_sztyks2/compress_packet_1x110933x1.tflite' \
-  --decompress-model './c++outputs/litert_export_sztyks2/decompress_packet_1x3x434.tflite' \
+  --input sample_16k.wav \
+  --full-model './artifacts/models/litert_trainclean100_2s/full_recon_1x32000x1.tflite' \
+  --compress-model './artifacts/models/litert_trainclean100_2s/compress_packet_1x32000x1.tflite' \
+  --decompress-model './artifacts/models/litert_trainclean100_2s/decompress_packet_1x3x125.tflite' \
   --litert-lib '.venv-tflite/lib/python3.12/site-packages/ai_edge_litert/libLiteRt.so' \
   --num-threads 16 \
   --preload-runs 1 \
   --benchmark-runs 5 \
-  --output-dir './c++outputs/tflite_benchmark_sztyks2'
+  --output-dir './artifacts/benchmarks/litert_single_file_2s'
 ```
 
-Latest local C++ LiteRT benchmark with `--num-threads 16`:
+Dataset benchmark on 5% of LibriSpeech train-clean-100 with 2 s segments and
+`--num-threads 16`:
 
-- `codec_full`: 0.099067 s, 69.99x realtime
-- `compress_only`: 0.034069 s, 203.51x realtime
-- `decompress_only`: 0.064998 s, 106.67x realtime
-- `full`: 0.102328 s, 67.76x realtime
+- full reconstruction: 0.062011 s, 32.25x realtime
+- compression and decompression: 0.061543 s, 32.50x realtime
+- compression: 0.026084 s, 76.68x realtime
+- decompression: 0.035459 s, 56.40x realtime
 
 The thread count is passed to XNNPACK through LiteRT opaque CPU options.
 
@@ -110,10 +112,10 @@ The thread count is passed to XNNPACK through LiteRT opaque CPU options.
 
 ```bash
 build/sirencodec_infer/sirencodec_tests \
-  --input sztyks2_orig.wav \
-  --full-model './c++outputs/litert_export_sztyks2/full_recon_1x110933x1.tflite' \
-  --compress-model './c++outputs/litert_export_sztyks2/compress_packet_1x110933x1.tflite' \
-  --decompress-model './c++outputs/litert_export_sztyks2/decompress_packet_1x3x434.tflite' \
+  --input sample_16k.wav \
+  --full-model './artifacts/models/litert_trainclean100_2s/full_recon_1x32000x1.tflite' \
+  --compress-model './artifacts/models/litert_trainclean100_2s/compress_packet_1x32000x1.tflite' \
+  --decompress-model './artifacts/models/litert_trainclean100_2s/decompress_packet_1x3x125.tflite' \
   --litert-lib '.venv-tflite/lib/python3.12/site-packages/ai_edge_litert/libLiteRt.so' \
   --num-threads 16
 ```

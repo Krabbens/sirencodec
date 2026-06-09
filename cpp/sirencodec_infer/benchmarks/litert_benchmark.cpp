@@ -24,7 +24,7 @@ struct Args {
   std::filesystem::path full_model;
   std::filesystem::path compress_model;
   std::filesystem::path decompress_model;
-  std::filesystem::path output_dir{"c++outputs/litert_benchmarks"};
+  std::filesystem::path output_dir{"artifacts/benchmarks/litert_single_file"};
   std::filesystem::path litert_lib;
   int sample_rate{16000};
   int preload_runs{1};
@@ -54,7 +54,7 @@ void print_usage(const char *argv0) {
       << "  --full-model FILE        Full waveform->waveform .tflite model\n"
       << "  --compress-model FILE    waveform->indices,norms .tflite model\n"
       << "  --decompress-model FILE  indices,norms->waveform .tflite model\n"
-      << "  --output-dir DIR         Output directory (default: c++outputs/litert_benchmarks)\n"
+      << "  --output-dir DIR         Output directory (default: artifacts/benchmarks/litert_single_file)\n"
       << "  --litert-lib FILE        libLiteRt.so path (default: env/path probe)\n"
       << "  --sample-rate N          Audio sample rate for exported shape (default: 16000)\n"
       << "  --num-threads N          XNNPACK CPU threads via LiteRT opaque options\n"

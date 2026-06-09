@@ -15,6 +15,7 @@ __pycache__/
 
 # Data & large local assets (keep manifests out or use LFS explicitly)
 data/
+artifacts/
 
 # Build
 dist/

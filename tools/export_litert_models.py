@@ -134,7 +134,7 @@ def make_sample_wave(args: argparse.Namespace, sample_rate: int) -> tuple[torch.
     elif input_wav is not None:
         sample_count = int(input_wav.shape[0])
     else:
-        sample_count = int(sample_rate)
+        sample_count = int(2 * sample_rate)
     if sample_count <= 0:
         raise RuntimeError(f"sample count must be positive, got {sample_count}")
 
@@ -461,9 +461,9 @@ def export_one(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="Converted CUDA/PyTorch .pt checkpoint")
-    parser.add_argument("-o", "--out-dir", type=Path, default=Path("c++outputs/litert_export"))
+    parser.add_argument("-o", "--out-dir", type=Path, default=Path("artifacts/models/litert_export"))
     parser.add_argument("-i", "--input", type=Path, help="Optional WAV used as representative fixed-shape input")
-    parser.add_argument("--seconds", type=float, help="Fixed input duration. Defaults to full --input length or 1s.")
+    parser.add_argument("--seconds", type=float, help="Fixed input duration. Defaults to full --input length or 2s.")
     parser.add_argument("--samples", type=int, help="Fixed input sample count. Overrides --seconds.")
     parser.add_argument("--models", type=_parse_models, default=list(MODEL_CHOICES), help="Comma list or 'all'")
     parser.add_argument("--no-validate", action="store_true", help="Skip LiteRT interpreter validation")
