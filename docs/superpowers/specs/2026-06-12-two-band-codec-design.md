@@ -2,8 +2,8 @@
 
 ## Cel
 
-Rozszerzyc kodek o jawny podzial sygnalu 16 kHz na pasmo niskie 0--3 kHz
-i pasmo wysokie 3--8 kHz. Oba pasma maja byc kodowane przez osobne galezie
+Rozszerzyc kodek o jawny podzial sygnalu 16 kHz na pasmo niskie 0--3,5 kHz
+i pasmo wysokie 3,5--8 kHz. Oba pasma maja byc kodowane przez osobne galezie
 uczone wspolnie od losowej inicjalizacji. Dekoder pasma wysokiego ma korzystac
 z informacji odtworzonej przez galaz niskopasmowa, a laczna nominalna
 przeplywnosc obu strumieni ma pozostac bliska 900 bit/s.
@@ -26,7 +26,7 @@ falowego.
 ## Analiza i synteza pasm
 
 Podzial wykorzystuje staly, symetryczny filtr dolnoprzepustowy FIR o 127
-wspolczynnikach i czestotliwosci granicznej 3 kHz. Wspolczynniki sa obliczane
+wspolczynnikach i czestotliwosci granicznej 3,5 kHz. Wspolczynniki sa obliczane
 raz metoda okienkowa i przechowywane jako stale modelu.
 
 Dla sygnalu wejsciowego `x`:
