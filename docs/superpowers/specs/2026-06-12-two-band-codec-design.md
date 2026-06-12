@@ -90,7 +90,15 @@ jest pasmo niskie, a nastepnie pasmo wysokie.
 
 Mniejsza galaz wykorzystuje kanaly encodera `(12, 16, 24, 32, 48, 64, 96,
 128)`. Struktura redukcji czasowej pozostaje zgodna z glowna galezia, aby nie
-bylo potrzebne interpolowanie latentow.
+bylo potrzebne interpolowanie latentow. Przed kwantyzatorem stosowana jest
+normalizacja warstwowa. Gradient z dekodera high nie jest propagowany przez
+sygnal ani latent warunkujacy do kodeka low, dzieki czemu pomocnicza galaz
+nie destabilizuje glownej reprezentacji.
+
+Przed pierwszym krokiem ksiegi kodowe obu galezi sa inicjalizowane
+deterministycznym K-means na pierwszym batchu. W dalszym treningu embeddingi
+sa aktualizowane EMA. Twarde podmiany ksiegi w trakcie dzialania Adama sa
+domyslnie wylaczone.
 
 ## Budzet bitowy i strumien
 
@@ -121,20 +129,26 @@ Model jest uczony wspolnie. Strata calkowita zawiera:
 Domyslna kombinacja strat rekonstrukcyjnych ma postac:
 
 ```text
-L_recon = 1,0 * L_full + 0,5 * L_low + 1,0 * L_high_normalized
+L_recon = 1,0 * L_full + 0,5 * L_low + 0,1 * L_high_normalized
 ```
 
 Kazdy skladnik uzywa obecnej receptury bez GAN: `lambda_time=1,0`,
 `lambda_stft=0,5`, `lambda_sc=1,0`, `lambda_complex_stft=0,1`
 i `lambda_mel_l1=0,12`. Efektywna waga STFT podlega tej samej rozgrzewce
-we wszystkich trzech skladnikach. Dla kazdej galezi przyjmowane sa ponadto
-`lambda_vq=5,0` i `lambda_marginal=0,35`, a straty semantyczne pozostaja
+we wszystkich trzech skladnikach. Dla galezi low przyjmowane sa ponadto
+`lambda_vq=5,0` i `lambda_marginal=0,35`. Galaz high korzysta ze
+straight-through oraz aktualizacji EMA, bez dodatkowej kary VQ i marginalnej;
+wykorzystanie jej slownika pozostaje monitorowane. Straty semantyczne sa
 wylaczone w pierwszym przebiegu.
 
-Strata wysokiego pasma jest dzielona przez srednia wartosc bezwzgledna celu
-z dolnym ograniczeniem `0,02`. Zapobiega to zanikowi jej gradientu w cichych
-segmentach, bez nieograniczonego wzmacniania szumu. Wszystkie wspolczynniki
-sa polami konfiguracji i sa wypisywane w logu startowym.
+Strata wysokiego pasma jest liczona po podzieleniu predykcji i celu przez
+srednia wartosc bezwzgledna celu z dolnym ograniczeniem `0,1`. W polaczeniu
+z waga `0,1` daje to ograniczone wzmocnienie cichego pasma bez nieograniczonego
+wzrostu gradientu. Na wyjsciu encodera i dekodera high zastosowane sa lokalne
+guardy gradientu: forward pozostaje bez zmian, natomiast niepoprawne wartosci
+pochodnej sa zerowane, a jej RMS jest ograniczany przed propagacja przez mala
+galaz. Wszystkie wspolczynniki sa polami konfiguracji i sa wypisywane w logu
+startowym.
 
 ## Trening i logowanie
 

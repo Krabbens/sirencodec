@@ -15,6 +15,7 @@ formatu dotychczasowych checkpointow ani zachowania `MLXCodec`.
 3. Dodac `TwoBandCodec`:
    - low: `MLXCodec`, latent 512, RVQ `2 x K32`;
    - high: mniejszy `MLXCodec`, latent 256, RVQ `1 x K32`;
+   - LayerNorm przed RVQ high i deterministyczny bootstrap K-means;
    - encoder warunkujacy odtworzony sygnal low;
    - projekcja latentu low i fuzja trzech latentow;
    - dekodowanie high po zdekodowaniu low;
@@ -27,8 +28,8 @@ formatu dotychczasowych checkpointow ani zachowania `MLXCodec`.
 
 1. Dodac funkcje kosztu dla full, low i high:
    - L1, log-STFT, spectral convergence, complex STFT i mel;
-   - wagi galezi `1,0 / 0,5 / 1,0`;
-   - normalizacja high przez `max(mean(abs(target_high)), 0,02)`;
+   - wagi galezi `1,0 / 0,5 / 0,1`;
+   - normalizacja high przez `max(mean(abs(target_high)), 0,1)`;
    - osobne VQ i marginal entropy dla obu galezi.
 2. Dodac osobny entrypoint `tools/train_two_band_mlx.py`:
    - dataset `data/train-clean-100`;
@@ -56,6 +57,6 @@ formatu dotychczasowych checkpointow ani zachowania `MLXCodec`.
 
 1. Wykonac testy jednostkowe.
 2. Wykonac 3 kroki na danych syntetycznych.
-3. Wykonac 100 krokow na `train-clean-100`.
+3. Wykonac 100 krokow na `train-clean-100` z docelowym horyzontem LR.
 4. Po poprawnym smoke uruchomic 330000 krokow od zera w tle i zapisac
    komende, PID, log oraz konfiguracje w katalogu przebiegu.
