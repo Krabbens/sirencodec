@@ -81,3 +81,28 @@ test_original.wav
 
 # Bundled upstream clone (nested .git); use submodule or copy separately if needed
 LuxTTS/
+
+# Production artifact guard
+/data/
+/artifacts/
+/runs/
+/experiments/
+/c++outputs/
+/infer_*/
+**/sztyks*
+**/szweka*
+**/czat*
+**/adam*
+**/goralski*
+**/góralski*
+*.wav
+*.mp3
+*.flac
+*.asd
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+*.tflite
+*.tar.gz
