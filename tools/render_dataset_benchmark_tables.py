@@ -27,6 +27,13 @@ def fmt_optional(value: Any, digits: int = 1) -> str:
     return f(float(value), digits)
 
 
+def benchmark_fraction_label(report: dict[str, Any]) -> str:
+    fraction = report.get("fraction")
+    if fraction is None:
+        return "n/a"
+    return f"{100.0 * float(fraction):.0f}%"
+
+
 def exported_model_label(name: str) -> str:
     labels = {
         "full_recon": "pełna rekonstrukcja",
@@ -119,6 +126,7 @@ def render_markdown(
     mem_rows: list[dict[str, Any]],
 ) -> str:
     total_files = py_cuda.get("total_flac_files") or py_cpu.get("total_flac_files") or 28539
+    fraction_label = benchmark_fraction_label(py_cuda)
     manifest = py_cuda.get("manifest_out") or py_cuda.get("manifest") or py_cpu.get("manifest") or cpp.get("manifest")
     lines: list[str] = []
     lines.append("# Benchmark inferencji SirenCodec: PyTorch vs C++ LiteRT/TFLite\n")
@@ -127,7 +135,7 @@ def render_markdown(
     lines.append("|---|---|")
     lines.append("| Zbiór | LibriSpeech train-clean-100 |")
     lines.append(f"| Liczba plików w zbiorze | {total_files} |")
-    lines.append(f"| Udział benchmarku | 5% plików, {py_cuda['selected_files']} plików |")
+    lines.append(f"| Udział benchmarku | {fraction_label} plików, {py_cuda['selected_files']} plików |")
     lines.append("| Wybór próbek | deterministyczny wybór według skrótu ścieżki; wspólny manifest dla wszystkich backendów |")
     lines.append(
         f"| Segment wejściowy | {py_cuda['samples_per_file']} próbek, "
@@ -200,6 +208,8 @@ def render_markdown(
 
 def render_latex(py_cuda: dict[str, Any], cpp: dict[str, Any], rows: list[dict[str, Any]], py_cpu: dict[str, Any]) -> str:
     total_files = py_cuda.get("total_flac_files") or py_cpu.get("total_flac_files") or 28539
+    selected_files = py_cuda.get("selected_files") or py_cpu.get("selected_files")
+    fraction_label = benchmark_fraction_label(py_cuda).replace("%", r"\%")
     mem_rows = memory_rows(py_cuda, py_cpu, cpp)
     metrics = [
         ("PyTorch CUDA", py_cuda["metrics_mean"]),
@@ -211,7 +221,7 @@ def render_latex(py_cuda: dict[str, Any], cpp: dict[str, Any], rows: list[dict[s
         [
             r"\begin{table}[htbp]",
             r"\centering",
-            r"\caption{Warunki benchmarku inferencji dla 5\% plików LibriSpeech train-clean-100.}",
+            rf"\caption{{Warunki benchmarku inferencji dla {fraction_label} plików LibriSpeech train-clean-100.}}",
             r"\label{tab:benchmark-metodyka}",
             r"\begin{tabular}{ll}",
             r"\toprule",
@@ -219,7 +229,7 @@ def render_latex(py_cuda: dict[str, Any], cpp: dict[str, Any], rows: list[dict[s
             r"\midrule",
             r"Zbiór & LibriSpeech train-clean-100 \\",
             f"Liczba plików & {total_files} \\\\",
-            f"Udział benchmarku & 5\\%, {py_cuda['selected_files']} plików \\\\",
+            f"Udział benchmarku & {fraction_label}, {py_cuda['selected_files']} plików \\\\",
             r"Wybór próbek & deterministyczny skrót ścieżki, wspólny manifest \\",
             f"Segment & {py_cuda['samples_per_file']} próbek, {float(py_cuda['audio_seconds_per_file']):.1f} s przy 16 kHz \\\\",
             r"Zakres pomiaru & forward modelu, bez I/O audio \\",
@@ -232,7 +242,7 @@ def render_latex(py_cuda: dict[str, Any], cpp: dict[str, Any], rows: list[dict[s
             "",
             r"\begin{table}[htbp]",
             r"\centering",
-            r"\caption{Porównanie czasu inferencji PyTorch i C++ LiteRT/TFLite dla tych samych 1427 plików.}",
+            rf"\caption{{Porównanie czasu inferencji PyTorch i C++ LiteRT/TFLite dla tych samych {selected_files} plików.}}",
             r"\label{tab:benchmark-inferencja}",
             r"\begin{tabular}{lllrrrrr}",
             r"\toprule",

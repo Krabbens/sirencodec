@@ -66,6 +66,8 @@ def test_config_defaults_are_coherent():
     assert encoder_time_stride(cfg) == 2 ** len(cfg.enc_channels)
     assert nominal_rvq_kbps(cfg) > 0
     assert cfg.load_audio_threads >= 1
+    assert 0 <= cfg.noise_aug_prob <= 1
+    assert 0 < cfg.noise_aug_snr_min <= cfg.noise_aug_snr_max
     assert cfg.semantic_batch_items >= 1
     assert cfg.semantic_every >= 1
     assert isinstance(cfg.eval_seed, int)
@@ -79,9 +81,23 @@ def test_config_defaults_are_coherent():
     assert cfg.decoder_band_heads >= 1
     assert cfg.decoder_band_depth >= 0
     assert cfg.decoder_band_gain >= 0
+    assert cfg.speech_control_depth >= 0
+    assert cfg.speech_control_channels >= 1
+    assert cfg.speech_control_gain >= 0
+    assert cfg.speech_residual_gain >= 0
+    assert 0 <= cfg.speech_hf_gate_floor <= 1
+    assert cfg.speech_control_warmup_steps >= 0
     assert cfg.harmonic_harmonics >= 1
     assert cfg.harmonic_amp >= 0
     assert 0 < cfg.harmonic_f0_min < cfg.harmonic_f0_max
+    assert cfg.quantizer in {"rvq", "turboquant"}
+    assert cfg.turboquant_bits in {2, 4}
+    assert cfg.turboquant_code_dim >= 0
+    assert cfg.decoder_backend in {"waveform", "lux_vocos"}
+    assert cfg.lux_vocos_feature_dim >= 1
+    assert cfg.lux_vocos_n_fft >= 2
+    assert cfg.lux_vocos_hop >= 1
+    assert cfg.lux_vocos_output_sample_rate >= 1
 
 
 def test_argparse_defaults_cover_current_config():
@@ -89,6 +105,9 @@ def test_argparse_defaults_cover_current_config():
     assert defaults["batch"] == Config().batch
     assert defaults["checkpoint_dir"] == Config().checkpoint_dir
     assert defaults["dataset"] == Config().dataset
+    assert defaults["noise_aug_prob"] == Config().noise_aug_prob
+    assert defaults["noise_aug_snr_min"] == Config().noise_aug_snr_min
+    assert defaults["noise_aug_snr_max"] == Config().noise_aug_snr_max
     assert defaults["semantic_model"] == Config().semantic_model
     assert defaults["semantic_every"] == Config().semantic_every
     assert defaults["lambda_preemph"] == Config().lambda_preemph
@@ -97,7 +116,15 @@ def test_argparse_defaults_cover_current_config():
     assert defaults["self_attention_heads"] == Config().self_attention_heads
     assert defaults["decoder_refine_depth"] == Config().decoder_refine_depth
     assert defaults["decoder_band_heads"] == Config().decoder_band_heads
+    assert defaults["speech_control_depth"] == Config().speech_control_depth
+    assert defaults["speech_control_warmup_steps"] == Config().speech_control_warmup_steps
     assert defaults["harmonic_source"] == Config().harmonic_source
+    assert defaults["quantizer"] == Config().quantizer
+    assert defaults["turboquant_bits"] == Config().turboquant_bits
+    assert defaults["turboquant_code_dim"] == Config().turboquant_code_dim
+    assert defaults["decoder_backend"] == Config().decoder_backend
+    assert defaults["lux_vocos_feature_dim"] == Config().lux_vocos_feature_dim
+    assert defaults["lux_vocos_model"] == Config().lux_vocos_model
 
 
 def test_stft_parsers_accept_valid_values_and_reject_bad_ones():
@@ -297,6 +324,37 @@ def test_decoder_architecture_branches_forward_match_audio_shape():
     y, _, _, _, idx = model.forward_full(x)
     assert y.shape == x.shape
     assert idx is not None
+
+
+def test_mlx_speech_control_forward_matches_audio_shape():
+    import numpy as np
+
+    mx = pytest.importorskip("mlx.core")
+    mlx_codec = pytest.importorskip("sirencodec.mlx.codec")
+    cfg = Config(
+        batch=1,
+        segment=64,
+        enc_channels=(4, 4),
+        latent_dim=8,
+        latent_temporal_depth=0,
+        latent_temporal_post_depth=0,
+        speech_control_depth=1,
+        speech_control_channels=6,
+        speech_residual_gain=0.02,
+        n_codebooks=1,
+        codebook_size=8,
+        rvq_code_dim=0,
+    )
+    model = mlx_codec.MLXCodec(cfg)
+    x = mx.random.normal((1, 64, 1))
+    y, _, _, _, idx = model.forward_full(x)
+    mx.eval(y)
+    arr = np.array(y)
+    assert arr.shape == (1, 64, 1)
+    assert np.isfinite(arr).all()
+    assert idx is not None
+    stats = model.speech_control_stats()
+    assert {"energy", "voicing", "harmonicity", "hf_gate", "noise_gate", "residual_gate"} <= set(stats)
 
 
 def test_ae_anchor_loss_is_only_active_during_rvq_phase():

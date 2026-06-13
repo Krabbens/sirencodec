@@ -46,11 +46,16 @@
 \RequirePackage{graphicx}
 \RequirePackage{setspace}
 \RequirePackage{booktabs}
+\RequirePackage{iftex}
 
-\ifpdf
-	\DeclareGraphicsExtensions{.pdf,.png,.jpg}
+\ifPDFTeX
+	\ifpdf
+		\DeclareGraphicsExtensions{.pdf,.png,.jpg}
+	\else
+		\DeclareGraphicsExtensions{.eps}
+	\fi
 \else
-	\DeclareGraphicsExtensions{.eps}
+	\DeclareGraphicsExtensions{.pdf,.png,.jpg}
 \fi
 \RequirePackage{fancyvrb}
 
@@ -62,10 +67,14 @@
 \RequirePackage{nameref}
 \RequirePackage{varioref}
   
-\ifpdf
-        \usepackage[unicode,linktocpage,bookmarks]{hyperref}
+\ifPDFTeX
+        \ifpdf
+                \usepackage[unicode,linktocpage,bookmarks]{hyperref}
+        \else
+                \usepackage[dvips,unicode,linktocpage,bookmarks]{hyperref}
+        \fi
 \else
-        \usepackage[dvips,unicode,linktocpage,bookmarks]{hyperref}
+        \usepackage[unicode,linktocpage,bookmarks]{hyperref}
 \fi
 \hypersetup{
     pdffitwindow=true,
@@ -117,11 +126,19 @@
 \renewcommand{\maketitlehooka}{%
 \begin{center}
 \if@pppolish
-  \includegraphics[width=\textwidth]{wit/sygnet-pp.eps} \\
+  \ifPDFTeX
+    \includegraphics[width=\textwidth]{wit/sygnet-pp.eps} \\
+  \else
+    \includegraphics[width=0.22\textwidth]{wit/logo-pp.pdf} \\
+  \fi
 WYDZIA{\L} INFORMATYKI I TELEKOMUNIKACJI\\
 Instytut Informatyki
 \else
-  \includegraphics[width=\textwidth]{wit/sygnet-pp-eng.eps} \\
+  \ifPDFTeX
+    \includegraphics[width=\textwidth]{wit/sygnet-pp-eng.eps} \\
+  \else
+    \includegraphics[width=0.22\textwidth]{wit/logo-pp.pdf} \\
+  \fi
 FACULTY OF COMPUTING AND TELECOMMUNICATION\\
 Institute of Computing Science
 \fi\end{center}}

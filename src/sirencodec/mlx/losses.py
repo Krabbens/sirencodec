@@ -10,6 +10,33 @@ def _hann(n: int) -> mx.array:
     return 0.5 - 0.5 * mx.cos(2.0 * math.pi * i / float(max(n - 1, 1)))
 
 
+def _hann_periodic(n: int) -> mx.array:
+    i = mx.arange(n, dtype=mx.float32)
+    return 0.5 - 0.5 * mx.cos(2.0 * math.pi * i / float(max(n, 1)))
+
+
+def _reflect_pad_time(x: mx.array, pad: int) -> mx.array:
+    """Torch-style 1D reflect padding over ``axis=1`` for audio batches."""
+    if pad <= 0:
+        return x
+    t = int(x.shape[1])
+    if t <= 1:
+        return mx.pad(x, [(0, 0), (pad, pad)])
+    # PyTorch reflection excludes the edge sample:
+    # [0, 1, 2, 3], pad=2 -> [2, 1, 0, 1, 2, 3, 2, 1].
+    p = min(int(pad), t - 1)
+    base = mx.arange(p, dtype=mx.int32)
+    left_idx = p - base
+    right_idx = (t - 2) - base
+    left = mx.take(x, left_idx, axis=1)
+    right = mx.take(x, right_idx, axis=1)
+    y = mx.concatenate([left, x, right], axis=1)
+    if p == pad:
+        return y
+    extra = pad - p
+    return mx.pad(y, [(0, 0), (extra, extra)])
+
+
 def stft_complex(x: mx.array, n_fft: int, hop: int) -> mx.array:
     """x: [B, T] real → complex STFT [B, F, n_frames] via one batched ``rfft`` over framed signal."""
     b, t = x.shape
@@ -36,6 +63,26 @@ def stft_complex(x: mx.array, n_fft: int, hop: int) -> mx.array:
 def stft_linear_mag(x: mx.array, n_fft: int, hop: int) -> mx.array:
     """x: [B, T] → linear magnitude STFT [B, F, n_frames] (``|stft_complex(x)|``)."""
     return mx.abs(stft_complex(x, n_fft, hop))
+
+
+def stft_linear_mag_centered_reflect(x: mx.array, n_fft: int, hop: int) -> mx.array:
+    """Torchaudio-style ``center=True, pad_mode='reflect'`` linear magnitude STFT."""
+    b, t = x.shape
+    if x.dtype == mx.bfloat16:
+        x = x.astype(mx.float32)
+    n_fft_i = int(n_fft)
+    hop_i = int(hop)
+    x = _reflect_pad_time(x, n_fft_i // 2)
+    t_pad = int(x.shape[1])
+    n_frames = 1 + max(0, (t_pad - n_fft_i) // hop_i)
+    if n_frames <= 0:
+        return mx.zeros((b, n_fft_i // 2 + 1, 1))
+    f_idx = mx.arange(n_frames, dtype=mx.int32)[:, None] * hop_i + mx.arange(n_fft_i, dtype=mx.int32)[None, :]
+    flat = mx.reshape(f_idx, (-1,))
+    taken = mx.take(x, flat, axis=1)
+    frames = mx.reshape(taken, (b, n_frames, n_fft_i)) * _hann_periodic(n_fft_i)
+    spec = mx.fft.rfft(frames, n=n_fft_i)
+    return mx.transpose(mx.abs(spec), (0, 2, 1))
 
 
 def stft_log_mag(x: mx.array, n_fft: int, hop: int) -> mx.array:
@@ -93,23 +140,13 @@ def _mel_filterbank_numpy(
     mel_hi = hz_to_mel(np.array([fmax], dtype=np.float64))[0]
     mel_pts = np.linspace(mel_lo, mel_hi, n_mels + 2, dtype=np.float64)
     hz_pts = mel_to_hz(mel_pts)
-    fft_bins = np.floor((n_fft + 1) * hz_pts / float(sample_rate)).astype(np.int64)
-    fft_bins = np.clip(fft_bins, 0, n_freqs)
-
-    fb = np.zeros((n_mels, n_freqs), dtype=np.float32)
-    for i in range(n_mels):
-        lo, peak, hi = int(fft_bins[i]), int(fft_bins[i + 1]), int(fft_bins[i + 2])
-        if peak <= lo:
-            peak = lo + 1
-        if hi <= peak:
-            hi = peak + 1
-        peak = min(peak, n_freqs)
-        hi = min(hi, n_freqs)
-        for k in range(lo, peak):
-            fb[i, k] = (k - lo) / float(max(peak - lo, 1))
-        for k in range(peak, hi):
-            fb[i, k] = (hi - k) / float(max(hi - peak, 1))
-    return fb
+    all_freqs = np.linspace(0.0, float(int(sample_rate) // 2), n_freqs, dtype=np.float64)
+    f_diff = hz_pts[1:] - hz_pts[:-1]
+    slopes = hz_pts[None, :] - all_freqs[:, None]
+    down_slopes = (-slopes[:, :-2]) / np.maximum(f_diff[:-1], 1e-12)
+    up_slopes = slopes[:, 2:] / np.maximum(f_diff[1:], 1e-12)
+    fb_fm = np.maximum(0.0, np.minimum(down_slopes, up_slopes))
+    return fb_fm.T.astype(np.float32, copy=False)
 
 
 _MEL_FB_MX_CACHE: dict[tuple[int, int, int, int, int], mx.array] = {}
@@ -140,6 +177,20 @@ def _linear_mag_to_mel(mag_bft: mx.array, mel_fb: mx.array) -> mx.array:
     fb_t = mx.transpose(mel_fb, (1, 0))
     y = mx.matmul(x, fb_t)
     return mx.transpose(y, (0, 2, 1))
+
+
+def log_mel_spectrogram(
+    wav: mx.array,
+    mel_fb: mx.array,
+    n_fft: int,
+    hop: int,
+    *,
+    eps: float = 1e-7,
+) -> mx.array:
+    """Vocos-style log-mel features: waveform ``[B,T,1]`` → ``[B,frames,mels]``."""
+    mag = stft_linear_mag_centered_reflect(wav[..., 0], n_fft, hop)
+    mel = _linear_mag_to_mel(mag, mel_fb)
+    return mx.transpose(mx.log(mel + eps), (0, 2, 1))
 
 
 def mel_log_bin_losses(
@@ -394,6 +445,71 @@ def multi_stft_band_excess(
             fmin=fmin,
             fmax=fmax,
             hf_emphasis=hf_emphasis,
+        )
+    return total / w_den
+
+
+def _mean_temporal_logmag_excess(
+    lp: mx.array,
+    lq: mx.array,
+    *,
+    sample_rate: int,
+    margin: float,
+    fmin: float,
+    fmax: float,
+) -> mx.array:
+    """Penalize broadband per-frame target-relative log-mag excess.
+
+    Unlike ``_mean_stationary_logmag_excess`` this averages over frequency first,
+    so a frame is expensive only when many bins are above target together.
+    """
+    excess = mx.maximum(mx.array(0.0, dtype=mx.float32), lp - lq - float(margin))
+    f_dim = int(lp.shape[1])
+    if f_dim <= 1:
+        frame_excess = mx.mean(excess, axis=1)
+        return mx.mean(frame_excess * frame_excess)
+    nyq = float(sample_rate) * 0.5
+    hi = nyq if float(fmax) <= 0.0 else min(float(fmax), nyq)
+    lo = max(0.0, float(fmin))
+    if hi <= lo:
+        return mx.array(0.0, dtype=mx.float32)
+    freqs = mx.arange(f_dim, dtype=mx.float32) * (nyq / float(f_dim - 1))
+    band = (freqs >= lo).astype(mx.float32) * (freqs <= hi).astype(mx.float32)
+    den = mx.sum(band) + 1e-8
+    frame_excess = mx.sum(excess * mx.reshape(band, (1, f_dim, 1)), axis=1) / den
+    return mx.mean(frame_excess * frame_excess)
+
+
+def multi_stft_temporal_stripe_excess(
+    pred: mx.array,
+    tgt: mx.array,
+    scales: tuple[tuple[int, int], ...],
+    *,
+    sample_rate: int,
+    margin: float = 0.08,
+    fmin: float = 700.0,
+    fmax: float = 0.0,
+    scale_weights: tuple[float, ...] | None = None,
+) -> mx.array:
+    """Multi-scale broadband temporal excess penalty for vertical spectrogram stripes."""
+    if not scales:
+        return mx.array(0.0)
+    ws = [1.0] * len(scales) if scale_weights is None else list(scale_weights)
+    if len(ws) != len(scales):
+        raise ValueError("scale_weights length must match stft_scales")
+    w_den = float(sum(ws))
+    if w_den <= 0:
+        raise ValueError("sum of STFT scale weights must be > 0")
+    total = mx.array(0.0)
+    for (n_fft, hop), w in zip(scales, ws):
+        lp, lq = _stft_log_mag_pair(pred, tgt, n_fft, hop)
+        total = total + float(w) * _mean_temporal_logmag_excess(
+            lp,
+            lq,
+            sample_rate=sample_rate,
+            margin=margin,
+            fmin=fmin,
+            fmax=fmax,
         )
     return total / w_den
 

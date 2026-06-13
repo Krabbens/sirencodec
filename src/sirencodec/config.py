@@ -92,6 +92,10 @@ class Config:
     prefetch_audio: bool = True
     # Number of ready/queued CPU batches when prefetching. >1 hides disk jitter better on Windows.
     prefetch_audio_batches: int = 2
+    # Denoising augmentation: model input may be noisy while the reconstruction target remains clean.
+    noise_aug_prob: float = 0.0
+    noise_aug_snr_min: float = 12.0
+    noise_aug_snr_max: float = 30.0
     steps: int = 250_000
     lr: float = 8e-5
     # Adam LR: ``none`` = constant; ``cosine`` = decay to lr×lr_min_ratio by last step;
@@ -140,11 +144,26 @@ class Config:
     post_lavasr_kernel: int = 15
     post_lavasr_gain: float = 0.03
     post_lavasr_highpass: bool = True
+    # Speech-control residual branch. Disabled by default; when enabled it predicts
+    # slow gates from the decoder latent and only adds a small high-passed residual.
+    speech_control_depth: int = 0
+    speech_control_channels: int = 32
+    speech_control_gain: float = 1.0
+    speech_residual_gain: float = 0.03
+    speech_hf_gate_floor: float = 0.05
+    speech_control_warmup_steps: int = 0
     harmonic_source: bool = False
     harmonic_harmonics: int = 8
     harmonic_amp: float = 0.05
     harmonic_f0_min: float = 50.0
     harmonic_f0_max: float = 650.0
+    # Bottleneck quantizer. ``rvq`` keeps existing checkpoints and training behavior;
+    # ``turboquant`` uses fixed scalar 2/4-bit latent-coordinate quantization.
+    quantizer: str = "rvq"  # "rvq" | "turboquant"
+    turboquant_bits: int = 2
+    # Optional factorized TurboQuant: project latent D→d, quantize d scalar coords, then project d→D.
+    # 0 = quantize full latent_dim. For sub-kbps rates, use small d (e.g. 8 at 2 bits).
+    turboquant_code_dim: int = 0
     # Residual VQ (SoundStream / EnCodec style): each stage quantizes the remaining residual
     n_codebooks: int = 3
     codebook_size: int = 32
@@ -155,6 +174,16 @@ class Config:
     vq_commitment: float = 1.35  # β on commitment (higher → less codebook collapse at low bitrate)
     lambda_vq: float = 5.0  # scale sum of VQ losses vs waveform/STFT
     ae_only: bool = False  # if True, skip VQ (pure autoencoder)
+    # Decoder backend. ``waveform`` predicts samples directly. ``lux_vocos`` predicts
+    # LuxTTS/Vocos log-mel features; a frozen Lux/Vocos vocoder renders waveform at inference.
+    decoder_backend: str = "waveform"  # "waveform" | "lux_vocos"
+    lux_vocos_feature_dim: int = 100
+    lux_vocos_n_fft: int = 1024
+    lux_vocos_hop: int = 256
+    lux_vocos_fmin: float = 0.0
+    lux_vocos_fmax: float | None = None
+    lux_vocos_model: str = "YatharthS/LuxTTS"
+    lux_vocos_output_sample_rate: int = 24000
     # Loss (STFT often dominates RVQ at 256× downsample — ramp + lower default helps)
     lambda_time: float = 1.0
     lambda_stft: float = 0.5  # Main log-mag L1 (multi-scale); higher without GAN.
@@ -210,6 +239,10 @@ class Config:
     lambda_marginal: float = 0.35  # higher → stronger push of batch-marginal H toward log K (more codes used)
     # Softmax(-dist/τ) for batch-marginal H(p̄). Too-large τ → H≈log K even when hard indices collapsed (u≪K).
     marginal_tau: float = 0.04
+    # Binary RVQ hard-usage balance: ST hard one-hot assignment with softmax gradient.
+    # This catches K=2 stages where soft marginal H is high but hard argmin is stuck at 0/100.
+    lambda_binary_usage: float = 0.0
+    binary_usage_tau: float = 0.04
     # Early collapse window: u/K often drops right after step 0 (random distances look diverse).
     # Linear decay: λ_marg_eff = λ_marg * (mult + (1−mult)·t), t∈[0,1] over [0, boost_steps]; then λ_marg.
     marginal_boost_steps: int = 24_000  # 0 = off; longer helps 100k+ runs before λ_marg drops to base
@@ -259,6 +292,14 @@ class Config:
     latent_semantic_start_step: int = 0
     latent_semantic_ramp_steps: int = 0
     latent_semantic_dim: int = 768
+    # Bottleneck distillation: train a new RVQ layout to reproduce a frozen teacher z_q.
+    # Useful for lower-bitrate RVQ changes before waveform fine-tuning.
+    lambda_rvq_distill: float = 0.0
+    rvq_distill_only: bool = False
+    rvq_distill_freeze_non_rvq: bool = False
+    rvq_distill_teacher_n_codebooks: int = 3
+    rvq_distill_teacher_codebook_size: int = 32
+    rvq_distill_teacher_codebook_sizes: tuple[int, ...] | None = None
     # Optional waveform GAN (hinge). Generator adversarial term participates in the reconstruction loss balancer.
     lambda_adv: float = 0.0
     # Discriminator feature matching. Strongly stabilizes MPD/MSD GAN starts.
@@ -299,6 +340,11 @@ class Config:
     # Extra mean L1 on **linear** STFT magnitudes (same scales as log-STFT; weighted by λ_stft ramp).
     # Without GAN this carries more of the absolute harmonic-amplitude shaping.
     lambda_mag_l1: float = 0.15
+    # Broadband vertical stripe suppressor: target-relative log-STFT excess averaged over frequency per frame.
+    lambda_temporal_stripe: float = 0.0
+    temporal_stripe_margin: float = 0.08
+    temporal_stripe_fmin: float = 700.0
+    temporal_stripe_fmax: float = 0.0  # 0 => Nyquist
     # Encoder/default decoder activation: ``gelu`` | ``snake`` | ``snake_beta`` (DAC-style sin²).
     activation: str = "snake_beta"
     # Optional decoder-only override. ``None`` keeps the historical shared activation.
@@ -336,6 +382,11 @@ def encoder_time_stride(cfg: Config) -> int:
 
 def effective_codebook_sizes(cfg: Config) -> tuple[int, ...]:
     """Resolved ``(K0, K1, …)`` length ``n_codebooks``."""
+    if (getattr(cfg, "quantizer", "rvq") or "rvq").strip().lower() == "turboquant":
+        bits = int(getattr(cfg, "turboquant_bits", 2))
+        if bits not in (2, 4):
+            raise ValueError(f"turboquant_bits must be 2 or 4, got {bits}")
+        return (1 << bits,)
     if cfg.codebook_sizes is not None:
         if len(cfg.codebook_sizes) != cfg.n_codebooks:
             raise ValueError(
@@ -357,9 +408,17 @@ def mean_log_codebook_for_entropy(cfg: Config) -> float:
 
 
 def nominal_rvq_kbps(cfg: Config) -> float:
-    """Nominal index bitrate (kb/s): ``sum_i log2(K_i) × (sr / encoder_stride)``."""
+    """Nominal bottleneck bitrate (kb/s): bits per latent frame × latent frame rate."""
     st = encoder_time_stride(cfg)
     fps = cfg.sample_rate / st
+    if (getattr(cfg, "quantizer", "rvq") or "rvq").strip().lower() == "turboquant":
+        bits = int(getattr(cfg, "turboquant_bits", 2))
+        if bits not in (2, 4):
+            raise ValueError(f"turboquant_bits must be 2 or 4, got {bits}")
+        code_dim = int(getattr(cfg, "turboquant_code_dim", 0) or 0)
+        if code_dim <= 0:
+            code_dim = int(cfg.latent_dim)
+        return (float(bits * code_dim) * fps) / 1000.0
     bps = sum(math.log2(float(k)) for k in effective_codebook_sizes(cfg)) * fps
     return bps / 1000.0
 
@@ -432,6 +491,7 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
     if c.stft_scale_weights is not None:
         stft_w = ",".join(str(float(x)) for x in c.stft_scale_weights)
     d: dict[str, object] = {
+        "sample_rate": c.sample_rate,
         "enc_channels": ",".join(str(x) for x in c.enc_channels),
         "steps": c.steps,
         "batch": c.batch,
@@ -439,6 +499,9 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "load_audio_threads": c.load_audio_threads,
         "prefetch_audio": c.prefetch_audio,
         "prefetch_audio_batches": c.prefetch_audio_batches,
+        "noise_aug_prob": c.noise_aug_prob,
+        "noise_aug_snr_min": c.noise_aug_snr_min,
+        "noise_aug_snr_max": c.noise_aug_snr_max,
         "segment": c.segment,
         "lr": c.lr,
         "lr_schedule": c.lr_schedule,
@@ -469,13 +532,30 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "post_lavasr_kernel": c.post_lavasr_kernel,
         "post_lavasr_gain": c.post_lavasr_gain,
         "post_lavasr_highpass": c.post_lavasr_highpass,
+        "speech_control_depth": c.speech_control_depth,
+        "speech_control_channels": c.speech_control_channels,
+        "speech_control_gain": c.speech_control_gain,
+        "speech_residual_gain": c.speech_residual_gain,
+        "speech_hf_gate_floor": c.speech_hf_gate_floor,
+        "speech_control_warmup_steps": c.speech_control_warmup_steps,
         "harmonic_source": c.harmonic_source,
         "harmonic_harmonics": c.harmonic_harmonics,
         "harmonic_amp": c.harmonic_amp,
         "harmonic_f0_min": c.harmonic_f0_min,
         "harmonic_f0_max": c.harmonic_f0_max,
+        "quantizer": c.quantizer,
+        "turboquant_bits": c.turboquant_bits,
+        "turboquant_code_dim": c.turboquant_code_dim,
         "n_codebooks": c.n_codebooks,
         "codebook_size": c.codebook_size,
+        "decoder_backend": c.decoder_backend,
+        "lux_vocos_feature_dim": c.lux_vocos_feature_dim,
+        "lux_vocos_n_fft": c.lux_vocos_n_fft,
+        "lux_vocos_hop": c.lux_vocos_hop,
+        "lux_vocos_fmin": c.lux_vocos_fmin,
+        "lux_vocos_fmax": c.lux_vocos_fmax,
+        "lux_vocos_model": c.lux_vocos_model,
+        "lux_vocos_output_sample_rate": c.lux_vocos_output_sample_rate,
         "lambda_time": c.lambda_time,
         "lambda_stft": c.lambda_stft,
         "lambda_stft_grad": c.lambda_stft_grad,
@@ -509,6 +589,8 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "lambda_entropy": c.lambda_entropy,
         "lambda_marginal": c.lambda_marginal,
         "marginal_tau": c.marginal_tau,
+        "lambda_binary_usage": c.lambda_binary_usage,
+        "binary_usage_tau": c.binary_usage_tau,
         "marginal_boost_steps": c.marginal_boost_steps,
         "marginal_boost_mult": c.marginal_boost_mult,
         "vq_reset_every": c.vq_reset_every,
@@ -544,6 +626,16 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "latent_semantic_start_step": c.latent_semantic_start_step,
         "latent_semantic_ramp_steps": c.latent_semantic_ramp_steps,
         "latent_semantic_dim": c.latent_semantic_dim,
+        "lambda_rvq_distill": c.lambda_rvq_distill,
+        "rvq_distill_only": c.rvq_distill_only,
+        "rvq_distill_freeze_non_rvq": c.rvq_distill_freeze_non_rvq,
+        "rvq_distill_teacher_n_codebooks": c.rvq_distill_teacher_n_codebooks,
+        "rvq_distill_teacher_codebook_size": c.rvq_distill_teacher_codebook_size,
+        "rvq_distill_teacher_codebook_sizes": (
+            ",".join(str(x) for x in c.rvq_distill_teacher_codebook_sizes)
+            if c.rvq_distill_teacher_codebook_sizes is not None
+            else None
+        ),
         "lambda_adv": c.lambda_adv,
         "lambda_fm": c.lambda_fm,
         "disc_lr": c.disc_lr,
@@ -560,6 +652,10 @@ def argparse_defaults_from_config(dc: Config | None = None) -> dict[str, object]
         "curriculum_adv_start": c.curriculum_adv_start,
         "curriculum_quantize_blend": c.curriculum_quantize_blend,
         "lambda_mag_l1": c.lambda_mag_l1,
+        "lambda_temporal_stripe": c.lambda_temporal_stripe,
+        "temporal_stripe_margin": c.temporal_stripe_margin,
+        "temporal_stripe_fmin": c.temporal_stripe_fmin,
+        "temporal_stripe_fmax": c.temporal_stripe_fmax,
         "activation": c.activation,
         "decoder_activation": c.decoder_activation,
         "rvq_code_dim": c.rvq_code_dim,

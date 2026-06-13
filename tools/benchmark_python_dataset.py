@@ -110,6 +110,35 @@ def summarize(values: list[float], audio_seconds: float) -> dict[str, float | in
     }
 
 
+def sync_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def timed_call(device: torch.device, fn) -> tuple[Any, float]:
+    sync_if_needed(device)
+    start = time.perf_counter()
+    out = fn()
+    sync_if_needed(device)
+    return out, time.perf_counter() - start
+
+
+def encode_quantized(model: CUDACodec, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+    z = model.latent_before_rvq(x)
+    if model.cfg.ae_only:
+        return z, None
+    z_q, _vq_loss, _ent_pos, _marg_ent, indices = model.rvq(z)
+    return z_q, indices
+
+
+def decode_quantized(model: CUDACodec, z_q: torch.Tensor, tlen: int) -> torch.Tensor:
+    if model.latent_post is not None:
+        z_q = model.latent_post(z_q)
+    if model.self_attn_post is not None:
+        z_q = model.self_attn_post(z_q)
+    return model.decoder(z_q, tlen)
+
+
 def current_rss_mib() -> float | None:
     status = Path("/proc/self/status")
     if status.exists():
@@ -166,7 +195,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("checkpoint", type=Path)
     p.add_argument("--data-root", type=Path, default=Path("data/train-clean-100"))
-    p.add_argument("--fraction", type=float, default=0.05)
+    p.add_argument("--fraction", type=float, default=0.10, help="Fraction of --data-root to benchmark; default is 0.10")
     p.add_argument("--manifest", type=Path, default=None, help="Use existing newline-delimited file list")
     p.add_argument("--manifest-out", type=Path, default=None, help="Write selected file list")
     p.add_argument("--samples", type=int, default=32000, help="Fixed samples per file; default is 32000, i.e. 2 s at 16 kHz")
@@ -204,30 +233,39 @@ def main(argv: list[str] | None = None) -> int:
         for wav in audio[: max(0, min(args.warmup_files, len(audio)))]:
             x = torch.from_numpy(wav).view(1, -1, 1).to(device)
             _ = model.forward_full(x)[0]
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+            z_q, _indices = encode_quantized(model, x)
+            _ = decode_quantized(model, z_q, x.shape[1])
+        sync_if_needed(device)
         memory_snapshots.append(memory_snapshot("after_warmup", device))
 
-        timings: list[float] = []
+        full_timings: list[float] = []
+        compress_timings: list[float] = []
+        decompress_timings: list[float] = []
+        codec_timings: list[float] = []
         quality_rows: list[dict[str, float | None]] = []
         for idx, wav in enumerate(audio):
             x = torch.from_numpy(wav).view(1, -1, 1).to(device)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            start = time.perf_counter()
-            y = model.forward_full(x)[0]
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start
-            timings.append(elapsed)
+            y_full, full_elapsed = timed_call(device, lambda: model.forward_full(x)[0])
+            (z_q, _indices), compress_elapsed = timed_call(device, lambda: encode_quantized(model, x))
+            y_codec, decompress_elapsed = timed_call(device, lambda: decode_quantized(model, z_q, x.shape[1]))
+            full_timings.append(full_elapsed)
+            compress_timings.append(compress_elapsed)
+            decompress_timings.append(decompress_elapsed)
+            codec_timings.append(compress_elapsed + decompress_elapsed)
             if idx < max(0, args.quality_files):
-                recon = y.detach().cpu().numpy().reshape(-1).astype(np.float32)[: args.samples]
+                recon = y_codec.detach().cpu().numpy().reshape(-1).astype(np.float32)[: args.samples]
                 quality_rows.append(quality_metrics_16k(audio[idx], recon))
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+            del y_full
+        sync_if_needed(device)
         memory_snapshots.append(memory_snapshot("after_benchmark", device))
 
     audio_seconds = args.samples / float(cfg.sample_rate)
+    benchmarks = {
+        "full": summarize(full_timings, audio_seconds),
+        "compress_only": summarize(compress_timings, audio_seconds),
+        "decompress_only": summarize(decompress_timings, audio_seconds),
+        "codec_full": summarize(codec_timings, audio_seconds),
+    }
     report = {
         "backend": f"pytorch-{args.device}",
         "checkpoint": str(args.checkpoint.resolve()),
@@ -241,7 +279,8 @@ def main(argv: list[str] | None = None) -> int:
         "audio_seconds_per_file": audio_seconds,
         "timing_excludes_io": True,
         "warmup_files": int(args.warmup_files),
-        "benchmark": summarize(timings, audio_seconds),
+        "benchmark": benchmarks["full"],
+        "benchmarks": benchmarks,
         "quality_files": len(quality_rows),
         "metrics_mean": {
             key: (
@@ -275,11 +314,20 @@ def main(argv: list[str] | None = None) -> int:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(_jsonable(report), indent=2, sort_keys=True), encoding="utf-8")
-    b = report["benchmark"]
+    b = benchmarks["full"]
     print(
-        f"{report['backend']}: files={len(files)} mean={b['mean_seconds']:.6f}s "
+        f"{report['backend']} full: files={len(files)} mean={b['mean_seconds']:.6f}s "
         f"p50={b['p50_seconds']:.6f}s p90={b['p90_seconds']:.6f}s xrt={b['x_realtime']:.2f}"
     )
+    c = benchmarks["codec_full"]
+    print(
+        f"{report['backend']} codec_full: mean={c['mean_seconds']:.6f}s "
+        f"p50={c['p50_seconds']:.6f}s p90={c['p90_seconds']:.6f}s xrt={c['x_realtime']:.2f}"
+    )
+    ce = benchmarks["compress_only"]
+    de = benchmarks["decompress_only"]
+    print(f"compress_only: mean={ce['mean_seconds']:.6f}s xrt={ce['x_realtime']:.2f}")
+    print(f"decompress_only: mean={de['mean_seconds']:.6f}s xrt={de['x_realtime']:.2f}")
     m = report["memory"]
     rss_peak = m["rss_peak_mib"]
     mem_line = f"memory: rss_peak={rss_peak:.1f} MiB" if rss_peak is not None else "memory: rss_peak=n/a"

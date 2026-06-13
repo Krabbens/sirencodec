@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from statistics import NormalDist
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -9,6 +10,18 @@ import mlx.nn as nn
 from ..config import Config, effective_codebook_sizes
 from .. import streaming as streaming_mod
 from .losses import entropy_from_logits, marginal_code_entropy_from_dist
+
+
+def _argmin_lower_int32(dist: mx.array) -> mx.array:
+    """Deterministic argmin: exact ties resolve to the lowest code index."""
+    k = int(dist.shape[-1])
+    inf = mx.array(float("inf"), dtype=dist.dtype)
+    dist = mx.where(mx.isfinite(dist), dist, inf)
+    ranks = mx.arange(k, dtype=mx.int32)
+    sentinel = mx.full((k,), k, dtype=mx.int32)
+    winners = mx.where(dist == mx.min(dist, axis=-1, keepdims=True), ranks, sentinel)
+    return mx.min(winners, axis=-1).astype(mx.int32)
+
 
 def _enc_conv(cfg: Config, cin: int, cout: int, stride: int) -> nn.Module:
     if cfg.causal:
@@ -125,7 +138,7 @@ class VectorQuantizerStage(nn.Module):
             eb = cb / mx.sqrt(e2 + 1e-8)
             dots = zn @ mx.transpose(eb)
             dist = 2.0 - 2.0 * dots
-            idx = mx.argmin(dist, axis=-1)
+            idx = _argmin_lower_int32(dist)
             rn = mx.sqrt(z2 + 1e-8)
             flat = mx.reshape(idx, (-1,))
             z_q_dir = mx.reshape(mx.take(eb, flat, axis=0), r.shape)
@@ -135,7 +148,7 @@ class VectorQuantizerStage(nn.Module):
             e2 = mx.sum(cb * cb, axis=-1)
             dots = r @ mx.transpose(cb)
             dist = z2 + e2 - 2.0 * dots
-            idx = mx.argmin(dist, axis=-1)
+            idx = _argmin_lower_int32(dist)
             z_q_low = self.embedding(idx)
         if self.out_proj is not None:
             z_q = self.out_proj(z_q_low)
@@ -145,6 +158,16 @@ class VectorQuantizerStage(nn.Module):
         commit = mx.mean((mx.stop_gradient(z_q) - residual) ** 2)
         codebook = mx.mean((z_q - mx.stop_gradient(residual)) ** 2)
         vq_loss = self.beta * commit + codebook
+        if self.num_embeddings == 2 and float(getattr(self.cfg, "lambda_binary_usage", 0.0) or 0.0) > 0:
+            tau = max(float(getattr(self.cfg, "binary_usage_tau", 0.04) or 0.04), 1e-6)
+            soft = mx.softmax(-dist / tau, axis=-1)
+            codes = mx.reshape(mx.arange(self.num_embeddings, dtype=mx.int32), (1, 1, self.num_embeddings))
+            hard = (mx.expand_dims(idx, -1) == codes).astype(soft.dtype)
+            usage = mx.reshape(hard + soft - mx.stop_gradient(soft), (-1, self.num_embeddings))
+            probs = mx.mean(usage, axis=0)
+            target = mx.ones((self.num_embeddings,), dtype=soft.dtype) / float(self.num_embeddings)
+            usage_loss = mx.sum((probs - target) ** 2)
+            vq_loss = vq_loss + float(self.cfg.lambda_binary_usage) * usage_loss
         return z_st, vq_loss, dist, idx
 
 
@@ -183,6 +206,75 @@ class ResidualVectorQuantizer(nn.Module):
         if self.cfg.lambda_marginal > 0 and self.n_q > 0:
             total_marg = total_marg / float(self.n_q)
         return quantized, total_vq, total_ent, total_marg, indices
+
+
+class TurboQuantBottleneck(nn.Module):
+    """Fixed TurboQuant-style scalar latent quantizer with optional D→d→D projection."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.bits = int(getattr(cfg, "turboquant_bits", 2))
+        if self.bits not in (2, 4):
+            raise ValueError(f"turboquant_bits must be 2 or 4, got {self.bits}")
+        d = int(cfg.latent_dim)
+        cd = int(getattr(cfg, "turboquant_code_dim", 0) or 0)
+        if cd <= 0:
+            cd = d
+        if cd > d:
+            raise ValueError(f"turboquant_code_dim must be <= latent_dim ({d}), got {cd}")
+        self.code_dim = int(cd)
+        self.use_factor = self.code_dim < d
+        if self.use_factor:
+            self.in_proj = nn.Linear(d, self.code_dim)
+            self.out_proj = nn.Linear(self.code_dim, d)
+        else:
+            self.in_proj = None
+            self.out_proj = None
+        self.beta = float(cfg.vq_commitment)
+        self.num_levels = 1 << self.bits
+        nd = NormalDist()
+        inv_std = math.sqrt(float(max(1, self.code_dim)))
+        # Quantile-spaced normal centroids approximate the high-dimensional unit-sphere marginal.
+        cents = [nd.inv_cdf((i + 0.5) / self.num_levels) / inv_std for i in range(self.num_levels)]
+        bnds = [nd.inv_cdf(i / self.num_levels) / inv_std for i in range(1, self.num_levels)]
+        self.centroids = tuple(float(x) for x in cents)
+        self.boundaries = tuple(float(x) for x in bnds)
+
+    def __call__(
+        self, z: mx.array
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array, list[mx.array]]:
+        r = self.in_proj(z) if self.in_proj is not None else z
+        norm = mx.sqrt(mx.sum(r * r, axis=-1, keepdims=True) + 1e-8)
+        unit = r / norm
+        idx = mx.zeros(unit.shape, dtype=mx.int32)
+        for b in self.boundaries:
+            idx = idx + (unit > float(b)).astype(mx.int32)
+        centroids = mx.array(self.centroids, dtype=unit.dtype)
+        flat = mx.reshape(idx, (-1,))
+        q_unit = mx.reshape(mx.take(centroids, flat, axis=0), unit.shape)
+        q_norm = mx.sqrt(mx.sum(q_unit * q_unit, axis=-1, keepdims=True) + 1e-8)
+        q_low = q_unit * (norm / q_norm)
+        q = self.out_proj(q_low) if self.out_proj is not None else q_low
+        z_st = z + mx.stop_gradient(q - z)
+        vq_loss = self.beta * mx.mean((mx.stop_gradient(q) - z) ** 2)
+
+        levels = mx.reshape(centroids, (1, 1, 1, self.num_levels))
+        dist = (mx.expand_dims(unit, -1) - levels) ** 2
+        ent = mx.array(0.0, dtype=mx.float32)
+        marg = mx.array(0.0, dtype=mx.float32)
+        if self.cfg.lambda_entropy > 0:
+            ent = entropy_from_logits(-dist)
+        if self.cfg.lambda_marginal > 0:
+            tau = max(float(getattr(self.cfg, "marginal_tau", 0.04) or 0.04), 1e-6)
+            logits = mx.clip(-dist / tau, -50.0, 50.0)
+            m = mx.max(logits, axis=-1, keepdims=True)
+            ex = mx.exp(logits - m)
+            p = ex / (mx.sum(ex, axis=-1, keepdims=True) + 1e-8)
+            avg = mx.mean(p, axis=(0, 1))
+            h = -mx.sum(avg * mx.log(avg + 1e-8), axis=-1)
+            marg = mx.mean(h)
+        return z_st, vq_loss, ent, marg, [idx.astype(mx.int32)]
 
 
 class DecoderRefineStack(nn.Module):
@@ -259,6 +351,16 @@ def _lava_highpass_residual(x: mx.array) -> mx.array:
     return x - (0.5 * (left + right))
 
 
+def _repeat_time_to(x: mx.array, target_len: int) -> mx.array:
+    """Repeat low-rate controls on the time axis to match a decoder waveform grid."""
+    t = int(x.shape[1])
+    n = max(1, int(target_len))
+    if t >= n:
+        return x[:, :n, :]
+    repeats = max(1, (n + t - 1) // t)
+    return mx.repeat(x, repeats, axis=1)[:, :n, :]
+
+
 class PostLavaSRRefiner(nn.Module):
     """Small waveform refiner applied after the decoder, inspired by LavaSR's LR merge."""
 
@@ -290,6 +392,39 @@ class PostLavaSRRefiner(nn.Module):
         if self.highpass:
             residual = _lava_highpass_residual(residual)
         return mx.tanh(y + self.gain * residual)
+
+
+class SpeechControlHead(nn.Module):
+    """Predict bounded speech gates for a conservative decoder residual path."""
+
+    names = ("energy", "voicing", "harmonicity", "hf_gate", "noise_gate")
+
+    def __init__(self, cfg: Config, channels: int):
+        super().__init__()
+        self.depth = max(0, int(cfg.speech_control_depth))
+        hidden = max(4, int(cfg.speech_control_channels))
+        act = _decoder_activation(cfg)
+        self.in_proj = _same_conv(cfg, channels, hidden, 7)
+        self.layers = []
+        for i in range(self.depth):
+            dilation = 2 ** (i % 4)
+            self.layers.append(_same_conv(cfg, hidden, hidden, 7, dilation=dilation))
+            self.layers.append(_act_module(cfg, hidden, act))
+        self.out = _same_conv(cfg, hidden, len(self.names), 7)
+        if hasattr(self.out, "bias"):
+            bias = mx.zeros((len(self.names),), dtype=mx.float32)
+            # Start new checkpoints conservative: HF/noise residual gates are nearly closed.
+            bias = bias.at[3].add(-4.0)
+            bias = bias.at[4].add(-2.0)
+            self.out.bias = bias
+        for i, layer in enumerate(self.layers):
+            setattr(self, f"_speech_ctl{i}", layer)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        h = self.in_proj(x)
+        for layer in self.layers:
+            h = layer(h)
+        return _sigmoid(self.out(h))
 
 
 class Decoder(nn.Module):
@@ -348,16 +483,59 @@ class Decoder(nn.Module):
             setattr(self, f"_band_head{i}", head)
         self.harmonic_gain = float(cfg.harmonic_amp)
         self.harmonic_source = HarmonicSource(cfg, c[-1]) if bool(cfg.harmonic_source) else None
+        self.speech_control_gain = float(cfg.speech_control_gain)
+        self.speech_residual_gain = float(cfg.speech_residual_gain)
+        self.speech_hf_gate_floor = float(cfg.speech_hf_gate_floor)
+        self.speech_control = SpeechControlHead(cfg, cfg.latent_dim) if int(cfg.speech_control_depth) > 0 else None
+        self.speech_residual = _same_conv(cfg, c[-1], 1, 7) if self.speech_control is not None else None
+        if self.speech_residual is not None:
+            self.speech_residual.weight = mx.zeros_like(self.speech_residual.weight)
+            if hasattr(self.speech_residual, "bias"):
+                self.speech_residual.bias = mx.zeros_like(self.speech_residual.bias)
+        object.__setattr__(self, "_last_speech_control_stats", {})
         self.post_lavasr = PostLavaSRRefiner(cfg) if int(cfg.post_lavasr_depth) > 0 else None
         for i, layer in enumerate(self.layers):
             setattr(self, f"_d{i}", layer)
 
+    def speech_control_stats(self) -> dict[str, mx.array]:
+        return dict(getattr(self, "_last_speech_control_stats", {}))
+
     def __call__(self, z: mx.array, target_len: int) -> mx.array:
+        control_src = self.speech_control(z) if self.speech_control is not None else None
         x = z
         for layer in self.layers:
             x = layer(x)
         features = self.refine(x) if self.refine is not None else x
         y = self.out(features)
+        if control_src is not None:
+            controls = _repeat_time_to(control_src, int(y.shape[1]))
+            energy = controls[:, :, 0:1]
+            voicing = controls[:, :, 1:2]
+            harmonicity = controls[:, :, 2:3]
+            hf_gate = controls[:, :, 3:4]
+            noise_gate = controls[:, :, 4:5]
+            floor = max(0.0, min(1.0, self.speech_hf_gate_floor))
+            gate = floor + (1.0 - floor) * hf_gate
+            speech_presence = 0.25 + 0.75 * mx.maximum(voicing, harmonicity)
+            residual_gate = mx.clip(self.speech_control_gain * gate * speech_presence, 0.0, 1.0)
+            if self.speech_residual is not None and self.speech_residual_gain != 0.0:
+                residual = _lava_highpass_residual(self.speech_residual(features))
+                residual_gate = residual_gate * (0.5 + 0.5 * noise_gate)
+                y = y + self.speech_residual_gain * residual_gate * residual
+            object.__setattr__(
+                self,
+                "_last_speech_control_stats",
+                {
+                    "energy": mx.stop_gradient(mx.mean(energy)),
+                    "voicing": mx.stop_gradient(mx.mean(voicing)),
+                    "harmonicity": mx.stop_gradient(mx.mean(harmonicity)),
+                    "hf_gate": mx.stop_gradient(mx.mean(hf_gate)),
+                    "noise_gate": mx.stop_gradient(mx.mean(noise_gate)),
+                    "residual_gate": mx.stop_gradient(mx.mean(residual_gate)),
+                },
+            )
+        else:
+            object.__setattr__(self, "_last_speech_control_stats", {})
         if self.band_heads and self.band_gain != 0.0:
             extra = mx.zeros_like(y)
             for head in self.band_heads:
@@ -375,6 +553,42 @@ class Decoder(nn.Module):
         if self.post_lavasr is not None:
             y = self.post_lavasr(y)
         return y
+
+
+class LuxVocosFeatureDecoder(nn.Module):
+    """Decode bottleneck latents to LuxTTS/Vocos log-mel frames instead of waveform samples."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.depth = max(0, int(cfg.latent_temporal_post_depth))
+        self.feature_dim = max(1, int(getattr(cfg, "lux_vocos_feature_dim", 100)))
+        self.in_proj = nn.Linear(cfg.latent_dim, cfg.latent_dim)
+        self.layers = []
+        act = _decoder_activation(cfg)
+        for i in range(max(0, int(cfg.decoder_refine_depth))):
+            dilation = 2 ** (i % 4)
+            self.layers.append(_same_conv(cfg, cfg.latent_dim, cfg.latent_dim, 3, dilation=dilation))
+            self.layers.append(_act_module(cfg, cfg.latent_dim, act))
+        self.out = nn.Linear(cfg.latent_dim, self.feature_dim)
+        for i, layer in enumerate(self.layers):
+            setattr(self, f"_lux_feat{i}", layer)
+
+    def speech_control_stats(self) -> dict[str, mx.array]:
+        return {}
+
+    def __call__(self, z: mx.array, target_len: int) -> mx.array:
+        h = self.in_proj(z)
+        for layer in self.layers:
+            h = layer(h)
+        y = self.out(h)
+        t = int(y.shape[1])
+        n = max(1, int(target_len))
+        if t >= n:
+            return y[:, :n, :]
+        return mx.pad(y, [(0, 0), (0, n - t), (0, 0)])
+
+
 class LatentTemporalStack(nn.Module):
     """Residual dilated Conv1d stack on [B, L, C] latents (temporal context)."""
 
@@ -437,8 +651,20 @@ class MLXCodec(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.encoder = Encoder(cfg)
-        self.rvq = ResidualVectorQuantizer(cfg)
-        self.decoder = Decoder(cfg)
+        quantizer = (getattr(cfg, "quantizer", "rvq") or "rvq").strip().lower()
+        if quantizer == "turboquant":
+            self.rvq = TurboQuantBottleneck(cfg)
+        elif quantizer == "rvq":
+            self.rvq = ResidualVectorQuantizer(cfg)
+        else:
+            raise ValueError(f"unknown quantizer {cfg.quantizer!r}")
+        backend = (getattr(cfg, "decoder_backend", "waveform") or "waveform").strip().lower()
+        if backend == "lux_vocos":
+            self.decoder = LuxVocosFeatureDecoder(cfg)
+        elif backend == "waveform":
+            self.decoder = Decoder(cfg)
+        else:
+            raise ValueError(f"unknown decoder_backend {cfg.decoder_backend!r}")
         self.pre_vq_ln = nn.LayerNorm(cfg.latent_dim) if cfg.pre_vq_layernorm else None
         self.latent_pre = (
             LatentTemporalStack(cfg.latent_dim, cfg.latent_temporal_depth, activation=cfg.activation)
@@ -503,8 +729,10 @@ class MLXCodec(nn.Module):
         """Returns reconstruction plus the raw bottleneck latent used before decoder post-processing."""
         tlen = x.shape[1]
         z = self.latent_before_rvq(x)
+        backend = (getattr(self.cfg, "decoder_backend", "waveform") or "waveform").strip().lower()
+        out_len = int(z.shape[1]) if backend == "lux_vocos" else int(tlen)
         if self.cfg.ae_only:
-            y = self.decoder(z, tlen)
+            y = self.decoder(z, out_len)
             return y, mx.array(0.0), mx.array(0.0), mx.array(0.0), None, z
         z_q, vq_loss, ent_pos, marg_ent, indices = self.rvq(z)
         z_bottleneck = z_q
@@ -513,7 +741,7 @@ class MLXCodec(nn.Module):
             z_dec = self.latent_post(z_dec)
         if self.self_attn_post is not None:
             z_dec = self.self_attn_post(z_dec)
-        y = self.decoder(z_dec, tlen)
+        y = self.decoder(z_dec, out_len)
         return y, vq_loss, ent_pos, marg_ent, indices, z_bottleneck
 
     def semantic_from_latent(self, z_q: mx.array) -> mx.array:
@@ -522,6 +750,9 @@ class MLXCodec(nn.Module):
             raise RuntimeError("semantic latent head is disabled; set lambda_latent_semantic > 0")
         h = self.semantic_head_norm(z_q) if self.semantic_head_norm is not None else z_q
         return self.semantic_head(h)
+
+    def speech_control_stats(self) -> dict[str, mx.array]:
+        return self.decoder.speech_control_stats()
 
     def forward_reconstruction_only(self, x: mx.array) -> mx.array:
         """Reconstruction ``ŷ`` only (same graph as ``forward_full``)."""

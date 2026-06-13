@@ -1,30 +1,406 @@
 \chapter{Eksperymenty i analiza wyników}
 \label{ch:eksperymenty}
 
+\providecommand{\notarysunku}[1]{%
+\par\smallskip
+\begin{minipage}{0.90\textwidth}
+\footnotesize\raggedright\emph{#1}
+\end{minipage}\par
+}
+
+Rozdział przedstawia warunki eksperymentalne oraz przebieg uczenia zaproponowanego kodeka. Analizę rozpoczęto od charakterystyki zbioru danych i~konfiguracji treningu, ponieważ wartości funkcji kosztu zależą zarówno od architektury, jak i~od kolejnych zmian harmonogramu optymalizacji. Następnie omówiono jakość rekonstrukcji, zgodność widmową oraz stabilność rezydualnej kwantyzacji wektorowej. Osobno rozpatrzono znaczenie przepływności bitowej i~parametrów modelu, aby odróżnić pojemność nominalnego kanału od pojemności rzeczywiście wykorzystywanej przez słowniki.
+
+Podstawę analizy stanowi połączona historia czterech kolejnych faz treningu zapisana w~pliku \texttt{combined\_history.csv}. Plik zawiera \(1281\) pomiarów i~wprowadza wspólną oś \texttt{global\_step}, dzięki której restarty lokalnego licznika kroków nie przerywają przebiegu wykresów. Rejestrowano składniki funkcji kosztu, zgodność sygnałów, normę gradientu, wykorzystanie kodów RVQ oraz entropię rozkładu kodów. Są to pomiary wykonywane na mini-batchach treningowych. Plik nie zawiera wyników osobnej ewaluacji PESQ, STOI, LSD ani SI-SDR na stałym zbiorze, dlatego metryk tych nie łączono z~danymi pochodzącymi z~innych uruchomień.
+
 \section{Opis zbioru danych wykorzystanego w badaniach}
 \label{sec:zbior-danych}
 
-% TODO: Opisać użyty korpus mowy, np. LibriSpeech train-clean-100 lub train-clean-360, sposób podziału danych,
-% przygotowanie próbek, długość segmentów i ograniczenia wynikające z dostępności danych.
+Do uczenia wykorzystano część \texttt{train-clean-360} korpusu LibriSpeech. Jest to zbiór angielskiej mowy czytanej, przygotowany na podstawie audiobooków z~projektu LibriVox i~udostępniony w~postaci nagrań o~częstotliwości próbkowania \(16\)~kHz \cite{Panayotov2015LibriSpeech}. W~historii treningu jedna epoka obejmuje \(104014\) nagrań, a~lokalny licznik wskazuje \(1084\) aktualizacje parametrów na epokę. Z~relacji między kolumnami \texttt{seen} i~\texttt{iter} wynika, że jedna aktualizacja przetwarzała efektywnie \(96\) segmentów. Zwiększenie zbioru względem części \texttt{train-clean-100} dostarcza większej liczby mówców i~wypowiedzi, lecz nadal są to nagrania mowy czytanej w~relatywnie czystych warunkach. Wyniki nie opisują więc bezpośrednio odporności na hałas, pogłos, mowę spontaniczną ani inne języki.
+
+Sposób przygotowania próbek pozostawał zgodny z~torem opisanym w~Rozdziale~\ref{ch:metoda-implementacja}: nagrania sprowadzano do jednego kanału, dopasowywano do długości segmentu i~normalizowano amplitudowo. Połączona historia nie zawiera osobnego podziału walidacyjnego ani identyfikatorów nagrań użytych w~każdym mini-batchu. Z~tego względu krzywe pozwalają ocenić stabilność optymalizacji i~kierunek zmian błędów treningowych, lecz nie stanowią samodzielnego pomiaru generalizacji na niezależnym zbiorze.
 
 \section{Konfiguracja eksperymentów}
 \label{sec:konfiguracja-eksperymentow}
 
-% TODO: Udokumentować konfiguracje treningu: liczbę kroków, batch, akumulację gradientu, architekturę,
-% parametry RVQ, funkcje kosztu, checkpointy i sprzęt. Warto odwołać się do plików w katalogach configs oraz runs.
+Analizowany zapis nie przedstawia kilku niezależnych eksperymentów, lecz kolejne fazy uczenia tej samej architektury. W~całym przebiegu zachowano geometrię kodera, liczbę słowników RVQ i~format strumienia indeksów. Zmieniano natomiast warunki optymalizacji, przede wszystkim harmonogram współczynnika uczenia oraz obecność semantycznego składnika HuBERT \cite{Hsu2021HuBERT}. Takie rozdzielenie jest istotne dla interpretacji wyników. Zmiana wartości funkcji kosztu na granicy faz może wynikać z~innego ważenia składników, podczas gdy stopniowa zmiana błędów rekonstrukcji wewnątrz fazy lepiej opisuje rzeczywisty postęp uczenia.
+
+W~analizie wykorzystano zarówno przebieg czasowy metryk, jak i~ich rozkład w~poszczególnych fazach. Pierwszy widok pokazuje kierunek zmian i~reakcję modelu na restart harmonogramu. Drugi ogranicza wpływ pojedynczych mini-batchy oraz punktów skrajnych. Parametry wspólne dla całego uruchomienia zestawiono w~Tabeli~\ref{tab:konfiguracja-treningu-latest}, natomiast Tabele~\ref{tab:fazy-treningu-combined} i~\ref{tab:rola-faz-treningu} opisują zakres oraz rolę kolejnych faz.
+
+\subsection{Parametry eksperymentu}
+\label{subsec:parametry-eksperymentu}
+
+Zestawienie obejmuje parametry, które pozostawały stałe w~połączonej historii. Kontrola tych wielkości jest potrzebna, ponieważ zmiana liczby słowników, wymiaru latentnego albo częstotliwości ramek zmieniałaby jednocześnie pojemność modelu i~przepływność strumienia. W~badanym przebiegu poprawa metryk nie wynikała więc z~poszerzenia wąskiego gardła.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.40\textwidth} >{\raggedright\arraybackslash}p{0.48\textwidth}}
+\toprule
+Parametr & Wartość \\
+\midrule
+Zbiór treningowy & LibriSpeech \texttt{train-clean-360}, \(104014\) nagrań \\
+Częstotliwość próbkowania & \(16\)~kHz \\
+Efektywny rozmiar aktualizacji & \(96\) segmentów \\
+Liczba aktualizacji na epokę & \(1084\) \\
+Zakres połączonej historii & kroki globalne \(217\)--\(232006\), epoki \(0{,}20\)--\(214{,}03\) \\
+Liczba zarejestrowanych pomiarów & \(1281\) w~czterech fazach \\
+Kwantyzacja & \(3\) słowniki RVQ po \(32\) kody \\
+Wymiar latentu i~przestrzeni kwantyzacji & \(512/512\), bez redukcji wymiaru przed RVQ \\
+Strata semantyczna & wyłączona w~fazie 1, HuBERT Base z~wagą \(0{,}03\) w~fazach 2.1--2.3 \\
+Nominalna przepływność indeksów & \(937{,}5\)~bit/s \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Konfiguracja uruchomienia wykorzystanego do analizy przebiegu uczenia.}
+\label{tab:konfiguracja-treningu-latest}
+\notatabeli{Źródło: opracowanie własne na podstawie pliku \texttt{latest\_logs/combined\_history.csv}; parametry architektury zgodne z~opisem modelu w~Rozdziale~\ref{ch:metoda-implementacja}.}
+\end{center}
+
+\subsection{Podział treningu na fazy}
+\label{subsec:podzial-treningu-na-fazy}
+
+Podział na fazy wynikał ze zmian sposobu optymalizacji, a~nie ze zmiany architektury. Wspólny licznik \texttt{global\_step} zachowuje rzeczywistą kolejność pomiarów mimo restartów lokalnego licznika. Dwie pierwsze fazy zrealizowały pełny lokalny plan, natomiast zapis dwóch kolejnych kończy się przed jego formalnym domknięciem. Nie uniemożliwia to analizy trendu, ale oznacza, że długości faz nie powinny być traktowane jako równoważne.
+
+\begin{center}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.12\textwidth} >{\raggedright\arraybackslash}p{0.22\textwidth} >{\raggedright\arraybackslash}p{0.19\textwidth} >{\raggedright\arraybackslash}p{0.16\textwidth} >{\raggedright\arraybackslash}p{0.16\textwidth}}
+\toprule
+Faza & Kroki globalne & Epoki globalne & Maksymalne LR & Stan zapisu \\
+\midrule
+1 & \(217\)--\(32520\) & \(0{,}20\)--\(30{,}00\) & \(2{,}40\cdot10^{-4}\) & zakończona \\
+2.1 & \(32737\)--\(75880\) & \(30{,}20\)--\(70{,}00\) & \(1{,}20\cdot10^{-4}\) & zakończona \\
+2.2 & \(76097\)--\(108430\) & \(70{,}20\)--\(100{,}03\) & \(1{,}00\cdot10^{-5}\) & \(75{,}1\%\) planu \\
+2.3 & \(108647\)--\(232006\) & \(100{,}23\)--\(214{,}03\) & \(2{,}00\cdot10^{-5}\) & \(95{,}0\%\) planu \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Zakres faz w~połączonej historii treningu.}
+\label{tab:fazy-treningu-combined}
+\notatabeli{Źródło: opracowanie własne na podstawie kolumn \texttt{phase\_name}, \texttt{global\_step}, \texttt{global\_epoch}, \texttt{lr} i~\texttt{progress\_pct} pliku \texttt{combined\_history.csv}.}
+\end{center}
+
+Sama numeracja faz nie wyjaśnia, jakie pytanie można rozpatrywać w~każdej z~nich. Tabela~\ref{tab:rola-faz-treningu} porządkuje ich znaczenie interpretacyjne. Nie jest to zestawienie wyników osobnych modeli, lecz opis kolejnych etapów dochodzenia do jednej konfiguracji końcowej.
+
+\begin{center}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.10\textwidth} >{\raggedright\arraybackslash}p{0.34\textwidth} >{\raggedright\arraybackslash}p{0.43\textwidth}}
+\toprule
+Faza & Najważniejsza cecha & Znaczenie w~analizie \\
+\midrule
+1 & Uczenie rekonstrukcji bez składnika semantycznego & Pokazuje formowanie podstawowej reprezentacji sygnału i~uruchamianie słowników RVQ. \\
+2.1 & Włączenie HuBERT i~restart harmonogramu & Pozwala obserwować dostosowanie modelu do dodatkowego kryterium zgodności treści. \\
+2.2 & Optymalizacja z~małym współczynnikiem uczenia & Służy stabilizacji błędów rekonstrukcji po zmianie funkcji kosztu. \\
+2.3 & Dłuższe dostrajanie przy zachowanym celu semantycznym & Pokazuje, czy poprawa rekonstrukcji utrzymuje się bez ponownego zapadania słowników. \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Rola kolejnych faz w~analizie przebiegu uczenia.}
+\label{tab:rola-faz-treningu}
+\notatabeli{Źródło: opracowanie własne na podstawie konfiguracji faz i~połączonej historii treningu.}
+\end{center}
+
+\subsection{Harmonogram optymalizacji}
+\label{subsec:harmonogram-optymalizacji}
+
+Rysunek~\ref{fig:trening-harmonogram} zestawia zmiany sterujące uczeniem z~reakcją gradientu. Na początku każdej fazy współczynnik uczenia był ponownie zwiększany, a~waga STFT przechodziła krótki okres narastania. Takie zachowanie wyjaśnia lokalne zaburzenia krzywych strat przy granicach faz. Nie należy ich interpretować jako natychmiastowej poprawy lub pogorszenia jakości, ponieważ model przez pewien czas dostosowywał się do zmienionej skali aktualizacji.
+
+Od fazy 2.1 aktywny był również tor HuBERT. Zwiększył on koszt pojedynczej aktualizacji podczas treningu, ale nie wszedł do toru inferencji. Norma gradientu była w~późniejszych fazach większa i~bardziej zmienna niż na początku uczenia. Istotniejsze od pojedynczego maksimum jest jednak zachowanie średniej kroczącej: po krótkich wzrostach nie następowała trwała eskalacja błędów rekonstrukcji. Oznacza to, że restarty harmonogramu nie doprowadziły do widocznej destabilizacji całego procesu.
+
+\begin{center}
+\centering
+\includegraphics[width=0.92\textwidth]{figures/training/training_schedule.pdf}
+\captionof{figure}{Harmonogram współczynnika uczenia, wagi składników funkcji kosztu i~norma gradientu w~zarejestrowanej części treningu.}
+\label{fig:trening-harmonogram}
+\notarysunku{Źródło: opracowanie własne na podstawie pliku \texttt{latest\_logs/combined\_history.csv}. Linie pionowe oznaczają granice faz. Dla normy gradientu linia o~mniejszym kryciu przedstawia wartości surowe, a~linia nieprzezroczysta średnią kroczącą z~\(11\) pomiarów, wyznaczaną osobno w~każdej fazie.}
+\end{center}
+
+\subsection{Przebieg funkcji kosztu i jakości rekonstrukcji}
+\label{subsec:funkcja-kosztu-jakosc-rekonstrukcji}
+
+Największa zmiana błędów nastąpiła w~początkowej części fazy 1, gdy model przechodził od praktycznie nieużytecznej rekonstrukcji do stabilnego odwzorowania ogólnego kształtu sygnału. W~dalszej części przebiegu poprawa była wolniejsza i~dotyczyła przede wszystkim widma oraz zgodności semantycznej. Rysunek~\ref{fig:trening-straty} pokazuje, że po włączeniu HuBERT składniki czasowe i~widmowe nie zaczęły trwale rosnąć. Dodatkowy cel semantyczny został więc wprowadzony bez widocznej utraty wcześniej uzyskanej zdolności rekonstrukcji.
+
+Strata całkowita ma w~tym przypadku znaczenie pomocnicze. Jej wartość zależy od aktywnych wag, dlatego nie nadaje się do prostego porównania granic faz. Bardziej miarodajne są składniki obliczane w~tej samej skali: \(L_1\), STFT, mel oraz strata semantyczna po jej aktywacji. Ich średnie kroczące wskazują, że późniejsze dostrajanie poprawiało kilka widoków sygnału jednocześnie, zamiast optymalizować wyłącznie jeden składnik kosztem pozostałych.
+
+\begin{center}
+\centering
+\includegraphics[width=0.92\textwidth]{figures/training/training_losses.pdf}
+\captionof{figure}{Przebieg straty całkowitej, kosztu kwantyzacji oraz podstawowych składników czasowych, semantycznych i~widmowych.}
+\label{fig:trening-straty}
+\notarysunku{Źródło: opracowanie własne na podstawie pliku \texttt{latest\_logs/combined\_history.csv}. Linie o~mniejszym kryciu przedstawiają wartości surowe, a~linie nieprzezroczyste średnią kroczącą z~\(11\) pomiarów, wyznaczaną osobno dla każdej fazy. Zastosowano skalę logarytmiczną.}
+\end{center}
+
+Ten wniosek potwierdza Rysunek~\ref{fig:trening-rekonstrukcja}. Zgodność cosinusowa po szybkim wzroście w~fazie 1 utrzymywała się na zbliżonym poziomie po wprowadzeniu HuBERT, a~w~dwóch ostatnich fazach jej typowa wartość ponownie rosła. Jednocześnie malały składniki mierzące zgodność widmową. Błąd zespolony pozostawał bardziej zmienny, co wskazuje, że poprawa amplitudy widma nie oznaczała równie szybkiego odtworzenia wszystkich zależności fazowych. Ocena oparta tylko na jednej krzywej prowadziłaby zatem do zbyt mocnego wniosku.
+
+\begin{center}
+\centering
+\includegraphics[width=0.92\textwidth]{figures/training/training_reconstruction.pdf}
+\captionof{figure}{Przebieg zgodności cosinusowej i~szczegółowych składników błędu widmowego.}
+\label{fig:trening-rekonstrukcja}
+\notarysunku{Źródło: opracowanie własne na podstawie pliku \texttt{latest\_logs/combined\_history.csv}. Linie o~mniejszym kryciu przedstawiają wartości surowe, a~linie nieprzezroczyste średnią kroczącą z~\(11\) pomiarów, wyznaczaną osobno dla każdej fazy.}
+\end{center}
+
+Porównanie punktów początkowych i~końcowych jest podatne na przypadkowy skład mini-batcha. Z~tego względu na Rysunku~\ref{fig:trening-rozklady-faz} przedstawiono rozkłady czterech metryk, a~w~Tabeli~\ref{tab:metryki-faz-mediany} ich mediany i~przedziały międzykwartylowe. W~fazie 2.1 wprowadzenie celu semantycznego zbiegło się z~chwilowym obniżeniem typowej zgodności cosinusowej i~przebudową rozkładu kodów. Kolejne fazy przyniosły jednoczesne obniżenie strat STFT i~HuBERT oraz odzyskanie zgodności rekonstrukcji. Przedziały dla faz 2.2 i~2.3 częściowo się nakładają, dlatego wynik należy traktować jako stopniowe dostrajanie, a~nie skokową zmianę jakości.
+
+\begin{center}
+\centering
+\includegraphics[width=0.92\textwidth]{figures/training/training_phase_distributions.pdf}
+\captionof{figure}{Rozkład wybranych metryk w~kolejnych fazach treningu.}
+\label{fig:trening-rozklady-faz}
+\notarysunku{Źródło: opracowanie własne na podstawie pliku \texttt{latest\_logs/combined\_history.csv}. Punkty o~małym kryciu przedstawiają próbkę surowych pomiarów, pudełka zakres międzykwartylowy, a~linia wewnątrz pudełka medianę. Strata HuBERT była wyłączona w~fazie 1.}
+\end{center}
+
+\begin{center}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.10\textwidth} >{\centering\arraybackslash}p{0.19\textwidth} >{\centering\arraybackslash}p{0.18\textwidth} >{\centering\arraybackslash}p{0.18\textwidth} >{\centering\arraybackslash}p{0.18\textwidth}}
+\toprule
+Faza & Zgodność cos. [\%] & STFT & HuBERT & Entropia RVQ [nat] \\
+\midrule
+1 & \(74{,}25\ [71{,}48;76{,}25]\) & \(0{,}966\ [0{,}937;1{,}010]\) & -- & \(3{,}374\ [3{,}366;3{,}385]\) \\
+2.1 & \(73{,}58\ [71{,}55;74{,}84]\) & \(0{,}969\ [0{,}944;0{,}994]\) & \(0{,}353\ [0{,}345;0{,}367]\) & \(2{,}855\ [2{,}777;3{,}346]\) \\
+2.2 & \(75{,}79\ [74{,}66;76{,}61]\) & \(0{,}951\ [0{,}935;0{,}973]\) & \(0{,}334\ [0{,}328;0{,}341]\) & \(2{,}749\ [2{,}728;2{,}768]\) \\
+2.3 & \(76{,}78\ [75{,}75;77{,}93]\) & \(0{,}939\ [0{,}913;0{,}961]\) & \(0{,}321\ [0{,}310;0{,}330]\) & \(2{,}768\ [2{,}748;2{,}789]\) \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Mediany i~przedziały międzykwartylowe wybranych metryk w~fazach treningu.}
+\label{tab:metryki-faz-mediany}
+\notatabeli{Źródło: opracowanie własne na podstawie \texttt{combined\_history.csv}. W~nawiasach kwadratowych podano pierwszy i~trzeci kwartyl; mniejsza wartość strat oznacza lepszy wynik.}
+\end{center}
+
+\subsection{Stabilność kwantyzacji RVQ}
+\label{subsec:stabilnosc-kwantyzacji-rvq}
+
+Osobnej kontroli wymagało wykorzystanie słowników RVQ. Sama liczba dostępnych kodów określa jedynie górną granicę pojemności; model może używać niewielkiego podzbioru i~nadal generować strumień o~tej samej długości. Rysunek~\ref{fig:trening-rvq} pokazuje, że na początku uczenia występował taki stan przejściowy, lecz wraz z~poprawą rekonstrukcji wszystkie etapy zaczęły korzystać z~prawie całych słowników. W~późniejszych fazach pierwszy etap sporadycznie pomijał pojedyncze kody, natomiast nie wystąpiło trwałe zapadnięcie żadnego słownika.
+
+\begin{center}
+\centering
+\includegraphics[width=0.85\textwidth]{figures/training/training_rvq.pdf}
+\captionof{figure}{Liczba aktywnych kodów, entropia brzegowa oraz równoważna przepływność entropijna trzech etapów RVQ.}
+\label{fig:trening-rvq}
+\notarysunku{Źródło: opracowanie własne na podstawie pliku \texttt{latest\_logs/combined\_history.csv}. Linie o~mniejszym kryciu przedstawiają wartości surowe, a~linie nieprzezroczyste średnią kroczącą z~\(11\) pomiarów. Równoważną przepływność obliczono jako \(3\cdot62{,}5\cdot H/\ln(2)\), gdzie \(H\) oznacza średnią entropię brzegową etapu RVQ.}
+\end{center}
+
+Entropia dostarcza innej informacji niż liczba aktywnych kodów. Po włączeniu celu semantycznego jej typowy poziom obniżył się, mimo że prawie wszystkie pozycje pozostawały używane. Oznacza to koncentrację prawdopodobieństwa na części symboli, a~nie utratę całych obszarów słownika. Taki rozkład może być łatwiejszy do dalszego kodowania entropijnego, lecz nie dowodzi sam w~sobie lepszej kompresji ani lepszej jakości. W~badanej implementacji indeksy zapisywano ze stałą szerokością, dlatego zmiana entropii była wskaźnikiem diagnostycznym, a~nie zmianą rzeczywistej przepływności.
+
+Łączna analiza rekonstrukcji i~RVQ wskazuje, że późniejsze obniżenie strat nie zostało osiągnięte przez ograniczenie modelu do kilku najczęstszych kodów. Jest to ważniejsze niż pojedyncza wartość entropii: model poprawiał zgodność czasową, widmową i~semantyczną przy zachowaniu szerokiego wykorzystania dyskretnego wąskiego gardła. Wniosek dotyczy jednak mini-batchy treningowych. Brak stałego zbioru walidacyjnego w~połączonej historii ogranicza możliwość oceny generalizacji.
 
 \section{Wpływ przepływności bitowej na jakość rekonstrukcji}
 \label{sec:wplyw-przeplywnosci}
 
-% TODO: Porównać warianty różniące się liczbą słowników, rozmiarem codebooków lub krokiem czasowym kodera.
-% Należy zestawić nominalną przepływność z metrykami jakości oraz z obserwacjami odsłuchowymi.
+W~eksperymencie przepływność pozostawała stała. Historia pozwala więc ocenić, jak model uczył się wykorzystywać ustalony kanał. Nie pozwala natomiast wyznaczyć krzywej zależności jakości od liczby bitów. Poprawa obserwowana między fazami wynikała z~optymalizacji wag przy niezmienionym strumieniu indeksów.
 
+\subsection{Nominalny budżet bitowy przyjętego wariantu}
+\label{subsec:nominalny-budzet-bitowy}
+
+Koder przypisuje każdej ramce latentnej po jednym indeksie z~każdego etapu RVQ. Ponieważ liczba ramek i~rozmiary słowników pozostają stałe, budżet bitowy jest taki sam dla prostego i~złożonego fragmentu mowy. Model nie może przeznaczyć dodatkowych bitów na szybką spółgłoskę, zmianę mówcy albo nietypowy układ widma. Musi rozdzielić tę samą pojemność między informację fonetyczną, energię, prozodię i~cechy barwy.
+
+\begin{equation}
+    R_{\mathrm{RVQ}} = 62{,}5 \cdot 3 \cdot \log_2(32)
+    = 937{,}5~\mathrm{bit/s}.
+    \label{eq:przeplywnosc-wariantu-eksperymentalnego}
+\end{equation}
+
+Znaczenie tej wartości zestawiono w~Tabeli~\ref{tab:interpretacja-budzetu-bitowego}. Porównanie z~PCM pokazuje skalę redukcji danych, ale nie jest porównaniem jakości. Sygnał PCM zachowuje bezpośrednie wartości próbek, natomiast strumień RVQ przekazuje jedynie dyskretne wskazania do wyuczonych wektorów. Dekoder rekonstruuje brakujące szczegóły na podstawie parametrów modelu, dlatego duży współczynnik kompresji oznacza jednocześnie silną zależność wyniku od jakości wyuczonej reprezentacji \cite{Zeghidour2021SoundStream,Defossez2022Encodec}.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.27\textwidth} >{\raggedright\arraybackslash}p{0.18\textwidth} >{\raggedright\arraybackslash}p{0.43\textwidth}}
+\toprule
+Wielkość & Wartość & Znaczenie \\
+\midrule
+Wejściowy sygnał PCM & \(256\)~kbps & Punkt odniesienia dla monofonicznego zapisu \(16\)-bit/\(16\)~kHz. \\
+Ładunek indeksów RVQ & \(937{,}5\)~bit/s & Rzeczywisty budżet modelu przy pakowaniu indeksów ze stałą szerokością. \\
+Współczynnik redukcji & około \(273{:}1\) & Porównuje objętość ładunku, ale nie uwzględnia jakości ani kosztu modelu. \\
+Wskaźnik entropijny pod koniec historii & około \(730\)~bit/s & Opisuje nierównomierność symboli; nie jest rozmiarem zapisanego strumienia. \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Interpretacja budżetu bitowego przyjętego wariantu.}
+\label{tab:interpretacja-budzetu-bitowego}
+\notatabeli{Źródło: opracowanie własne na podstawie konfiguracji modelu i~historii wykorzystania RVQ.}
+\end{center}
+
+\subsection{Wykorzystanie pojemności słowników RVQ}
+\label{subsec:wykorzystanie-pojemnosci-rvq}
+
+Nominalny budżet określa liczbę dostępnych symboli, lecz nie gwarantuje ich użytecznego wykorzystania. Na początku uczenia niewielka część kodów przenosiła mało zróżnicowaną informację, mimo że format strumienia rezerwował pełną liczbę bitów. Wraz z~uczeniem liczba aktywnych pozycji rosła, a~rekonstrukcja poprawiała się. Dopiero wspólna obserwacja tych dwóch zjawisk pozwala uznać, że pojemność kanału zaczęła być wykorzystywana do opisu sygnału, a~nie jedynie formalnie dostępna.
+
+W~późniejszych fazach prawie pełna liczba aktywnych kodów współistniała z~entropią niższą od maksimum. Nie jest to sprzeczność. Wszystkie symbole mogą występować, ale część z~nich może być wybierana znacznie częściej. Dla zapisu stałoszerokiego nie zmienia to liczby bitów. Potencjalna redukcja wymagałaby osobnego kodera entropijnego, którego nie zastosowano w~badanym strumieniu. Z~tego względu wskaźnik entropijny służy do oceny struktury rozkładu, nie do raportowania osiągniętej przepływności.
+
+\clearpage
+\subsection{Zakres porównania wariantów przepływności}
+\label{subsec:zakres-porownania-przeplywnosci}
+
+Zakres porównania jest ograniczony do jednego budżetu bitowego. Nie trenowano równoległych wariantów tej samej architektury z~inną przepływnością, dlatego dostępne dane nie pokazują, jak zmieniłaby się jakość po zwężeniu lub poszerzeniu kanału. Nie można na ich podstawie wskazać wartości optymalnej ani przypisać poprawy między fazami większej liczbie bitów. Przepływność pozostawała stała, a~zmieniały się wyłącznie parametry modelu i~warunki uczenia.
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.48\textwidth} >{\raggedright\arraybackslash}p{0.40\textwidth}}
+\toprule
+Pytanie badawcze & Zakres odpowiedzi na podstawie danych \\
+\midrule
+Czy strumień indeksów mieści się poniżej \(1\)~kbps? & Tak; wynika to z~geometrii wąskiego gardła i~formatu pakowania. \\
+Czy słowniki wykorzystują dostępną pojemność? & Tak; historia pokazuje prawie pełną liczbę aktywnych kodów bez trwałego zapadnięcia. \\
+Czy rekonstrukcja poprawiała się przy stałej przepływności? & Tak; trend jest widoczny w~metrykach czasowych, widmowych i~semantycznych treningu. \\
+Czy większa przepływność poprawiłaby jakość? & Nie oceniono; w~eksperymencie nie zmieniano budżetu bitowego. \\
+Czy przyjęta przepływność jest optymalna? & Nie można stwierdzić na podstawie jednego punktu pracy. \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Zakres wniosków dotyczących przepływności badanego modelu.}
+\label{tab:zakres-wnioskow-przeplywnosc}
+\notatabeli{Źródło: opracowanie własne na podstawie konfiguracji eksperymentu i~połączonej historii treningu.}
+\end{center}
+
+Wynik eksperymentu należy zatem interpretować jako demonstrację uczenia rekonstrukcji pod narzuconym ograniczeniem subkilobitowym. Zarejestrowane zmiany pokazują, że model potrafił poprawiać reprezentację bez zwiększania strumienia oraz bez trwałego ograniczenia słowników do niewielkiego podzbioru kodów. Nie stanowią natomiast empirycznego dowodu ogólnej zależności między przepływnością i~jakością dźwięku.
+
+\clearpage
 \section{Wpływ parametrów modelu na skuteczność kompresji}
 \label{sec:wplyw-parametrow-modelu}
 
-% TODO: Przeanalizować znaczenie wybranych parametrów: wymiaru latentnego, rvq-code-dim, funkcji aktywacji,
-% strat STFT/mel, stabilizacji RVQ, bloków dekodera i post-refinera.
+Parametry modelu wpływają na kompresję na dwa różne sposoby. Liczba etapów RVQ, rozmiary słowników i~częstotliwość ramek latentnych wyznaczają liczbę transmitowanych indeksów, a~zatem bezpośrednio określają nominalną przepływność. Szerokości warstw, wymiar latentny, bloki temporalne, samouwaga i~tor dekodera nie zmieniają formatu strumienia, lecz określają, jak skutecznie model wykorzystuje dostępne \(15\) bitów na ramkę. Rozróżnienie to jest istotne, ponieważ zwiększenie liczby parametrów może poprawić zdolność rekonstrukcji bez przesłania dodatkowego bitu, ale jednocześnie podnosi koszt pamięciowy i~obliczeniowy kodeka.
 
+Analizę wykonano dla konfiguracji użytej w~połączonej historii treningu. Nie przeprowadzono kontrolowanej ablacji, w~której pojedynczy parametr zmieniano przy zachowaniu pozostałych ustawień. Wnioski w~tej części wynikają więc z~geometrii strumienia, budowy aktywnego grafu obliczeń oraz rozkładu parametrów, a~nie z~porównania jakości kilku wariantów. Pozwala to wskazać rolę i~koszt poszczególnych elementów, lecz nie pozwala przypisać im osobnych wartości poprawy metryk.
+
+\subsection{Parametry bezpośrednio określające strumień bitowy}
+\label{subsec:parametry-strumienia-bitowego}
+
+Przy częstotliwości próbkowania \(16\)~kHz i~całkowitej redukcji czasowej \(256\) koder wytwarza \(62{,}5\) ramki latentnej na sekundę. Każda ramka jest opisana przez trzy indeksy RVQ, a~każdy indeks wskazuje jeden z~\(32\) kodów. Oznacza to \(3\cdot\log_2 32=15\) bitów na ramkę oraz \(937{,}5\)~bit/s bez nagłówków i~danych synchronizacyjnych. Tylko zmiana jednej z~tych wielkości zmieniłaby nominalną przepływność badanego formatu. Wymiar wektora latentnego nie występuje w~tym obliczeniu, ponieważ do odbiornika trafiają indeksy, a~nie współrzędne wektora zmiennoprzecinkowego \cite{Zeghidour2021SoundStream,Defossez2022Encodec}.
+
+\begin{center}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.24\textwidth} >{\raggedright\arraybackslash}p{0.15\textwidth} >{\raggedright\arraybackslash}p{0.22\textwidth} >{\raggedright\arraybackslash}p{0.28\textwidth}}
+\toprule
+Parametr & Wartość & Wpływ na strumień & Znaczenie dla rekonstrukcji \\
+\midrule
+Częstotliwość próbkowania & \(16\)~kHz & Wraz z~redukcją wyznacza liczbę ramek na sekundę & Określa pasmo wejścia i~liczbę próbek przetwarzanych przez model \\
+Redukcja czasowa & \(256\times\) & Bezpośrednio wyznacza \(62{,}5\) ramki/s & Jedna pozycja latentna przypada nominalnie na \(16\)~ms sygnału \\
+Liczba etapów RVQ & \(3\) & Liniowo zmienia liczbę indeksów na ramkę & Kolejne etapy kodują resztę po wcześniejszych przybliżeniach \\
+Rozmiar słownika & \(32\) kody & Każdy indeks zajmuje \(5\) bitów & Ogranicza liczbę dostępnych reprezentantów na etap \\
+Wymiar latentny & \(512\) & Brak bezpośredniego wpływu & Określa pojemność obliczeniowej reprezentacji przed i~po kwantyzacji \\
+Wymiar kodu RVQ & \(512\) & Brak bezpośredniego wpływu & Wybór kodu odbywa się w~pełnej przestrzeni latentnej \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Parametry modelu a~nominalna przepływność i~zdolność rekonstrukcji.}
+\label{tab:parametry-modelu-przeplywnosc}
+\notatabeli{Źródło: opracowanie własne na podstawie aktywnej konfiguracji modelu.}
+\end{center}
+
+Tak ustalony strumień jest stałoszerokowy. Nawet jeżeli rozkład wyboru kodów nie jest jednostajny, każdy z~trzech indeksów zajmuje pięć bitów. Parametry wspierające równomierne wykorzystanie słowników wpływają zatem na rzeczywistą pojemność reprezentacji, ale nie zmniejszają rozmiaru zapisu bez dodatkowego kodowania entropijnego. Zależność tę potwierdza analiza z~Podrozdziału~\ref{subsec:wykorzystanie-pojemnosci-rvq}: aktywność kodów jest miarą wykorzystania kanału, a~nie jego nominalnej szerokości.
+
+\subsection{Koder i wymiar reprezentacji latentnej}
+\label{subsec:koder-wymiar-latentny}
+
+Koder obejmuje osiem warstw konwolucyjnych o~kroku \(2\), których liczby kanałów rosną kolejno od \(24\) do \(256\). Taki układ stopniowo zastępuje gęsty przebieg próbkowy rzadszą reprezentacją o~większej liczbie cech. Po ostatnim etapie wykonywana jest projekcja do \(512\) kanałów latentnych. Sam koder zawiera \(1\,078\,328\) parametrów, czyli \(13{,}47\%\) całego modelu. Nie zastosowano dodatkowych bloków o~kroku \(1\) pomiędzy etapami redukcji, dlatego wzrost kosztu tej części wynika przede wszystkim z~kolejnych szerokości kanałowych i~projekcji końcowej.
+
+Wymiar \(512\) jest znacznie większy niż liczba bitów przypadających na ramkę. Nie oznacza to jednak obejścia ograniczenia kompresji, ponieważ ciągły wektor nie jest przesyłany. Jego rolą jest utworzenie przestrzeni, w~której koder może rozdzielić cechy mowy przed przypisaniem do kodów, a~dekoder może przetwarzać sumę wektorów wybranych przez RVQ. Większy wymiar zwiększa liczbę wag w~blokach temporalnych, samouwadze oraz dekoderze, podczas gdy liczba możliwych komunikatów pozostaje ograniczona do trzech indeksów po \(32\) wartości. W~aktywnej konfiguracji nie użyto normalizacji LayerNorm bezpośrednio przed RVQ, więc skala i~kierunek latentów są kształtowane przez warstwy poprzedzające oraz składniki funkcji kosztu.
+
+W~koderze i~dekoderze zastosowano aktywację \texttt{snake\_beta}. Jej uczone parametry pozwalają łączyć odpowiedź zbliżoną do liniowej z~okresowym składnikiem przydatnym przy reprezentowaniu struktur harmonicznych sygnału audio \cite{Ziyin2020Snake,Kumar2023ImprovedRVQGAN}. Aktywacja nie zmienia liczby transmitowanych symboli, ale wpływa na postać funkcji realizowanej pomiędzy próbkami a~wąskim gardłem. Dostępne dane nie zawierają porównania z~inną funkcją aktywacji, dlatego jej znaczenie można ocenić tylko konstrukcyjnie, bez przypisywania jej osobnej poprawy jakości.
+
+\subsection{Kontekst temporalny i blok self-attention}
+\label{subsec:kontekst-self-attention}
+
+Po redukcji czasowej pojedyncza pozycja odpowiada nominalnie \(16\)~ms sygnału. Przed kwantyzacją zastosowano dwa rezydualne bloki temporalne z~jądrem \(3\) i~dylatacjami \(1\) oraz \(2\). Ich łączne pole widzenia obejmuje siedem pozycji latentnych, czyli około \(112\)~ms lokalnego kontekstu. Dwa analogiczne bloki działają po RVQ. Pierwszy stos pomaga przygotować reprezentację do dyskretnego przypisania, natomiast drugi wygładza i~interpretuje skwantowane latenty przed zwiększaniem rozdzielczości w~dekoderze. Każdy z~tych stosów zawiera \(1\,574\,912\) parametrów; razem odpowiadają za \(39{,}35\%\) wag modelu. Połączenia rezydualne zachowują bezpośrednią ścieżkę sygnału, a~jednocześnie pozwalają nakładać korekty zależne od sąsiednich ramek \cite{He2016DeepResidualLearning}.
+
+Pomiędzy blokami temporalnymi przed RVQ a~kwantyzerem znajduje się jeden blok samouwagi o~wymiarze \(512\) i~dwóch głowach. Każda głowa operuje więc na podprzestrzeni \(256\)-wymiarowej. Blok obejmuje normalizację, projekcje zapytań, kluczy i~wartości, projekcję wyjściową oraz część feed-forward o~szerokości \(1024\), zgodnie z~ogólną konstrukcją mechanizmu wielogłowicowej uwagi \cite{Vaswani2017Attention}. Jego zadaniem jest powiązanie pozycji oddalonych bardziej niż lokalne pole widzenia konwolucji. Dla segmentu \(16384\) próbek sekwencja po redukcji ma \(64\) pozycje, dlatego blok może zestawiać informacje z~całego około sekundowego fragmentu przed wyborem kodów.
+
+Self-attention zawiera \(2\,102\,784\) parametrów i~jest największym pojedynczym blokiem modelu, odpowiadającym za \(26{,}27\%\) wszystkich wag. Koszt uwagi rośnie kwadratowo z~długością sekwencji latentnej, choć silna redukcja czasowa ogranicza tę długość w~badanym ustawieniu. Blok działa wyłącznie przed RVQ; samouwaga po kwantyzacji jest wyłączona. Model pracuje ponadto w~trybie nieprzyczynowym, więc uwaga może korzystać z~całego segmentu. Rozwiązanie sprzyja wykorzystaniu kontekstu w~kodowaniu plikowym, ale nie zapewnia samo z~siebie przyczynowej inferencji próbka po próbce. W~pipeline strumieniowym wymaga zatem segmentacji i~buforowania wejścia albo zmiany maskowania oraz ponownego treningu.
+
+\begin{center}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.28\textwidth} >{\raggedright\arraybackslash}p{0.20\textwidth} >{\raggedright\arraybackslash}p{0.18\textwidth} >{\raggedright\arraybackslash}p{0.24\textwidth}}
+\toprule
+Element kontekstu & Konfiguracja & Stan & Rola w~torze \\
+\midrule
+Bloki temporalne przed RVQ & \(2\), dylatacje \(1,2\) & aktywne & Lokalna integracja informacji przed wyborem kodów \\
+Self-attention przed RVQ & \(1\) blok, \(2\) głowy & aktywny & Zależności pomiędzy wszystkimi pozycjami segmentu \\
+Self-attention po RVQ & głębokość \(0\) & wyłączony & Brak dodatkowego globalnego mieszania po kwantyzacji \\
+Bloki temporalne po RVQ & \(2\), dylatacje \(1,2\) & aktywne & Interpretacja i~lokalne wygładzanie skwantowanych latentów \\
+Tryb przyczynowy & \texttt{false} & wyłączony & Warstwy mogą korzystać z~przyszłego kontekstu segmentu \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Elementy modelujące kontekst w~aktywnym torze kodeka.}
+\label{tab:kontekst-aktywnego-modelu}
+\notatabeli{Źródło: opracowanie własne na podstawie konfiguracji i~implementacji modelu.}
+\end{center}
+
+\subsection{Kwantyzer, dekoder i korekcja wyjścia}
+\label{subsec:kwantyzer-dekoder-korekcja}
+
+Kwantyzer wykorzystuje trzy słowniki po \(32\) wektory i~kolejno koduje resztę pozostałą po wcześniejszych etapach \cite{Gray1984VectorQuantization,VanDenOord2017NeuralDiscrete,Zeghidour2021SoundStream}. Wybór reprezentanta jest oparty na podobieństwie cosinusowym, a~współczynnik składnika commitment wynosi \(1{,}35\). W~analizowanej konfiguracji parametr \texttt{rvq\_code\_dim} ma wartość \(0\), co w~implementacji oznacza brak projekcji do przestrzeni pomocniczej i~kwantyzację w~pełnym wymiarze \(512\). Słowniki zawierają łącznie \(3\cdot32\cdot512=49\,152\) parametrów. Jest to tylko \(0{,}61\%\) modelu, lecz właśnie ten niewielki moduł narzuca dyskretną postać komunikatu i~bezpośrednio ogranicza przepływ informacji. Stabilność jego uczenia nie zależy więc od dużej liczby wag, lecz od wykorzystania kodów, geometrii latentów i~strat RVQ.
+
+Główny dekoder zawiera \(1\,602\,105\) parametrów. Osiem etapów odwraca redukcję czasową, prowadząc od \(512\)-wymiarowego wejścia przez kanały \(256,192,128,96,64,48,32,24\) do jednego kanału audio. Zastosowany wariant \texttt{repeat\_conv} najpierw powiela pozycje w~czasie, a~następnie przetwarza je konwolucją o~jądrze \(7\). Oddzielenie zwiększania długości od filtracji ogranicza zależność rekonstrukcji od geometrii transponowanej konwolucji. Aktywacja \texttt{snake\_beta} pozostaje aktywna również w~tej części. Źródło harmoniczne jest wyłączone, więc okresowość mowy musi zostać odtworzona przez dekoder na podstawie skwantowanych latentów, bez jawnie dołączonego generatora tonu podstawowego.
+
+Za głównym dekoderem działają dwa małe tory korekcyjne. Pierwszy jest pojedynczym blokiem rezydualnym o~jądrze \(7\), \(24\) kanałach i~wzmocnieniu \(0{,}018\); zawiera \(4080\) parametrów. Drugi jest dwublokowym post-filtrem o~\(24\) kanałach, jądrze \(15\), dylatacjach \(1\) i~\(2\), wzmocnieniu \(0{,}02\) oraz wysokoprzepustowej korekcie resztowej; zawiera \(18\,121\) parametrów. Konfiguracja przewiduje jedną głowicę pasmową, która jest wyjściem podstawowym, dlatego nie powstają dodatkowe pomocnicze głowice pasmowe. Mała liczba parametrów tych elementów nie oznacza proporcjonalnie małego kosztu wykonania: oba pracują przy wysokiej rozdzielczości czasowej, a~post-filtr bezpośrednio na fali wyjściowej.
+
+\begin{center}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.25\textwidth} >{\raggedright\arraybackslash}p{0.27\textwidth} >{\raggedright\arraybackslash}p{0.14\textwidth} >{\raggedright\arraybackslash}p{0.23\textwidth}}
+\toprule
+Moduł & Aktywna konfiguracja & Parametry & Znaczenie \\
+\midrule
+RVQ & \(3\times32\), cosinus, wymiar \(512\) & \(49\,152\) & Dyskretyzacja i~utworzenie transmitowanych indeksów \\
+Główny dekoder & \(8\) etapów \texttt{repeat\_conv} & \(1\,602\,105\) & Odtworzenie rozdzielczości i~fali audio \\
+Blok korekcyjny & głębokość \(1\), wzmocnienie \(0{,}018\) & \(4080\) & Lokalna korekta cech przed wyjściem \\
+Post-filtr & \(2\) bloki, \(24\) kanały, jądro \(15\) & \(18\,121\) & Korekta reszty wysokoczęstotliwościowej \\
+Dodatkowe głowice pasmowe & brak & \(0\) & Brak pomocniczych wyjść poza głowicą podstawową \\
+Źródło harmoniczne & wyłączone & \(0\) & Brak jawnego modelu pobudzenia okresowego \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Parametry kwantyzera, dekodera i~toru korekcji wyjścia.}
+\label{tab:kwantyzer-dekoder-korekcja}
+\notatabeli{Źródło: opracowanie własne na podstawie aktywnej konfiguracji i~implementacji modelu.}
+\end{center}
+
+\subsection{Rozkład parametrów i zakres wniosków}
+\label{subsec:rozklad-parametrow-modelu}
+
+Aktywny model zawiera \(8\,004\,394\) parametrów. Ich rozkład przedstawiono na Rysunku~\ref{fig:rozklad-parametrow-modelu}. Największą pojedynczą częścią jest blok self-attention przed RVQ, natomiast oba stosy temporalne razem mają największy udział funkcjonalny. Koder i~główny dekoder odpowiadają łącznie za około jedną trzecią wag. Same słowniki RVQ zajmują mniej niż jeden procent, mimo że to one definiują symbole strumienia. Pokazuje to, że większość pojemności modelu służy nie przechowywaniu kodów, lecz przekształceniu sygnału do postaci możliwej do opisania bardzo małą liczbą indeksów oraz rekonstrukcji z~tej reprezentacji.
+
+\begin{center}
+\centering
+\includegraphics[width=0.88\textwidth]{figures/model/model_parameter_breakdown.pdf}
+\captionof{figure}{Rozkład parametrów aktywnego toru kodeka.}
+\label{fig:rozklad-parametrow-modelu}
+\notarysunku{Źródło: opracowanie własne na podstawie automatycznego zliczenia parametrów aktywnej konfiguracji.}
+\end{center}
+
+\begin{center}
+\centering
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.48\textwidth} r r}
+\toprule
+Grupa & Liczba parametrów & Udział \\
+\midrule
+Koder & \(1\,078\,328\) & \(13{,}47\%\) \\
+Bloki temporalne przed RVQ & \(1\,574\,912\) & \(19{,}68\%\) \\
+Self-attention przed RVQ & \(2\,102\,784\) & \(26{,}27\%\) \\
+Słowniki RVQ & \(49\,152\) & \(0{,}61\%\) \\
+Bloki temporalne po RVQ & \(1\,574\,912\) & \(19{,}68\%\) \\
+Główny dekoder & \(1\,602\,105\) & \(20{,}02\%\) \\
+Korekcja wyjścia & \(22\,201\) & \(0{,}28\%\) \\
+\midrule
+Łącznie & \(8\,004\,394\) & \(100{,}00\%\) \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Liczba parametrów w~głównych częściach aktywnego modelu.}
+\label{tab:rozklad-parametrow-modelu}
+\notatabeli{Źródło: opracowanie własne na podstawie aktywnej instancji modelu.}
+\end{center}
+
+Liczba parametrów opisuje wymagania pamięciowe modelu, ale nie jest pełną miarą kosztu inferencji. Self-attention ma dużo wag i~koszt zależny kwadratowo od długości sekwencji, lecz działa na silnie skróconych latentach. Z~kolei mały post-filtr zawiera niewiele wag, ale wykonuje konwolucje dla każdej próbki wyjściowej. Do oceny wdrożeniowej potrzebny jest więc osobny pomiar czasu kodowania i~dekodowania na docelowym procesorze. Na podstawie samego rozkładu można natomiast stwierdzić, że nominalny bitrate jest kontrolowany przez niewielki RVQ, podczas gdy zasadniczy koszt modelu przypada na przygotowanie kontekstu przed kwantyzacją i~rekonstrukcję po niej.
+
+Konfiguracja stanowi jeden punkt pracy: pełny \(512\)-wymiarowy RVQ, pojedynczy blok self-attention, po dwa bloki temporalne po obu stronach kwantyzatora oraz niewielka korekcja wyjścia. Wyniki treningu pokazują, że taki układ uczy się wykorzystywać prawie wszystkie kody i~zmniejsza błędy rekonstrukcji przy stałym strumieniu. Nie rozstrzygają jednak, czy podobną jakość dałby model bez uwagi, z~mniejszym wymiarem latentnym albo bez post-filtru. Odpowiedź na te pytania wymagałaby serii ablacji trenowanych i~ocenianych w~tych samych warunkach.
+
+\clearpage
 \section{Ocena jakości odtworzonego dźwięku}
 \label{sec:ocena-jakosci}
 

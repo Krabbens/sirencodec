@@ -91,3 +91,22 @@ download-train-clean-360
 ```
 
 The container requires NVIDIA Container Toolkit on the host.
+
+## PVQ-NS MLX MVP
+
+This branch also includes an ultra-low-bitrate speech-specific codec path:
+
+- `sirencodec.pvq_ns` - 8 kHz LPC/LSF + F0 + energy analysis, PQ/scalar quantization, 500/700/900 bps bitstream, and LPC-only fallback synthesis
+- `sirencodec.mlx.pvq_ns` - tiny residual MLX TCN post-filter for improving the LPC waveform from dequantized features
+- `tools/pvq_ns_mlx.py` / `pvq-ns` - codebook training, encode/decode/roundtrip, and MLX post-filter smoke checks
+
+Examples:
+
+```bash
+PYTHONPATH=src python3 tools/pvq_ns_mlx.py train-codebooks data/train-clean-100 pvq_900_codebooks.npz --mode 900
+PYTHONPATH=src python3 tools/pvq_ns_mlx.py roundtrip sample.wav out/pvq900_lpc.wav --codebooks pvq_900_codebooks.npz
+PYTHONPATH=src python3 tools/pvq_ns_mlx.py train-postfilter data/train-clean-100 pvq_900_codebooks.npz pvq_pf.safetensors --steps 1000
+PYTHONPATH=src python3 tools/pvq_ns_mlx.py postfilter-smoke
+```
+
+The built-in fallback codebooks are deterministic and useful for tests only. Train LSF codebooks on speech before judging quality.

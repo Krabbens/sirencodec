@@ -114,7 +114,7 @@ build/sirencodec_infer/sirencodec_benchmark \
   --output-dir './artifacts/benchmarks/litert_single_file_2s'
 ```
 
-Dataset benchmark on 5% of LibriSpeech train-clean-100 with 2 s segments and
+Dataset benchmark on 10% of LibriSpeech train-clean-100 with 2 s segments and
 `--num-threads 16`:
 
 - full reconstruction: 0.062011 s, 32.25x realtime

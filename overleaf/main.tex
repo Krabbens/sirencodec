@@ -10,9 +10,15 @@
 
 \documentclass[polish,a4paper,oneside]{ppfcmthesis}
 
+\usepackage[nocompress]{cite}
 
-\usepackage[utf8]{inputenc}
-\usepackage[OT4]{fontenc}
+\ifPDFTeX
+  \usepackage[utf8]{inputenc}
+  \usepackage[OT4]{fontenc}
+\else
+  \usepackage{fontspec}
+  \defaultfontfeatures{Ligatures=TeX}
+\fi
 \makeatletter
 \providecommand{\captionof}[1]{\def\@captype{#1}\caption}
 \makeatother

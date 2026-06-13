@@ -15,13 +15,17 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 mlx = ["mlx>=0.29.3", "mlx-contentvec>=0.1.1"]
+lux = ["huggingface-hub", "linacodec", "vocos"]
+turbo = ["turbovec"]
 
 [project.scripts]
 train = "sirencodec.cuda.train:main"
+pvq-ns = "sirencodec.pvq_ns.cli:main"
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
+linacodec = { git = "https://github.com/ysharma3501/LinaCodec.git" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

@@ -1,3 +1,3 @@
 """MLX backend package for SirenCodec."""
 
-__all__ = ["codec", "data", "losses", "train"]
+__all__ = ["codec", "data", "losses", "pvq_ns", "train"]

@@ -36,6 +36,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -51,7 +52,7 @@ try:
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.optimizers import Adam, cosine_decay, join_schedules, linear_schedule
-    from mlx.utils import tree_flatten, tree_map, tree_reduce
+    from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 except ImportError:
     print("MLX is not installed. On Apple Silicon: uv sync --extra mlx", file=sys.stderr)
     sys.exit(1)
@@ -81,6 +82,7 @@ from .data import (
     synth_viz_clip,
 )
 from .losses import (
+    log_mel_spectrogram,
     mel_filterbank_mx,
     mel_log_bin_losses,
     multi_stft_band_excess,
@@ -89,7 +91,20 @@ from .losses import (
     multi_stft_mag_l1_linear,
     multi_stft_spectral_convergence,
     multi_stft_spectral_terms,
+    multi_stft_temporal_stripe_excess,
 )
+
+
+def _quantizer_kind(cfg: Config) -> str:
+    return (getattr(cfg, "quantizer", "rvq") or "rvq").strip().lower()
+
+
+def _decoder_backend(cfg: Config) -> str:
+    return (getattr(cfg, "decoder_backend", "waveform") or "waveform").strip().lower()
+
+
+def _uses_lux_vocos(cfg: Config) -> bool:
+    return _decoder_backend(cfg) == "lux_vocos"
 
 
 class MlxContentVecSemanticTeacher:
@@ -228,6 +243,19 @@ def effective_lambda_stft(step: int, cfg: Config) -> float:
     return cfg.lambda_stft * scale
 
 
+def clear_mlx_cache() -> None:
+    """Best-effort release of MLX/Metal cached resources after long lazy graphs."""
+    try:
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        else:
+            metal = getattr(mx, "metal", None)
+            if metal is not None and hasattr(metal, "clear_cache"):
+                metal.clear_cache()
+    except Exception:
+        pass
+
+
 def _eval_loss_and_grad_tree(loss: mx.array, grads) -> None:
     """Materialize backward: MLX keeps ``grads`` lazy until evaluated; ``opt.update`` needs real values."""
     flat = tree_flatten(grads)
@@ -286,6 +314,27 @@ def _grad_tree_add(a, b):
     return tree_map(lambda x, y: x + y, a, b, is_leaf=lambda t: isinstance(t, mx.array))
 
 
+def mask_gradients_keep_prefixes(grads, keep_prefixes: tuple[str, ...]):
+    """Zero every gradient leaf except named module prefixes."""
+    flat = []
+    for k, g in tree_flatten(grads):
+        if isinstance(g, mx.array) and not k.startswith(keep_prefixes):
+            flat.append((k, mx.zeros_like(g)))
+        else:
+            flat.append((k, g))
+    return tree_unflatten(flat)
+
+
+def mask_speech_control_gradients(grads):
+    """Keep only the new speech-control residual path trainable for Stage A warmup."""
+    return mask_gradients_keep_prefixes(grads, ("decoder.speech_control.", "decoder.speech_residual."))
+
+
+def mask_rvq_gradients(grads):
+    """Keep only RVQ codebook/projection gradients for bottleneck distillation warmup."""
+    return mask_gradients_keep_prefixes(grads, ("rvq.",))
+
+
 def effective_lambda_marginal(step: int, cfg: Config) -> float:
     """Stronger batch-marginal diversity weight at the start (fights fast post-init index collapse)."""
     if cfg.lambda_marginal <= 0 or cfg.marginal_boost_steps <= 0:
@@ -325,6 +374,26 @@ def encoded_frame_count(num_samples: int, cfg: Config) -> int:
     return max(1, n)
 
 
+def _match_feature_frames(x: mx.array, target_frames: int) -> mx.array:
+    n = max(1, int(target_frames))
+    t = int(x.shape[1])
+    if t >= n:
+        return x[:, :n, :]
+    return mx.pad(x, [(0, 0), (0, n - t), (0, 0)])
+
+
+def lux_vocos_target_features(batch: mx.array, cfg: Config, mel_fb: mx.array) -> mx.array:
+    """Frozen target features for ``decoder_backend=lux_vocos``."""
+    feat = log_mel_spectrogram(
+        batch,
+        mel_fb,
+        int(cfg.lux_vocos_n_fft),
+        int(cfg.lux_vocos_hop),
+        eps=1e-7,
+    )
+    return _match_feature_frames(feat, encoded_frame_count(int(batch.shape[1]), cfg))
+
+
 def batch_mean_cosine(orig: mx.array, recon: mx.array) -> mx.array:
     """Mean cosine similarity in [-1, 1] over batch (each item flattened)."""
     b = orig.shape[0]
@@ -337,6 +406,41 @@ def batch_mean_cosine(orig: mx.array, recon: mx.array) -> mx.array:
     return mx.mean(cos)
 
 
+def apply_noise_augmentation(clean: mx.array, cfg: Config) -> tuple[mx.array, mx.array, mx.array]:
+    """Return model input, noisy-item fraction, and mean SNR for clean-target denoising training."""
+    prob = float(cfg.noise_aug_prob)
+    if prob <= 0.0:
+        z = mx.array(0.0, dtype=mx.float32)
+        return clean, z, z
+    b = int(clean.shape[0])
+    flat = clean.reshape(b, -1)
+    sig_rms = mx.sqrt(mx.mean(flat * flat, axis=1, keepdims=True) + 1e-8).reshape(b, 1, 1)
+    noise = mx.random.normal(shape=clean.shape)
+    nflat = noise.reshape(b, -1)
+    noise_rms = mx.sqrt(mx.mean(nflat * nflat, axis=1, keepdims=True) + 1e-8).reshape(b, 1, 1)
+    snr_min = float(cfg.noise_aug_snr_min)
+    snr_max = float(cfg.noise_aug_snr_max)
+    snr_db = mx.random.uniform(low=snr_min, high=snr_max, shape=(b, 1, 1))
+    # RMS scale for a requested dB SNR: noise_rms = signal_rms / 10^(snr_db / 20).
+    target_noise_rms = sig_rms * mx.exp(mx.array(-math.log(10.0) / 20.0, dtype=mx.float32) * snr_db)
+    scaled_noise = noise * (target_noise_rms / noise_rms)
+    mask = (mx.random.uniform(low=0.0, high=1.0, shape=(b, 1, 1)) < prob).astype(mx.float32)
+    noisy = mx.clip(clean + mask * scaled_noise, -1.0, 1.0)
+    noisy_frac = mx.mean(mask)
+    denom = mx.maximum(mx.sum(mask), mx.array(1.0, dtype=mx.float32))
+    mean_snr = mx.sum(snr_db * mask) / denom
+    return noisy, mx.stop_gradient(noisy_frac), mx.stop_gradient(mean_snr)
+
+
+def rvq_bottleneck_latent(m: MLXCodec, x: mx.array):
+    """Return z_q and RVQ stats without running post-latent stacks or decoder."""
+    z = m.latent_before_rvq(x)
+    if m.cfg.ae_only:
+        zero = mx.array(0.0, dtype=mx.float32)
+        return z, zero, zero, zero, None
+    return m.rvq(z)
+
+
 def make_train_fn(
     model: MLXCodec,
     cfg: Config,
@@ -344,6 +448,8 @@ def make_train_fn(
     step: int,
     mel_fb: mx.array | None = None,
     *,
+    target_batch: mx.array | None = None,
+    target_features: mx.array | None = None,
     compiled_multi_stft: Callable[[mx.array, mx.array], mx.array] | None = None,
     semantic_teacher: MlxContentVecSemanticTeacher | None = None,
     semantic_grad: mx.array | None = None,
@@ -355,6 +461,11 @@ def make_train_fn(
     latent_semantic_target: mx.array | None = None,
     latent_semantic_weight: float = 0.0,
     latent_semantic_items: int = 0,
+    rvq_distill_target: mx.array | None = None,
+    rvq_distill_weight: float = 0.0,
+    rvq_distill_only: bool = False,
+    noise_aug_applied: mx.array | None = None,
+    noise_aug_snr: mx.array | None = None,
 ):
     """Return a zero-arg loss for nn.value_and_grad(model, loss_fn).
 
@@ -364,88 +475,140 @@ def make_train_fn(
     """
 
     forward_metrics: dict = {}
+    target = batch if target_batch is None else target_batch
+    feature_mode = _uses_lux_vocos(cfg)
 
     def loss_fn(m: MLXCodec) -> mx.array:
-        if latent_semantic_target is not None and latent_semantic_weight > 0:
+        rvq_distill_active = rvq_distill_target is not None and rvq_distill_weight > 0
+        if rvq_distill_active and rvq_distill_only:
+            z_bottleneck, vq_l, ent_pos, marg_ent, idx = rvq_bottleneck_latent(m, batch)
+            y_hat = target
+            speech_stats = {}
+            lt = mx.array(0.0, dtype=mx.float32)
+            ls = mx.array(0.0, dtype=mx.float32)
+            lsg = mx.array(0.0, dtype=mx.float32)
+            lsc = mx.array(0.0, dtype=mx.float32)
+            l_lin = mx.array(0.0, dtype=mx.float32)
+            l_sc = mx.array(0.0, dtype=mx.float32)
+            l_cx = mx.array(0.0, dtype=mx.float32)
+            l_band = mx.array(0.0, dtype=mx.float32)
+            l_stripe = mx.array(0.0, dtype=mx.float32)
+            cos = mx.array(0.0, dtype=mx.float32)
+            ls_w = 0.0
+            total = cfg.lambda_vq * vq_l
+        elif (latent_semantic_target is not None and latent_semantic_weight > 0) or rvq_distill_active:
             y_hat, vq_l, ent_pos, marg_ent, idx, z_bottleneck = m.forward_full_with_latent(batch)
         else:
             y_hat, vq_l, ent_pos, marg_ent, idx = m.forward_full(batch)
             z_bottleneck = None
-        lt = mx.mean(mx.abs(y_hat - batch))
-        if cfg.lambda_stft_grad > 0 or cfg.lambda_stft_cos > 0:
-            ls, lsg, lsc = multi_stft_spectral_terms(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                with_grad=cfg.lambda_stft_grad > 0,
-                with_cos_1m=cfg.lambda_stft_cos > 0,
-                grad_freq_weight=cfg.stft_grad_freq_weight,
-                grad_time_weight=cfg.stft_grad_time_weight,
-                hf_emphasis=cfg.stft_hf_emphasis,
-                scale_weights=cfg.stft_scale_weights,
-            )
-        else:
-            if compiled_multi_stft is not None:
-                ls = compiled_multi_stft(y_hat, batch)
+        if not (rvq_distill_active and rvq_distill_only):
+            speech_stats = m.speech_control_stats()
+            if feature_mode:
+                if target_features is None:
+                    raise RuntimeError("target_features is required for decoder_backend='lux_vocos'")
+                feat_tgt = mx.stop_gradient(_match_feature_frames(target_features, int(y_hat.shape[1])))
+                y_hat = _match_feature_frames(y_hat, int(feat_tgt.shape[1]))
+                lt = mx.mean(mx.abs(y_hat - feat_tgt))
+                cos = batch_mean_cosine(feat_tgt, y_hat)
+                ls = mx.array(0.0, dtype=mx.float32)
+                lsg = mx.array(0.0, dtype=mx.float32)
+                lsc = mx.array(0.0, dtype=mx.float32)
+                l_lin = mx.array(0.0, dtype=mx.float32)
+                l_sc = mx.array(0.0, dtype=mx.float32)
+                l_cx = mx.array(0.0, dtype=mx.float32)
+                l_band = mx.array(0.0, dtype=mx.float32)
+                l_stripe = mx.array(0.0, dtype=mx.float32)
+                ls_w = 0.0
+                total = cfg.lambda_time * lt + cfg.lambda_vq * vq_l
             else:
-                ls = multi_stft_loss(
-                    y_hat,
-                    batch,
-                    cfg.stft_scales,
-                    hf_emphasis=cfg.stft_hf_emphasis,
-                    scale_weights=cfg.stft_scale_weights,
-                )
-            lsg = mx.array(0.0)
-            lsc = mx.array(0.0)
-        cos = batch_mean_cosine(batch, y_hat)
-        ls_w = effective_lambda_stft(step, cfg)
-        total = cfg.lambda_time * lt + ls_w * ls + cfg.lambda_vq * vq_l
-        l_lin = mx.array(0.0)
-        if cfg.lambda_mag_l1 > 0:
-            l_lin = multi_stft_mag_l1_linear(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                hf_emphasis=cfg.stft_hf_emphasis,
-                scale_weights=cfg.stft_scale_weights,
-            )
-            total = total + ls_w * cfg.lambda_mag_l1 * l_lin
-        if cfg.lambda_stft_grad > 0:
-            total = total + ls_w * cfg.lambda_stft_grad * lsg
-        if cfg.lambda_stft_cos > 0:
-            total = total + ls_w * cfg.lambda_stft_cos * lsc
-        l_sc = mx.array(0.0)
-        if cfg.lambda_sc > 0:
-            l_sc = multi_stft_spectral_convergence(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                scale_weights=cfg.stft_scale_weights,
-            )
-            total = total + ls_w * cfg.lambda_sc * l_sc
-        l_cx = mx.array(0.0)
-        if cfg.lambda_complex_stft > 0:
-            l_cx = multi_stft_complex_l1(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                scale_weights=cfg.stft_scale_weights,
-            )
-            total = total + ls_w * cfg.lambda_complex_stft * l_cx
-        l_band = mx.array(0.0)
-        if cfg.lambda_stft_band_excess > 0:
-            l_band = multi_stft_band_excess(
-                y_hat,
-                batch,
-                cfg.stft_scales,
-                sample_rate=cfg.sample_rate,
-                margin=cfg.stft_band_excess_margin,
-                fmin=cfg.stft_band_excess_fmin,
-                fmax=cfg.stft_band_excess_fmax,
-                hf_emphasis=cfg.stft_hf_emphasis,
-                scale_weights=cfg.stft_scale_weights,
-            )
-            total = total + ls_w * cfg.lambda_stft_band_excess * l_band
+                lt = mx.mean(mx.abs(y_hat - target))
+                if cfg.lambda_stft_grad > 0 or cfg.lambda_stft_cos > 0:
+                    ls, lsg, lsc = multi_stft_spectral_terms(
+                        y_hat,
+                        target,
+                        cfg.stft_scales,
+                        with_grad=cfg.lambda_stft_grad > 0,
+                        with_cos_1m=cfg.lambda_stft_cos > 0,
+                        grad_freq_weight=cfg.stft_grad_freq_weight,
+                        grad_time_weight=cfg.stft_grad_time_weight,
+                        hf_emphasis=cfg.stft_hf_emphasis,
+                        scale_weights=cfg.stft_scale_weights,
+                    )
+                else:
+                    if compiled_multi_stft is not None:
+                        ls = compiled_multi_stft(y_hat, target)
+                    else:
+                        ls = multi_stft_loss(
+                            y_hat,
+                            target,
+                            cfg.stft_scales,
+                            hf_emphasis=cfg.stft_hf_emphasis,
+                            scale_weights=cfg.stft_scale_weights,
+                        )
+                    lsg = mx.array(0.0)
+                    lsc = mx.array(0.0)
+                cos = batch_mean_cosine(target, y_hat)
+                ls_w = effective_lambda_stft(step, cfg)
+                total = cfg.lambda_time * lt + ls_w * ls + cfg.lambda_vq * vq_l
+                l_lin = mx.array(0.0)
+                if cfg.lambda_mag_l1 > 0:
+                    l_lin = multi_stft_mag_l1_linear(
+                        y_hat,
+                        target,
+                        cfg.stft_scales,
+                        hf_emphasis=cfg.stft_hf_emphasis,
+                        scale_weights=cfg.stft_scale_weights,
+                    )
+                    total = total + ls_w * cfg.lambda_mag_l1 * l_lin
+                if cfg.lambda_stft_grad > 0:
+                    total = total + ls_w * cfg.lambda_stft_grad * lsg
+                if cfg.lambda_stft_cos > 0:
+                    total = total + ls_w * cfg.lambda_stft_cos * lsc
+                l_sc = mx.array(0.0)
+                if cfg.lambda_sc > 0:
+                    l_sc = multi_stft_spectral_convergence(
+                        y_hat,
+                        target,
+                        cfg.stft_scales,
+                        scale_weights=cfg.stft_scale_weights,
+                    )
+                    total = total + ls_w * cfg.lambda_sc * l_sc
+                l_cx = mx.array(0.0)
+                if cfg.lambda_complex_stft > 0:
+                    l_cx = multi_stft_complex_l1(
+                        y_hat,
+                        target,
+                        cfg.stft_scales,
+                        scale_weights=cfg.stft_scale_weights,
+                    )
+                    total = total + ls_w * cfg.lambda_complex_stft * l_cx
+                l_band = mx.array(0.0)
+                if cfg.lambda_stft_band_excess > 0:
+                    l_band = multi_stft_band_excess(
+                        y_hat,
+                        target,
+                        cfg.stft_scales,
+                        sample_rate=cfg.sample_rate,
+                        margin=cfg.stft_band_excess_margin,
+                        fmin=cfg.stft_band_excess_fmin,
+                        fmax=cfg.stft_band_excess_fmax,
+                        hf_emphasis=cfg.stft_hf_emphasis,
+                        scale_weights=cfg.stft_scale_weights,
+                    )
+                    total = total + ls_w * cfg.lambda_stft_band_excess * l_band
+                l_stripe = mx.array(0.0)
+                if cfg.lambda_temporal_stripe > 0:
+                    l_stripe = multi_stft_temporal_stripe_excess(
+                        y_hat,
+                        target,
+                        cfg.stft_scales,
+                        sample_rate=cfg.sample_rate,
+                        margin=cfg.temporal_stripe_margin,
+                        fmin=cfg.temporal_stripe_fmin,
+                        fmax=cfg.temporal_stripe_fmax,
+                        scale_weights=cfg.stft_scale_weights,
+                    )
+                    total = total + ls_w * cfg.lambda_temporal_stripe * l_stripe
         # Diversity as non-negative penalty (same ∂/∂θ as −λ·H when H<log K): push H → log K
         log_k = mean_log_codebook_for_entropy(cfg)
         log_k_mx = mx.array(log_k, dtype=mx.float32)
@@ -455,11 +618,25 @@ def make_train_fn(
         if cfg.lambda_marginal > 0:
             marg_gap = mx.maximum(mx.array(0.0, dtype=mx.float32), log_k_mx - marg_ent)
             total = total + effective_lambda_marginal(step, cfg) * marg_gap
-        if cfg.lambda_cos > 0:
+        if cfg.lambda_cos > 0 and not (rvq_distill_active and rvq_distill_only):
             total = total + cfg.lambda_cos * (1.0 - cos)
-        if cfg.cos_hinge > 0:
+        if cfg.cos_hinge > 0 and not (rvq_distill_active and rvq_distill_only):
             gap = mx.maximum(mx.array(0.0), mx.array(cfg.cos_target, dtype=mx.float32) - cos)
             total = total + cfg.cos_hinge * gap
+        l_rvq_distill = mx.array(0.0, dtype=mx.float32)
+        rvq_distill_cos = mx.array(0.0, dtype=mx.float32)
+        if rvq_distill_active and z_bottleneck is not None:
+            pred_z = z_bottleneck
+            tgt_z = mx.stop_gradient(rvq_distill_target)
+            t = min(int(pred_z.shape[1]), int(tgt_z.shape[1]))
+            d = min(int(pred_z.shape[2]), int(tgt_z.shape[2]))
+            pred_z = pred_z[:, :t, :d]
+            tgt_z = tgt_z[:, :t, :d]
+            l_rvq_distill = mx.mean((pred_z - tgt_z) * (pred_z - tgt_z))
+            pred_n = pred_z / mx.sqrt(mx.sum(pred_z * pred_z, axis=-1, keepdims=True) + 1e-8)
+            tgt_n = tgt_z / mx.sqrt(mx.sum(tgt_z * tgt_z, axis=-1, keepdims=True) + 1e-8)
+            rvq_distill_cos = mx.mean(mx.sum(pred_n * tgt_n, axis=-1))
+            total = total + float(rvq_distill_weight) * l_rvq_distill
         l_lat_sem = mx.array(0.0, dtype=mx.float32)
         lat_sem_cos = mx.array(0.0, dtype=mx.float32)
         lat_sem_items = int(latent_semantic_items)
@@ -477,10 +654,15 @@ def make_train_fn(
             total = total + float(latent_semantic_weight) * l_lat_sem
         lm1 = mx.array(0.0)
         lm2 = mx.array(0.0)
-        if mel_fb is not None and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0):
+        if (
+            mel_fb is not None
+            and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0)
+            and not (rvq_distill_active and rvq_distill_only)
+            and not feature_mode
+        ):
             lm1, lm2 = mel_log_bin_losses(
                 y_hat,
-                batch,
+                target,
                 mel_fb,
                 cfg.mel_n_fft,
                 cfg.mel_hop,
@@ -490,7 +672,12 @@ def make_train_fn(
         sem_cos: mx.array | float = semantic_cos
         sem_items = int(semantic_items)
         sem_w = float(cfg.lambda_semantic if semantic_weight is None else semantic_weight)
-        if semantic_grad is not None and sem_w > 0:
+        if (
+            semantic_grad is not None
+            and sem_w > 0
+            and not (rvq_distill_active and rvq_distill_only)
+            and not feature_mode
+        ):
             sem_dot = mx.sum(y_hat * mx.stop_gradient(semantic_grad))
             sem_base = (
                 semantic_loss_value
@@ -503,9 +690,11 @@ def make_train_fn(
             semantic_teacher is not None
             and sem_w > 0
             and step % max(1, int(cfg.semantic_every)) == 0
+            and not (rvq_distill_active and rvq_distill_only)
+            and not feature_mode
         ):
             l_sem, sem_cos, sem_items = semantic_teacher.loss(
-                batch,
+                target,
                 y_hat,
                 max_items=cfg.semantic_batch_items,
             )
@@ -520,6 +709,7 @@ def make_train_fn(
             l_cx=l_cx,
             l_band=l_band,
             l_lin=l_lin,
+            l_stripe=l_stripe,
             lm1=lm1,
             lm2=lm2,
             vq_l=vq_l,
@@ -555,6 +745,26 @@ def make_train_fn(
             lat_sem_cos=mx.stop_gradient(lat_sem_cos),
             lat_sem_items=int(lat_sem_items),
             lat_sem_weight=mx.array(float(latent_semantic_weight), dtype=mx.float32),
+            l_rvq_distill=l_rvq_distill,
+            rvq_distill_cos=mx.stop_gradient(rvq_distill_cos),
+            rvq_distill_weight=mx.array(float(rvq_distill_weight), dtype=mx.float32),
+            rvq_distill_only=bool(rvq_distill_only),
+            speech_energy=speech_stats.get("energy", mx.array(0.0, dtype=mx.float32)),
+            speech_voicing=speech_stats.get("voicing", mx.array(0.0, dtype=mx.float32)),
+            speech_harmonicity=speech_stats.get("harmonicity", mx.array(0.0, dtype=mx.float32)),
+            speech_hf_gate=speech_stats.get("hf_gate", mx.array(0.0, dtype=mx.float32)),
+            speech_noise_gate=speech_stats.get("noise_gate", mx.array(0.0, dtype=mx.float32)),
+            speech_residual_gate=speech_stats.get("residual_gate", mx.array(0.0, dtype=mx.float32)),
+            noise_aug_applied=(
+                noise_aug_applied
+                if isinstance(noise_aug_applied, mx.array)
+                else mx.array(0.0, dtype=mx.float32)
+            ),
+            noise_aug_snr=(
+                noise_aug_snr
+                if isinstance(noise_aug_snr, mx.array)
+                else mx.array(0.0, dtype=mx.float32)
+            ),
         )
         return total
 
@@ -609,7 +819,7 @@ def vq_reset_dead_codes(model: MLXCodec, batch: mx.array, cfg: Config) -> tuple[
     If collapse is severe (``unique/K`` below ~35% of ``vq_reset_collapse_frac``), optionally permute all
     codebook rows so ``argmin`` is not stuck on index 0 when distances are near-ties.
     """
-    if cfg.ae_only or cfg.vq_reset_every <= 0:
+    if cfg.ae_only or cfg.vq_reset_every <= 0 or _quantizer_kind(cfg) != "rvq":
         return 0, []
     try:
         import numpy as np
@@ -719,7 +929,7 @@ def vq_reset_dead_codes(model: MLXCodec, batch: mx.array, cfg: Config) -> tuple[
 def update_vq_ema_codebooks(model: MLXCodec, batch: mx.array, cfg: Config) -> None:
     """EMA codebook rows toward batch means of assigned projected residuals (code space)."""
     dec = float(cfg.vq_ema_decay)
-    if dec <= 0.0 or dec >= 1.0 or cfg.ae_only:
+    if dec <= 0.0 or dec >= 1.0 or cfg.ae_only or _quantizer_kind(cfg) != "rvq":
         return
     try:
         import numpy as np
@@ -760,13 +970,28 @@ def _format_vq_util(indices: list[mx.array] | None, sizes: tuple[int, ...]) -> s
     except ImportError:
         return ""
     parts = []
+    binary_h: list[float] = []
+    binary_both = 0
     for i, idx in enumerate(indices):
         k = sizes[i] if i < len(sizes) else sizes[-1]
         mx.eval(idx)
-        a = np.array(idx)
+        a = np.array(idx).astype(np.int64, copy=False).ravel()
         nu = int(len(np.unique(a)))
         u = float(nu) / float(k)
-        parts.append(f"u{i}={nu}/{k}({100.0 * u:.1f}%)")
+        if int(k) == 2 and a.size > 0:
+            hist = np.bincount(a, minlength=2)[:2].astype(np.float64)
+            total = max(1.0, float(np.sum(hist)))
+            p = hist / total
+            nz = p[p > 0.0]
+            h = float(-np.sum(nz * np.log2(nz))) if nz.size else 0.0
+            binary_h.append(h)
+            if hist[0] > 0 and hist[1] > 0:
+                binary_both += 1
+            parts.append(f"u{i}={nu}/{k} H{i}={h:.2f} b{i}={100.0 * p[0]:.0f}/{100.0 * p[1]:.0f}%")
+        else:
+            parts.append(f"u{i}={nu}/{k}({100.0 * u:.1f}%)")
+    if binary_h:
+        parts.insert(0, f"bin_both={binary_both}/{len(binary_h)} Hmean={sum(binary_h) / len(binary_h):.2f}b")
     return "  " + " ".join(parts)
 
 
@@ -972,7 +1197,12 @@ def _remap_legacy_codec_subdict(sub: dict[str, mx.array], module: MLXCodec) -> t
     return out, n_moved
 
 
-def _shape_compatible_weight_items(module: nn.Module, flat: dict[str, mx.array]) -> list[tuple[str, mx.array]]:
+def _shape_compatible_weight_items(
+    module: nn.Module,
+    flat: dict[str, mx.array],
+    *,
+    label: str = "resume",
+) -> list[tuple[str, mx.array]]:
     """Keep only checkpoint tensors that exist in ``module`` with the same shape.
 
     MLX ``strict=False`` can still assign a tensor with a different first dimension
@@ -1001,11 +1231,17 @@ def _shape_compatible_weight_items(module: nn.Module, flat: dict[str, mx.array])
         if len(skipped_shape) > 8:
             extra = f", ... +{len(skipped_shape) - 8} shape"
         unk = f", {skipped_unknown} unknown" if skipped_unknown else ""
-        print(f"[resume] skipped incompatible tensors: {shown}{extra}{unk}", flush=True)
+        print(f"[{label}] skipped incompatible tensors: {shown}{extra}{unk}", flush=True)
     return out
 
 
-def _load_weights_prefix(module: nn.Module, flat: dict[str, mx.array], prefix: str) -> None:
+def _load_weights_prefix(
+    module: nn.Module,
+    flat: dict[str, mx.array],
+    prefix: str,
+    *,
+    label: str = "resume",
+) -> None:
     pl = len(prefix)
     sub = {k[pl:]: v for k, v in flat.items() if k.startswith(prefix) and isinstance(v, mx.array)}
     if not sub:
@@ -1019,12 +1255,12 @@ def _load_weights_prefix(module: nn.Module, flat: dict[str, mx.array], prefix: s
         sub2, n_rem = _remap_legacy_codec_subdict(sub, module)
         if n_rem > 0:
             print(
-                f"[resume] remapped {n_rem} legacy ``encoder.layers``/``decoder.layers`` keys → ``_b``/``_d``",
+                f"[{label}] remapped {n_rem} legacy ``encoder.layers``/``decoder.layers`` keys → ``_b``/``_d``",
                 flush=True,
             )
-        module.load_weights(_shape_compatible_weight_items(module, sub2), strict=False)
+        module.load_weights(_shape_compatible_weight_items(module, sub2, label=label), strict=False)
     else:
-        module.load_weights(_shape_compatible_weight_items(module, sub), strict=False)
+        module.load_weights(_shape_compatible_weight_items(module, sub, label=label), strict=False)
 
 
 def _load_optimizer_prefix(opt: Adam, flat: dict[str, mx.array], prefix: str) -> None:
@@ -1064,10 +1300,49 @@ def load_full_checkpoint_into(
     *,
     model: nn.Module,
     opt: Adam | None,
+    label: str = "resume",
 ) -> None:
-    _load_weights_prefix(model, flat, "model/")
+    _load_weights_prefix(model, flat, "model/", label=label)
     if opt is not None:
         _load_optimizer_prefix(opt, flat, "opt_g/")
+
+
+def load_model_checkpoint_weights(
+    model: MLXCodec,
+    ck_path: Path,
+    *,
+    label: str = "resume",
+) -> None:
+    """Load only model weights, skipping tensors incompatible with the current architecture."""
+    if _is_full_checkpoint_path(ck_path):
+        try:
+            flat = mx.load(str(ck_path))
+        except Exception as e:
+            print(f"load safetensors failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        load_full_checkpoint_into(flat, model=model, opt=None, label=label)
+        return
+    try:
+        model.load_weights(str(ck_path), strict=True)
+    except Exception as e:
+        flat_npz = dict(mx.load(str(ck_path)))
+        flat2, n_rem = _remap_legacy_codec_subdict(flat_npz, model)
+        if n_rem > 0:
+            print(
+                f"[{label}] remapped {n_rem} legacy ``encoder.layers``/``decoder.layers`` keys → ``_b``/``_d``",
+                flush=True,
+            )
+        try:
+            model.load_weights(_shape_compatible_weight_items(model, flat2, label=label), strict=False)
+        except Exception as e2:
+            print(f"load_weights failed: {e}", file=sys.stderr)
+            print(f"  after legacy key remap + strict=False: {e2}", file=sys.stderr)
+            print(
+                "  Hint: checkpoint may be from ``decoder_upsample=transpose`` while current "
+                "``Config`` defaults to ``repeat_conv`` (or vice versa). Weights are not interchangeable.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 
 def _cast_module_floats(module: nn.Module, dtype) -> None:
@@ -1180,11 +1455,47 @@ class PlateauLRSchedule:
         return mx.array(max(self._lr, self.min_lr), dtype=mx.float32)
 
 
+class CosineLRSchedule:
+    """Resume-aware cosine LR over the remaining optimizer steps."""
+
+    __slots__ = ("peak", "end", "start_step", "total_steps", "warmup_steps")
+
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        lr_scale: float = 1.0,
+        start_step: int = 0,
+    ) -> None:
+        scale = float(lr_scale)
+        self.peak = float(cfg.lr) * scale
+        self.end = self.peak * float(cfg.lr_min_ratio)
+        self.start_step = max(0, int(start_step))
+        self.total_steps = max(self.start_step + 1, int(cfg.steps))
+        remaining = max(1, self.total_steps - self.start_step)
+        warmup = max(0, int(cfg.lr_warmup_steps))
+        self.warmup_steps = 0 if warmup >= remaining else warmup
+
+    def __call__(self, step_mx: mx.array) -> mx.array:
+        step = int(step_mx.item())
+        local = max(0, step - self.start_step)
+        if self.warmup_steps > 0 and local < self.warmup_steps:
+            lr = self.peak * float(local + 1) / float(self.warmup_steps)
+            return mx.array(lr, dtype=mx.float32)
+
+        decay_step = max(0, local - self.warmup_steps)
+        decay_steps = max(1, self.total_steps - self.start_step - self.warmup_steps - 1)
+        progress = min(1.0, float(decay_step) / float(decay_steps))
+        lr = self.end + 0.5 * (self.peak - self.end) * (1.0 + math.cos(math.pi * progress))
+        return mx.array(lr, dtype=mx.float32)
+
+
 def build_lr_schedule(
     cfg: Config,
     *,
     lr_scale: float = 1.0,
     plateau_resume: dict | None = None,
+    start_step: int = 0,
 ) -> float | Callable[[mx.array], mx.array] | PlateauLRSchedule:
     """Return constant LR, cosine schedule, or a :class:`PlateauLRSchedule` instance.
 
@@ -1198,19 +1509,7 @@ def build_lr_schedule(
         return PlateauLRSchedule(cfg, lr_scale=scale, resume=plateau_resume)
     if mode != "cosine":
         raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule!r} (use none, cosine, or plateau)")
-    peak = float(cfg.lr) * scale
-    end = peak * float(cfg.lr_min_ratio)
-    total = max(1, int(cfg.steps))
-    wu = max(0, int(cfg.lr_warmup_steps))
-    if wu >= total:
-        wu = 0
-    if wu > 0:
-        warm = linear_schedule(0.0, peak, wu)
-        tail_n = max(1, total - wu - 1)
-        tail = cosine_decay(peak, tail_n, end=end)
-        return join_schedules([warm, tail], [wu])
-    decay_n = max(1, total - 1)
-    return cosine_decay(peak, decay_n, end=end)
+    return CosineLRSchedule(cfg, lr_scale=scale, start_step=start_step)
 
 
 def _refresh_optimizer_schedules(opt: Adam) -> None:
@@ -1243,6 +1542,30 @@ def main() -> None:
         help="While the GPU runs step t, load batch t+1 on a side thread (only with --data-dir / --librispeech)",
     )
     p.add_argument("--segment", type=int, default=16384, help="Waveform length per sample (more latent frames helps RVQ)")
+    p.add_argument(
+        "--noise-aug-prob",
+        type=float,
+        default=0.0,
+        help="Probability per batch item to feed noisy input while keeping clean target (0=off)",
+    )
+    p.add_argument(
+        "--noise-aug-snr-min",
+        type=float,
+        default=12.0,
+        help="Minimum SNR in dB for noisy-input clean-target augmentation",
+    )
+    p.add_argument(
+        "--noise-aug-snr-max",
+        type=float,
+        default=30.0,
+        help="Maximum SNR in dB for noisy-input clean-target augmentation",
+    )
+    p.add_argument(
+        "--sample-rate",
+        type=int,
+        default=16000,
+        help="Internal training sample rate; disk audio is resampled to this rate",
+    )
     p.add_argument("--lr", type=float, default=5e-4, help="Adam peak LR (warmup/plateau/cosine) or constant (--lr-schedule none)")
     p.add_argument(
         "--lr-schedule",
@@ -1396,6 +1719,24 @@ def main() -> None:
         help="Only add high-passed post-refiner residual, preserving low-band decoder output",
     )
     p.add_argument(
+        "--speech-control-depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Enable low-rate latent speech-control gates for the decoder residual branch (0=off)",
+    )
+    p.add_argument("--speech-control-channels", type=int, default=32, metavar="C")
+    p.add_argument("--speech-control-gain", type=float, default=1.0, metavar="G")
+    p.add_argument("--speech-residual-gain", type=float, default=0.03, metavar="G")
+    p.add_argument("--speech-hf-gate-floor", type=float, default=0.05, metavar="F")
+    p.add_argument(
+        "--speech-control-warmup-steps",
+        type=int,
+        default=0,
+        metavar="N",
+        help="For first N optimizer steps, train only decoder.speech_control/residual modules",
+    )
+    p.add_argument(
         "--harmonic-source",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1405,6 +1746,27 @@ def main() -> None:
     p.add_argument("--harmonic-amp", type=float, default=0.05, metavar="G")
     p.add_argument("--harmonic-f0-min", type=float, default=50.0, metavar="HZ")
     p.add_argument("--harmonic-f0-max", type=float, default=650.0, metavar="HZ")
+    p.add_argument(
+        "--quantizer",
+        type=str,
+        default="rvq",
+        choices=("rvq", "turboquant"),
+        help="Bottleneck quantizer: RVQ codebooks or TurboQuant-style fixed scalar latent quantization",
+    )
+    p.add_argument(
+        "--turboquant-bits",
+        type=int,
+        default=2,
+        choices=(2, 4),
+        help="Scalar TurboQuant bits per latent coordinate",
+    )
+    p.add_argument(
+        "--turboquant-code-dim",
+        type=int,
+        default=0,
+        metavar="d",
+        help="Optional latent projection dimension for TurboQuant (0 = full latent_dim)",
+    )
     p.add_argument(
         "--n-codebooks",
         type=int,
@@ -1424,6 +1786,35 @@ def main() -> None:
         default=None,
         metavar="K0,K1,…",
         help="Comma-separated K per RVQ stage (length must match --n-codebooks), e.g. decreasing 256,128,64",
+    )
+    p.add_argument(
+        "--decoder-backend",
+        type=str,
+        default="waveform",
+        choices=("waveform", "lux_vocos"),
+        help="Decoder target: waveform samples or LuxTTS/Vocos log-mel features",
+    )
+    p.add_argument("--lux-vocos-feature-dim", type=int, default=100, help="Lux/Vocos log-mel bins")
+    p.add_argument("--lux-vocos-n-fft", type=int, default=1024, help="Lux/Vocos feature FFT size")
+    p.add_argument("--lux-vocos-hop", type=int, default=256, help="Lux/Vocos feature hop length")
+    p.add_argument("--lux-vocos-fmin", type=float, default=0.0, help="Lux/Vocos mel low edge (Hz)")
+    p.add_argument(
+        "--lux-vocos-fmax",
+        type=float,
+        default=None,
+        help="Lux/Vocos mel high edge (Hz); default Nyquist",
+    )
+    p.add_argument(
+        "--lux-vocos-model",
+        type=str,
+        default="YatharthS/LuxTTS",
+        help="LuxTTS model repo id or local path used by inference for the frozen Vocos vocoder",
+    )
+    p.add_argument(
+        "--lux-vocos-output-sample-rate",
+        type=int,
+        default=48000,
+        help="Output sample rate after frozen Lux/Vocos rendering at inference",
     )
     p.add_argument("--lambda-time", type=float, default=1.0, help="L1 waveform weight")
     p.add_argument(
@@ -1550,6 +1941,18 @@ def main() -> None:
         help="τ for marginal softmax(-dist/τ); lower → sharper p̄ → H tracks hard code usage (try 0.03–0.06; too high masks collapse)",
     )
     p.add_argument(
+        "--lambda-binary-usage",
+        type=float,
+        default=0.0,
+        help="K=2 RVQ only: add straight-through hard usage balance loss so hard 0/1 assignments do not collapse",
+    )
+    p.add_argument(
+        "--binary-usage-tau",
+        type=float,
+        default=0.04,
+        help="τ for the softmax gradient used by --lambda-binary-usage",
+    )
+    p.add_argument(
         "--marginal-boost-steps",
         type=int,
         default=24_000,
@@ -1654,6 +2057,10 @@ def main() -> None:
     p.add_argument("--stft-band-excess-margin", type=float, default=0.15, help="Log-magnitude margin before --lambda-stft-band-excess activates")
     p.add_argument("--stft-band-excess-fmin", type=float, default=1200.0, help="Low edge in Hz for --lambda-stft-band-excess")
     p.add_argument("--stft-band-excess-fmax", type=float, default=0.0, help="High edge in Hz for --lambda-stft-band-excess (0=Nyquist)")
+    p.add_argument("--lambda-temporal-stripe", type=float, default=0.0, help="Penalize broadband target-relative log-STFT excess per time frame (vertical stripe suppressor)")
+    p.add_argument("--temporal-stripe-margin", type=float, default=0.08, help="Log-magnitude margin before --lambda-temporal-stripe activates")
+    p.add_argument("--temporal-stripe-fmin", type=float, default=700.0, help="Low edge in Hz for --lambda-temporal-stripe")
+    p.add_argument("--temporal-stripe-fmax", type=float, default=0.0, help="High edge in Hz for --lambda-temporal-stripe (0=Nyquist)")
     p.add_argument("--lambda-semantic", type=float, default=0.0, help="MLX ContentVec/HuBERT semantic feature loss weight (0=off)")
     p.add_argument("--semantic-model", type=str, default="HUBERT_BASE", help="HUBERT_BASE/CONTENTVEC alias or HuggingFace repo id for mlx-contentvec weights")
     p.add_argument("--semantic-layers", type=str, default="9", help="1-based HuBERT layers, comma-separated")
@@ -1686,6 +2093,38 @@ def main() -> None:
         type=int,
         default=768,
         help="Dimension of teacher semantic frames predicted by z_q head",
+    )
+    p.add_argument(
+        "--rvq-distill-from",
+        type=str,
+        default=None,
+        help="Frozen teacher checkpoint whose post-RVQ bottleneck z_q supervises the current RVQ layout",
+    )
+    p.add_argument(
+        "--lambda-rvq-distill",
+        type=float,
+        default=0.0,
+        help="Weight for MSE between current RVQ z_q and --rvq-distill-from teacher z_q",
+    )
+    p.add_argument(
+        "--rvq-distill-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Stage-A mode: optimize RVQ bottleneck distillation/VQ/diversity only, without decoder waveform losses",
+    )
+    p.add_argument(
+        "--rvq-distill-freeze-non-rvq",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Zero gradients outside rvq.* while RVQ distillation is active",
+    )
+    p.add_argument("--rvq-distill-teacher-n-codebooks", type=int, default=3)
+    p.add_argument("--rvq-distill-teacher-codebook-size", type=int, default=32)
+    p.add_argument(
+        "--rvq-distill-teacher-codebook-sizes",
+        type=str,
+        default=None,
+        help="Optional comma list for teacher per-stage RVQ sizes; overrides teacher uniform size",
     )
     p.add_argument(
         "--activation",
@@ -1723,7 +2162,12 @@ def main() -> None:
         help="Decoder upsampling: ConvTranspose1d or repeat×2+Conv (also forced when --causal)",
     )
     p.add_argument("--causal", action="store_true", help="Causal encoder/decoder convs (left pad only)")
-    p.add_argument("--bf16", action="store_true", help="Run codec in bfloat16 (STFT fp32)")
+    p.add_argument(
+        "--bf16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run codec in bfloat16 (STFT fp32); use --no-bf16 for fp32 master weights",
+    )
     p.add_argument(
         "--compile-loss",
         action="store_true",
@@ -1827,9 +2271,22 @@ def main() -> None:
         help="Load weights and continue: optional path to codec_stepN.npz; if flag given alone, use highest N in --checkpoint-dir",
     )
     p.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Warm-start model weights from checkpoint but start a fresh run at step 0 without optimizer/LR resume",
+    )
+    p.add_argument(
         "--profile",
         action="store_true",
         help="Print per-block timing (data/D/G-fwd+bwd/optim/ema/vq-reset) every --log-every; small overhead from mx.eval syncs",
+    )
+    p.add_argument(
+        "--mlx-clear-cache-every",
+        type=int,
+        default=0,
+        help="Call MLX/Metal clear_cache every N optimizer steps (0=off; useful for long teacher-distill graphs)",
     )
     p.set_defaults(**argparse_defaults_from_config())
     args = p.parse_args()
@@ -1843,11 +2300,32 @@ def main() -> None:
     if args.checkpoint_every < 0:
         print("--checkpoint-every must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.mlx_clear_cache_every < 0:
+        print("--mlx-clear-cache-every must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_binary_usage < 0:
+        print("--lambda-binary-usage must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.binary_usage_tau <= 0:
+        print("--binary-usage-tau must be > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.resume is not None and args.init_from is not None:
+        print("use either --resume or --init-from, not both", file=sys.stderr)
+        sys.exit(1)
     if args.load_audio_threads < 0 or args.load_audio_threads > 128:
         print("--load-audio-threads must be in [0, 128]", file=sys.stderr)
         sys.exit(1)
-    if args.grad_accum_steps < 1:
-        print("--grad-accum-steps must be >= 1", file=sys.stderr)
+    if args.noise_aug_prob < 0.0 or args.noise_aug_prob > 1.0:
+        print("--noise-aug-prob must be in [0, 1]", file=sys.stderr)
+        sys.exit(1)
+    if args.noise_aug_snr_min <= 0.0 or args.noise_aug_snr_max <= 0.0:
+        print("--noise-aug-snr-min/max must be > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.noise_aug_snr_max < args.noise_aug_snr_min:
+        print("--noise-aug-snr-max must be >= --noise-aug-snr-min", file=sys.stderr)
+        sys.exit(1)
+    if args.grad_accum_steps < 0:
+        print("--grad-accum-steps must be >= 0 (0 disables accumulation)", file=sys.stderr)
         sys.exit(1)
     if args.lr_min_ratio < 0 or args.lr_min_ratio > 1.0:
         print("--lr-min-ratio must be in [0, 1]", file=sys.stderr)
@@ -1874,6 +2352,9 @@ def main() -> None:
     if args.n_codebooks < 1 and not args.ae_only:
         print("--n-codebooks must be >= 1 unless --ae-only", file=sys.stderr)
         sys.exit(1)
+    if args.turboquant_code_dim < 0:
+        print("--turboquant-code-dim must be >= 0", file=sys.stderr)
+        sys.exit(1)
 
     try:
         enc_ch = tuple(int(x.strip()) for x in args.enc_channels.split(",") if x.strip())
@@ -1882,6 +2363,41 @@ def main() -> None:
     if len(enc_ch) < 1:
         print("--enc-channels must list at least one integer width (comma-separated)", file=sys.stderr)
         sys.exit(1)
+    if args.turboquant_code_dim > args.latent_dim:
+        print("--turboquant-code-dim must be <= --latent-dim", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder_backend == "lux_vocos":
+        if args.lux_vocos_feature_dim < 1:
+            print("--lux-vocos-feature-dim must be >= 1", file=sys.stderr)
+            sys.exit(1)
+        if args.lux_vocos_n_fft < 2 or args.lux_vocos_n_fft % 2 != 0:
+            print("--lux-vocos-n-fft must be a positive even integer", file=sys.stderr)
+            sys.exit(1)
+        if args.lux_vocos_hop < 1:
+            print("--lux-vocos-hop must be >= 1", file=sys.stderr)
+            sys.exit(1)
+        if args.lux_vocos_fmin < 0:
+            print("--lux-vocos-fmin must be >= 0", file=sys.stderr)
+            sys.exit(1)
+        if args.lux_vocos_fmax is not None and args.lux_vocos_fmax <= args.lux_vocos_fmin:
+            print("--lux-vocos-fmax must be > --lux-vocos-fmin", file=sys.stderr)
+            sys.exit(1)
+        if args.lux_vocos_output_sample_rate < 1:
+            print("--lux-vocos-output-sample-rate must be >= 1", file=sys.stderr)
+            sys.exit(1)
+        if args.lambda_semantic > 0 or args.lambda_latent_semantic > 0:
+            print(
+                "decoder_backend=lux_vocos does not support ContentVec semantic losses; "
+                "set --lambda-semantic 0 --lambda-latent-semantic 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.sample_rate != 24000:
+            print(
+                "[lux_vocos] warning: LuxTTS/Vocos features are trained at 24000 Hz; "
+                f"current --sample-rate is {args.sample_rate}",
+                flush=True,
+            )
 
     if args.lambda_stft_grad < 0:
         print("--lambda-stft-grad must be >= 0", file=sys.stderr)
@@ -1909,6 +2425,18 @@ def main() -> None:
         sys.exit(1)
     if args.stft_band_excess_fmax > 0 and args.stft_band_excess_fmax <= args.stft_band_excess_fmin:
         print("--stft-band-excess-fmax must be > --stft-band-excess-fmin, or 0 for Nyquist", file=sys.stderr)
+        sys.exit(1)
+    if args.lambda_temporal_stripe < 0:
+        print("--lambda-temporal-stripe must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.temporal_stripe_margin < 0:
+        print("--temporal-stripe-margin must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.temporal_stripe_fmin < 0 or args.temporal_stripe_fmax < 0:
+        print("--temporal-stripe-fmin and --temporal-stripe-fmax must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.temporal_stripe_fmax > 0 and args.temporal_stripe_fmax <= args.temporal_stripe_fmin:
+        print("--temporal-stripe-fmax must be > --temporal-stripe-fmin, or 0 for Nyquist", file=sys.stderr)
         sys.exit(1)
     if args.lambda_mel_l1 < 0 or args.lambda_mel_l2 < 0:
         print("--lambda-mel-l1 and --lambda-mel-l2 must be >= 0", file=sys.stderr)
@@ -1985,6 +2513,24 @@ def main() -> None:
     if args.post_lavasr_gain < 0:
         print("--post-lavasr-gain must be >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.speech_control_depth < 0:
+        print("--speech-control-depth must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.speech_control_channels < 1:
+        print("--speech-control-channels must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.speech_control_gain < 0:
+        print("--speech-control-gain must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.speech_residual_gain < 0:
+        print("--speech-residual-gain must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if not (0.0 <= args.speech_hf_gate_floor <= 1.0):
+        print("--speech-hf-gate-floor must be in [0, 1]", file=sys.stderr)
+        sys.exit(1)
+    if args.speech_control_warmup_steps < 0:
+        print("--speech-control-warmup-steps must be >= 0", file=sys.stderr)
+        sys.exit(1)
     if args.harmonic_harmonics < 1:
         print("--harmonic-harmonics must be >= 1", file=sys.stderr)
         sys.exit(1)
@@ -2033,11 +2579,47 @@ def main() -> None:
     if args.latent_semantic_dim < 1:
         print("--latent-semantic-dim must be >= 1", file=sys.stderr)
         sys.exit(1)
+    if args.lambda_rvq_distill < 0:
+        print("--lambda-rvq-distill must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.rvq_distill_from is not None and args.lambda_rvq_distill <= 0:
+        print("--rvq-distill-from requires --lambda-rvq-distill > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.rvq_distill_only and args.rvq_distill_from is None:
+        print("--rvq-distill-only requires --rvq-distill-from", file=sys.stderr)
+        sys.exit(1)
+    if args.rvq_distill_freeze_non_rvq and args.rvq_distill_from is None:
+        print("--rvq-distill-freeze-non-rvq requires --rvq-distill-from", file=sys.stderr)
+        sys.exit(1)
+    if args.rvq_distill_teacher_n_codebooks < 1:
+        print("--rvq-distill-teacher-n-codebooks must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.rvq_distill_teacher_codebook_size < 2:
+        print("--rvq-distill-teacher-codebook-size must be >= 2", file=sys.stderr)
+        sys.exit(1)
     try:
         semantic_layers_arg = parse_positive_int_list_arg(args.semantic_layers)
     except ValueError as e:
         print(f"--semantic-layers: {e}", file=sys.stderr)
         sys.exit(1)
+
+    rvq_distill_teacher_codebook_sizes_arg: tuple[int, ...] | None = None
+    if args.rvq_distill_teacher_codebook_sizes:
+        try:
+            rvq_distill_teacher_codebook_sizes_arg = parse_codebook_sizes_arg(
+                args.rvq_distill_teacher_codebook_sizes
+            )
+        except ValueError as e:
+            print(f"--rvq-distill-teacher-codebook-sizes: {e}", file=sys.stderr)
+            sys.exit(1)
+        if len(rvq_distill_teacher_codebook_sizes_arg) != args.rvq_distill_teacher_n_codebooks:
+            print(
+                "--rvq-distill-teacher-codebook-sizes: expected "
+                f"{args.rvq_distill_teacher_n_codebooks} values "
+                f"(got {len(rvq_distill_teacher_codebook_sizes_arg)})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     codebook_sizes_arg: tuple[int, ...] | None = None
     if args.codebook_sizes:
@@ -2082,11 +2664,15 @@ def main() -> None:
         stft_scale_weights_resolved = Config().stft_scale_weights
 
     cfg = Config(
+        sample_rate=args.sample_rate,
         steps=args.steps,
         batch=args.batch,
         load_audio_threads=args.load_audio_threads,
         prefetch_audio=bool(args.prefetch_audio),
         segment=args.segment,
+        noise_aug_prob=args.noise_aug_prob,
+        noise_aug_snr_min=args.noise_aug_snr_min,
+        noise_aug_snr_max=args.noise_aug_snr_max,
         lr=args.lr,
         lr_schedule=args.lr_schedule,
         lr_min_ratio=args.lr_min_ratio,
@@ -2119,14 +2705,31 @@ def main() -> None:
         post_lavasr_kernel=args.post_lavasr_kernel,
         post_lavasr_gain=args.post_lavasr_gain,
         post_lavasr_highpass=bool(args.post_lavasr_highpass),
+        speech_control_depth=args.speech_control_depth,
+        speech_control_channels=args.speech_control_channels,
+        speech_control_gain=args.speech_control_gain,
+        speech_residual_gain=args.speech_residual_gain,
+        speech_hf_gate_floor=args.speech_hf_gate_floor,
+        speech_control_warmup_steps=args.speech_control_warmup_steps,
         harmonic_source=bool(args.harmonic_source),
         harmonic_harmonics=args.harmonic_harmonics,
         harmonic_amp=args.harmonic_amp,
         harmonic_f0_min=args.harmonic_f0_min,
         harmonic_f0_max=args.harmonic_f0_max,
+        quantizer=args.quantizer,
+        turboquant_bits=args.turboquant_bits,
+        turboquant_code_dim=args.turboquant_code_dim,
         n_codebooks=args.n_codebooks,
         codebook_size=args.codebook_size,
         codebook_sizes=codebook_sizes_arg,
+        decoder_backend=args.decoder_backend,
+        lux_vocos_feature_dim=args.lux_vocos_feature_dim,
+        lux_vocos_n_fft=args.lux_vocos_n_fft,
+        lux_vocos_hop=args.lux_vocos_hop,
+        lux_vocos_fmin=args.lux_vocos_fmin,
+        lux_vocos_fmax=args.lux_vocos_fmax,
+        lux_vocos_model=args.lux_vocos_model,
+        lux_vocos_output_sample_rate=args.lux_vocos_output_sample_rate,
         lambda_time=args.lambda_time,
         lambda_stft=args.lambda_stft,
         lambda_stft_grad=args.lambda_stft_grad,
@@ -2142,6 +2745,10 @@ def main() -> None:
         stft_band_excess_margin=args.stft_band_excess_margin,
         stft_band_excess_fmin=args.stft_band_excess_fmin,
         stft_band_excess_fmax=args.stft_band_excess_fmax,
+        lambda_temporal_stripe=args.lambda_temporal_stripe,
+        temporal_stripe_margin=args.temporal_stripe_margin,
+        temporal_stripe_fmin=args.temporal_stripe_fmin,
+        temporal_stripe_fmax=args.temporal_stripe_fmax,
         mel_n_fft=args.mel_n_fft,
         mel_hop=args.mel_hop,
         n_mels=args.n_mels,
@@ -2153,6 +2760,8 @@ def main() -> None:
         lambda_entropy=args.lambda_entropy,
         lambda_marginal=args.lambda_marginal,
         marginal_tau=args.marginal_tau,
+        lambda_binary_usage=args.lambda_binary_usage,
+        binary_usage_tau=args.binary_usage_tau,
         marginal_boost_steps=args.marginal_boost_steps,
         marginal_boost_mult=args.marginal_boost_mult,
         vq_reset_every=args.vq_reset_every,
@@ -2182,6 +2791,12 @@ def main() -> None:
         latent_semantic_start_step=args.latent_semantic_start_step,
         latent_semantic_ramp_steps=args.latent_semantic_ramp_steps,
         latent_semantic_dim=args.latent_semantic_dim,
+        lambda_rvq_distill=args.lambda_rvq_distill,
+        rvq_distill_only=bool(args.rvq_distill_only),
+        rvq_distill_freeze_non_rvq=bool(args.rvq_distill_freeze_non_rvq),
+        rvq_distill_teacher_n_codebooks=args.rvq_distill_teacher_n_codebooks,
+        rvq_distill_teacher_codebook_size=args.rvq_distill_teacher_codebook_size,
+        rvq_distill_teacher_codebook_sizes=rvq_distill_teacher_codebook_sizes_arg,
         log_every=args.log_every,
         log_cos_ema_beta=args.log_cos_ema_beta,
         spectrogram_every=args.spectrogram_every,
@@ -2207,6 +2822,7 @@ def main() -> None:
         results_tsv_path=args.results_tsv,
         adaptive_mode=args.adaptive_mode,
     )
+    feature_mode = _uses_lux_vocos(cfg)
 
     mx.random.seed(cfg.seed)
     model = MLXCodec(cfg)
@@ -2217,6 +2833,14 @@ def main() -> None:
     resume_flat: dict[str, mx.array] | None = None
     resume_data_off: int | None = None
     resume_meta: dict | None = None
+    if args.init_from is not None:
+        init_path = Path(args.init_from).expanduser().resolve()
+        if not init_path.is_file():
+            print(f"--init-from file not found: {init_path}", file=sys.stderr)
+            sys.exit(1)
+        load_model_checkpoint_weights(model, init_path, label="init-from")
+        mx.eval(model.parameters())
+        print(f"[init-from] {init_path}  → warm-start weights, fresh train steps 0…{cfg.steps - 1}", flush=True)
     if args.resume is not None:
         if args.resume == "__latest__":
             ck_dir = Path(args.checkpoint_dir).expanduser().resolve()
@@ -2259,27 +2883,7 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            try:
-                model.load_weights(str(ck_path), strict=True)
-            except Exception as e:
-                flat_npz = dict(mx.load(str(ck_path)))
-                flat2, n_rem = _remap_legacy_codec_subdict(flat_npz, model)
-                if n_rem > 0:
-                    print(
-                        f"[resume] remapped {n_rem} legacy ``encoder.layers``/``decoder.layers`` keys → ``_b``/``_d``",
-                        flush=True,
-                    )
-                try:
-                    model.load_weights(_shape_compatible_weight_items(model, flat2), strict=False)
-                except Exception as e2:
-                    print(f"load_weights failed: {e}", file=sys.stderr)
-                    print(f"  after legacy key remap + strict=False: {e2}", file=sys.stderr)
-                    print(
-                        "  Hint: checkpoint may be from ``decoder_upsample=transpose`` while current "
-                        "``Config`` defaults to ``repeat_conv`` (or vice versa). Weights are not interchangeable.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
+            load_model_checkpoint_weights(model, ck_path, label="resume")
             res_ck_path, res_ck_n = ck_path, n_ck
             start_step = n_ck + 1
         if start_step >= cfg.steps:
@@ -2293,8 +2897,32 @@ def main() -> None:
             flush=True,
         )
 
+    rvq_distill_teacher: MLXCodec | None = None
+    if args.rvq_distill_from is not None:
+        teacher_path = Path(args.rvq_distill_from).expanduser().resolve()
+        if not teacher_path.is_file():
+            print(f"--rvq-distill-from file not found: {teacher_path}", file=sys.stderr)
+            sys.exit(1)
+        teacher_cfg = replace(
+            cfg,
+            n_codebooks=cfg.rvq_distill_teacher_n_codebooks,
+            codebook_size=cfg.rvq_distill_teacher_codebook_size,
+            codebook_sizes=cfg.rvq_distill_teacher_codebook_sizes,
+            lambda_rvq_distill=0.0,
+            rvq_distill_only=False,
+            rvq_distill_freeze_non_rvq=False,
+        )
+        rvq_distill_teacher = MLXCodec(teacher_cfg)
+        load_model_checkpoint_weights(rvq_distill_teacher, teacher_path, label="rvq-distill teacher")
+        mx.eval(rvq_distill_teacher.parameters())
+        print(
+            f"[rvq-distill] teacher {teacher_path}  "
+            f"layout={teacher_cfg.n_codebooks}xK{teacher_cfg.codebook_size}",
+            flush=True,
+        )
+
     plateau_resume = resume_meta.get("lr_plateau") if resume_meta else None
-    lr_spec = build_lr_schedule(cfg, plateau_resume=None)
+    lr_spec = build_lr_schedule(cfg, plateau_resume=plateau_resume, start_step=start_step)
     plateau_schedule = lr_spec if isinstance(lr_spec, PlateauLRSchedule) else None
     opt = Adam(lr_spec)
     opt.init(model.parameters())
@@ -2303,15 +2931,18 @@ def main() -> None:
         _refresh_optimizer_schedules(opt)
 
     if resume_flat is not None:
-        load_full_checkpoint_into(resume_flat, model=model, opt=opt)
+        load_full_checkpoint_into(resume_flat, model=model, opt=opt, label="resume")
         mx.eval(model.parameters(), opt.state)
         print("[resume] loaded full safetensors (weights + optimizer state)", flush=True)
         if plateau_schedule is not None and plateau_resume is not None:
             plateau_schedule.load_state(plateau_resume)
+        if start_step > 0:
+            opt.state["step"] = mx.array(int(start_step), dtype=mx.uint64)
+        if callable(lr_spec):
             _refresh_optimizer_schedules(opt)
 
     compiled_multi_stft: Callable[[mx.array, mx.array], mx.array] | None = None
-    if cfg.use_compile and cfg.lambda_stft_grad <= 0 and cfg.lambda_stft_cos <= 0:
+    if cfg.use_compile and cfg.lambda_stft_grad <= 0 and cfg.lambda_stft_cos <= 0 and not feature_mode:
 
         @mx.compile
         def _cmsft(pred: mx.array, tgt: mx.array) -> mx.array:
@@ -2333,7 +2964,23 @@ def main() -> None:
     st = encoder_time_stride(cfg)
     nom_kbps = nominal_rvq_kbps(cfg) * adaptive_mod.nominal_bitrate_multiplier(cfg.adaptive_mode)
     cb_sizes = effective_codebook_sizes(cfg)
-    rvq_ks = "×".join(str(k) for k in cb_sizes)
+    quant_kind = _quantizer_kind(cfg)
+    if quant_kind == "turboquant":
+        tq_dim = int(cfg.turboquant_code_dim or cfg.latent_dim)
+        rvq_bits_per_frame = float(int(cfg.turboquant_bits) * tq_dim)
+        quant_info = f"TurboQuant={cfg.turboquant_bits}b×d{tq_dim} (K={1 << int(cfg.turboquant_bits)})"
+        quant_cos_info = "vq_cos=na"
+        quant_reset_info = "vq_reset=off(turboquant)"
+    else:
+        rvq_bits_per_frame = sum(math.log2(float(k)) for k in cb_sizes)
+        rvq_ks = "×".join(str(k) for k in cb_sizes)
+        quant_info = f"RVQ={cfg.n_codebooks}×K={rvq_ks}"
+        quant_cos_info = f"vq_cos={cfg.vq_cosine}"
+        quant_reset_info = (
+            f"vq_reset={cfg.vq_reset_every}@{cfg.vq_reset_collapse_frac}  "
+            f"σ={cfg.vq_reset_noise}  shuffle={cfg.vq_reset_shuffle}  vq_km={cfg.vq_reset_kmeans}  "
+            f"vq_full≤{cfg.vq_reset_full_refresh_max_unique}u→allK  vq_rst_log={cfg.vq_reset_log_every}"
+        )
     ramp_s = (
         f"λ_stft_ramp={cfg.stft_ramp_steps}@{cfg.stft_ramp_start_frac}→1  "
         if cfg.stft_ramp_steps > 0
@@ -2353,14 +3000,17 @@ def main() -> None:
             f"thr={cfg.lr_plateau_threshold} ema={cfg.lr_plateau_ema} cd={cfg.lr_plateau_cooldown}  "
             f"warmup={cfg.lr_warmup_steps}"
         )
-    else:
+    elif _ls == "cosine":
         lr_info = (
             f"lr {cfg.lr_schedule}: peak={cfg.lr} → min={cfg.lr * cfg.lr_min_ratio:g}  "
-            f"warmup={cfg.lr_warmup_steps}"
+            f"warmup={cfg.lr_warmup_steps}  decay_start={start_step}"
         )
+    else:
+        lr_info = f"lr {cfg.lr_schedule}: peak={cfg.lr}  warmup={cfg.lr_warmup_steps}"
     mel_fb_mx: mx.array | None = None
+    lux_mel_fb_mx: mx.array | None = None
     mel_info = ""
-    if cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0:
+    if not feature_mode and (cfg.lambda_mel_l1 > 0 or cfg.lambda_mel_l2 > 0):
         fmax_mel = float(cfg.mel_fmax) if cfg.mel_fmax is not None else float(cfg.sample_rate) / 2.0
         if fmax_mel <= cfg.mel_fmin:
             print(
@@ -2382,6 +3032,35 @@ def main() -> None:
         mel_info = (
             f"  mel=nfft{cfg.mel_n_fft}/hop{cfg.mel_hop} M={cfg.n_mels} "
             f"[{cfg.mel_fmin:g}-{fmax_mel:g}]Hz  λ_mel_L1={cfg.lambda_mel_l1}  λ_mel_L2={cfg.lambda_mel_l2}"
+        )
+    lux_info = ""
+    if feature_mode:
+        fmax_lux = (
+            float(cfg.lux_vocos_fmax)
+            if cfg.lux_vocos_fmax is not None
+            else float(cfg.sample_rate) / 2.0
+        )
+        if fmax_lux <= cfg.lux_vocos_fmin:
+            print(
+                f"lux_vocos: fmax ({fmax_lux}) must be > fmin ({cfg.lux_vocos_fmin})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            lux_mel_fb_mx = mel_filterbank_mx(
+                cfg.sample_rate,
+                cfg.lux_vocos_n_fft,
+                cfg.lux_vocos_feature_dim,
+                cfg.lux_vocos_fmin,
+                fmax_lux,
+            )
+        except ValueError as e:
+            print(f"lux_vocos filterbank: {e}", file=sys.stderr)
+            sys.exit(1)
+        lux_info = (
+            f"  lux_vocos=nfft{cfg.lux_vocos_n_fft}/hop{cfg.lux_vocos_hop} "
+            f"M={cfg.lux_vocos_feature_dim} [{cfg.lux_vocos_fmin:g}-{fmax_lux:g}]Hz "
+            f"model={cfg.lux_vocos_model}"
         )
     semantic_teacher: MlxContentVecSemanticTeacher | None = None
     semantic_info = ""
@@ -2418,6 +3097,20 @@ def main() -> None:
                 f"D={cfg.latent_semantic_dim} subset={cfg.semantic_batch_items} every={cfg.semantic_every}"
             )
         semantic_info = "  " + "  ".join(sem_parts)
+    rvq_distill_info = ""
+    if cfg.lambda_rvq_distill > 0:
+        phase = "rvq-only" if cfg.rvq_distill_only else "joint"
+        freeze = "+freeze" if cfg.rvq_distill_freeze_non_rvq else ""
+        rvq_distill_info = (
+            f"  rvq_distill={phase}{freeze} λ={cfg.lambda_rvq_distill:g} "
+            f"teacher={cfg.rvq_distill_teacher_n_codebooks}xK{cfg.rvq_distill_teacher_codebook_size}"
+        )
+    noise_info = ""
+    if cfg.noise_aug_prob > 0.0:
+        noise_info = (
+            f"  noise_aug=p{cfg.noise_aug_prob:g}@"
+            f"{cfg.noise_aug_snr_min:g}-{cfg.noise_aug_snr_max:g}dB→clean"
+        )
     lt_pre_post = (
         f"lat_tmp={cfg.latent_temporal_depth}/{cfg.latent_temporal_post_depth}  "
         f"self_attn={cfg.self_attention_depth}/{cfg.self_attention_post_depth}×h{cfg.self_attention_heads}"
@@ -2428,6 +3121,9 @@ def main() -> None:
         f"post_lava={cfg.post_lavasr_depth}x{cfg.post_lavasr_channels}"
         f"/k{cfg.post_lavasr_kernel}@{cfg.post_lavasr_gain:g}"
         f"{'+hp' if cfg.post_lavasr_highpass else '+full'}  "
+        f"speech_ctl={cfg.speech_control_depth}x{cfg.speech_control_channels}"
+        f"@{cfg.speech_residual_gain:g}/floor{cfg.speech_hf_gate_floor:g}"
+        f"/warm{cfg.speech_control_warmup_steps}  "
         f"harm={'on' if cfg.harmonic_source else 'off'}({cfg.harmonic_harmonics}h,{cfg.harmonic_amp:g})"
     )
     dec_act = cfg.decoder_activation or cfg.activation
@@ -2437,6 +3133,12 @@ def main() -> None:
         f"  λ_band={cfg.lambda_stft_band_excess:g}@{cfg.stft_band_excess_margin:g}"
         f"[{cfg.stft_band_excess_fmin:g}-{cfg.stft_band_excess_fmax or cfg.sample_rate / 2:g}]Hz"
         if cfg.lambda_stft_band_excess > 0
+        else ""
+    )
+    stripe_info = (
+        f"  λ_stripe={cfg.lambda_temporal_stripe:g}@{cfg.temporal_stripe_margin:g}"
+        f"[{cfg.temporal_stripe_fmin:g}-{cfg.temporal_stripe_fmax or cfg.sample_rate / 2:g}]Hz"
+        if cfg.lambda_temporal_stripe > 0
         else ""
     )
     _acm_p = max(1, int(cfg.grad_accum_steps))
@@ -2449,18 +3151,16 @@ def main() -> None:
         f"Parameters: {n_params / 1e6:.2f}M{batch_info}  latent={cfg.latent_dim}  {lt_pre_post}  pre_vq_ln={cfg.pre_vq_layernorm}  enc_stride={st}×  "
         f"s1/scale={cfg.stride1_blocks_per_scale}  act={cfg.activation}/{dec_act}  {dec_arch}  "
         f"grad_clip={cfg.grad_clip_norm}  {lr_info}  "
-        f"~{nom_kbps:.1f} kbps nominal  "
+        f"~{nom_kbps:.3f} kbps nominal ({nom_kbps * 1000.0:.0f} bps, {rvq_bits_per_frame:g} bit/frame)  "
         f"STFT×{len(cfg.stft_scales)}: {stft_nfo}{stft_w_info}  stft_hf={cfg.stft_hf_emphasis:g}  "
-        f"λ_L1={cfg.lambda_time}  λ_stft={cfg.lambda_stft}  λ_stft_grad={cfg.lambda_stft_grad}{sc_info}{cx_info}{band_info}  "
+        f"λ_L1={cfg.lambda_time}  λ_stft={cfg.lambda_stft}  λ_stft_grad={cfg.lambda_stft_grad}{sc_info}{cx_info}{band_info}{stripe_info}  "
         f"sgrad_df/dt={cfg.stft_grad_freq_weight}/{cfg.stft_grad_time_weight}  λ_stft_cos={cfg.lambda_stft_cos}  {ramp_s}"
-        f"RVQ={cfg.n_codebooks}×K={rvq_ks}  vq_cos={cfg.vq_cosine}  λ_vq={cfg.lambda_vq}  λ_ent={cfg.lambda_entropy}  "
-        f"λ_marg={cfg.lambda_marginal}  τ_marg={cfg.marginal_tau}  "
+        f"{quant_info}  {quant_cos_info}  λ_vq={cfg.lambda_vq}  λ_ent={cfg.lambda_entropy}  "
+        f"λ_marg={cfg.lambda_marginal}  τ_marg={cfg.marginal_tau}  λ_bin_use={cfg.lambda_binary_usage}  τ_bin={cfg.binary_usage_tau}  "
         f"{'λ_marg_boost=' + str(cfg.marginal_boost_steps) + '@×' + str(cfg.marginal_boost_mult) + '→1  ' if cfg.marginal_boost_steps > 0 else ''}"
-        f"vq_reset={cfg.vq_reset_every}@{cfg.vq_reset_collapse_frac}  "
-        f"σ={cfg.vq_reset_noise}  shuffle={cfg.vq_reset_shuffle}  vq_km={cfg.vq_reset_kmeans}  "
-        f"vq_full≤{cfg.vq_reset_full_refresh_max_unique}u→allK  vq_rst_log={cfg.vq_reset_log_every}  "
+        f"{quant_reset_info}  "
         f"λ_cos={cfg.lambda_cos}  cos_hinge={cfg.cos_hinge}@{cfg.cos_target}"
-        f"{mel_info}{semantic_info}"
+        f"{mel_info}{lux_info}{semantic_info}{noise_info}{rvq_distill_info}"
     )
     if cfg.causal:
         tms = streaming_mod.benchmark_causal_latency_ms(sample_rate=cfg.sample_rate, chunk_ms=20.0)
@@ -2575,7 +3275,13 @@ def main() -> None:
             )
             if micro > 0 and audio_paths is not None:
                 data_off += cfg.batch
-            batch = b
+            clean_b = b
+            input_b = clean_b
+            noise_aug_applied = mx.array(0.0, dtype=mx.float32)
+            noise_aug_snr = mx.array(0.0, dtype=mx.float32)
+            if cfg.noise_aug_prob > 0.0:
+                input_b, noise_aug_applied, noise_aug_snr = apply_noise_augmentation(clean_b, cfg)
+            batch = clean_b
             sem_grad = None
             sem_loss_value = None
             sem_cos_value: mx.array | float = 0.0
@@ -2583,14 +3289,22 @@ def main() -> None:
             sem_grad_stats = None
             lat_sem_target = None
             lat_sem_items = 0
+            rvq_distill_target = None
+            target_features = None
+            if feature_mode:
+                if lux_mel_fb_mx is None:
+                    raise RuntimeError("lux_vocos mel filterbank was not initialized")
+                target_features = lux_vocos_target_features(clean_b, cfg, lux_mel_fb_mx)
+                mx.eval(target_features)
             if (
                 semantic_teacher is not None
                 and semantic_weight > 0
                 and step % max(1, int(cfg.semantic_every)) == 0
+                and not feature_mode
             ):
-                y_sem = model.forward_reconstruction_only(b)
+                y_sem = model.forward_reconstruction_only(input_b)
                 sem_grad, sem_loss_value, sem_cos_value, sem_items, sem_grad_stats = semantic_teacher.gradient(
-                    b,
+                    clean_b,
                     y_sem,
                     max_items=cfg.semantic_batch_items,
                     clip_value=cfg.semantic_grad_clip,
@@ -2601,19 +3315,25 @@ def main() -> None:
                 and latent_semantic_weight > 0
                 and step % max(1, int(cfg.semantic_every)) == 0
             ):
-                target_frames = encoded_frame_count(int(b.shape[1]), cfg)
+                target_frames = encoded_frame_count(int(clean_b.shape[1]), cfg)
                 lat_sem_target, lat_sem_items = semantic_teacher.latent_targets(
-                    b,
+                    clean_b,
                     max_items=cfg.semantic_batch_items,
                     target_frames=target_frames,
                 )
                 mx.eval(lat_sem_target)
+            if rvq_distill_teacher is not None and cfg.lambda_rvq_distill > 0:
+                rvq_distill_target, _, _, _, _ = rvq_bottleneck_latent(rvq_distill_teacher, clean_b)
+                rvq_distill_target = mx.stop_gradient(rvq_distill_target)
+                mx.eval(rvq_distill_target)
             loss_fn = make_train_fn(
                 model,
                 cfg,
-                b,
+                input_b,
                 step,
                 mel_fb_mx,
+                target_batch=clean_b,
+                target_features=target_features,
                 compiled_multi_stft=compiled_multi_stft,
                 semantic_grad=sem_grad,
                 semantic_loss_value=sem_loss_value,
@@ -2624,6 +3344,11 @@ def main() -> None:
                 latent_semantic_target=lat_sem_target,
                 latent_semantic_weight=latent_semantic_weight,
                 latent_semantic_items=lat_sem_items,
+                rvq_distill_target=rvq_distill_target,
+                rvq_distill_weight=cfg.lambda_rvq_distill,
+                rvq_distill_only=bool(cfg.rvq_distill_only),
+                noise_aug_applied=noise_aug_applied,
+                noise_aug_snr=noise_aug_snr,
             )
             lg = nn.value_and_grad(model, loss_fn)
             loss, grads = lg(model)
@@ -2650,6 +3375,20 @@ def main() -> None:
         _t_misc = _ptic()
         lv0 = lv_m_total * inv_acm
         grads = grads_acc
+        speech_ctl_only = (
+            cfg.speech_control_depth > 0
+            and cfg.speech_control_warmup_steps > 0
+            and (step - start_step) < cfg.speech_control_warmup_steps
+        )
+        if speech_ctl_only:
+            grads = mask_speech_control_gradients(grads)
+        rvq_distill_rvq_only = (
+            rvq_distill_teacher is not None
+            and cfg.lambda_rvq_distill > 0
+            and bool(cfg.rvq_distill_freeze_non_rvq)
+        )
+        if rvq_distill_rvq_only:
+            grads = mask_rvq_gradients(grads)
         if _grad_tree_any_nonfinite(grads):
             print(f"  [skip] non-finite accumulated gradient at step {step}", flush=True)
             continue
@@ -2671,6 +3410,7 @@ def main() -> None:
             l_sc = fm.get("l_sc")
             l_cx = fm.get("l_cx")
             l_band = fm.get("l_band")
+            l_stripe = fm.get("l_stripe")
             l_sem = fm.get("l_sem")
             sem_cos_m = fm.get("sem_cos")
             sem_w_m = fm.get("sem_weight")
@@ -2681,6 +3421,19 @@ def main() -> None:
             l_lat_sem = fm.get("l_lat_sem")
             lat_sem_cos_m = fm.get("lat_sem_cos")
             lat_sem_w_m = fm.get("lat_sem_weight")
+            l_rvq_distill = fm.get("l_rvq_distill")
+            rvq_distill_cos_m = fm.get("rvq_distill_cos")
+            rvq_distill_w_m = fm.get("rvq_distill_weight")
+            noise_aug_m = fm.get("noise_aug_applied")
+            noise_snr_m = fm.get("noise_aug_snr")
+            speech_stats = [
+                fm.get("speech_energy"),
+                fm.get("speech_voicing"),
+                fm.get("speech_harmonicity"),
+                fm.get("speech_hf_gate"),
+                fm.get("speech_noise_gate"),
+                fm.get("speech_residual_gate"),
+            ]
             to_ev = [lt, ls, lsg, lsc, lm1, lm2, vq_l, ent_pos, marg_ent, cos_m]
             if isinstance(l_lin, mx.array):
                 to_ev.append(l_lin)
@@ -2690,6 +3443,8 @@ def main() -> None:
                 to_ev.append(l_cx)
             if isinstance(l_band, mx.array):
                 to_ev.append(l_band)
+            if isinstance(l_stripe, mx.array):
+                to_ev.append(l_stripe)
             if isinstance(l_sem, mx.array):
                 to_ev.append(l_sem)
             if isinstance(sem_cos_m, mx.array):
@@ -2700,9 +3455,22 @@ def main() -> None:
                 to_ev.append(lat_sem_cos_m)
             if isinstance(lat_sem_w_m, mx.array):
                 to_ev.append(lat_sem_w_m)
+            if isinstance(l_rvq_distill, mx.array):
+                to_ev.append(l_rvq_distill)
+            if isinstance(rvq_distill_cos_m, mx.array):
+                to_ev.append(rvq_distill_cos_m)
+            if isinstance(rvq_distill_w_m, mx.array):
+                to_ev.append(rvq_distill_w_m)
+            if isinstance(noise_aug_m, mx.array):
+                to_ev.append(noise_aug_m)
+            if isinstance(noise_snr_m, mx.array):
+                to_ev.append(noise_snr_m)
             for sem_stat in (sem_w_m, sem_grad_l2_mean, sem_grad_l2_max, sem_grad_clip_frac, sem_grad_bad_count):
                 if isinstance(sem_stat, mx.array):
                     to_ev.append(sem_stat)
+            for speech_stat in speech_stats:
+                if isinstance(speech_stat, mx.array):
+                    to_ev.append(speech_stat)
             mx.eval(*to_ev)
             util = _format_vq_util(idx, cb_sizes)
             cos_pct = 100.0 * float(cos_m.item())
@@ -2743,6 +3511,14 @@ def main() -> None:
             band_extra = ""
             if cfg.lambda_stft_band_excess > 0 and isinstance(l_band, mx.array):
                 band_extra = f"  band={float(l_band.item()):.4f}"
+            stripe_extra = ""
+            if cfg.lambda_temporal_stripe > 0 and isinstance(l_stripe, mx.array):
+                stripe_extra = f"  stripe={float(l_stripe.item()):.4f}"
+            noise_extra = ""
+            if cfg.noise_aug_prob > 0.0 and isinstance(noise_aug_m, mx.array):
+                noisy_pct = 100.0 * float(noise_aug_m.item())
+                snr_v = float(noise_snr_m.item()) if isinstance(noise_snr_m, mx.array) else 0.0
+                noise_extra = f"  noise={noisy_pct:.0f}%@{snr_v:.1f}dB"
             sem_extra = ""
             if cfg.lambda_semantic > 0 and isinstance(l_sem, mx.array):
                 sem_items = int(fm.get("sem_items", 0))
@@ -2777,6 +3553,24 @@ def main() -> None:
                 if lat_items > 0:
                     lat_cos_v = float(lat_sem_cos_m.item()) if isinstance(lat_sem_cos_m, mx.array) else 0.0
                     lat_sem_extra += f"  zssl={100.0 * lat_cos_v:.1f}%/{lat_items}"
+            rvqdist_extra = ""
+            if cfg.lambda_rvq_distill > 0 and isinstance(l_rvq_distill, mx.array):
+                zd_w = float(rvq_distill_w_m.item()) if isinstance(rvq_distill_w_m, mx.array) else float(cfg.lambda_rvq_distill)
+                zd_cos = float(rvq_distill_cos_m.item()) if isinstance(rvq_distill_cos_m, mx.array) else 0.0
+                phase = "/rvqonly" if bool(fm.get("rvq_distill_only", False)) else ""
+                rvqdist_extra = (
+                    f"  zdist={float(l_rvq_distill.item()):.5f}  "
+                    f"zdcos={100.0 * zd_cos:.1f}%  λ_zdist={zd_w:g}{phase}"
+                )
+            speech_extra = ""
+            if cfg.speech_control_depth > 0 and all(isinstance(x, mx.array) for x in speech_stats):
+                sp_vals = [float(x.item()) for x in speech_stats]  # type: ignore[union-attr]
+                phase = "/only" if speech_ctl_only else ""
+                speech_extra = (
+                    f"  speech_ctl="
+                    f"E{sp_vals[0]:.2f}/V{sp_vals[1]:.2f}/H{sp_vals[2]:.2f}/"
+                    f"HF{sp_vals[3]:.2f}/N{sp_vals[4]:.2f}/G{sp_vals[5]:.2f}{phase}"
+                )
             if callable(lr_spec):
                 tlr = lr_spec(opt.step)
                 mx.eval(tlr)
@@ -2793,9 +3587,9 @@ def main() -> None:
                 prof_count = 0
             print(
                 f"step {step:6d}/{cfg.steps}  loss={lv:.5f}  "
-                f"L1={float(lt.item()):.4f}  stft={float(ls.item()):.4f}{sgrad_extra}{scos_extra}{sc_extra}{cx_extra}{band_extra}{mel_extra}{lin_extra}{sem_extra}{lat_sem_extra}  "
+                f"L1={float(lt.item()):.4f}  stft={float(ls.item()):.4f}{sgrad_extra}{scos_extra}{sc_extra}{cx_extra}{band_extra}{stripe_extra}{mel_extra}{lin_extra}{noise_extra}{sem_extra}{lat_sem_extra}{rvqdist_extra}  "
                 f"vq={vq_s}  marg_ent={float(marg_ent.item()):.4f}{ent_extra}{ramp_extra}  "
-                f"cos={cos_pct:.1f}%{cos_ema_extra}{util}  lr={lr_log:.2e}  "
+                f"cos={cos_pct:.1f}%{cos_ema_extra}{speech_extra}{util}  lr={lr_log:.2e}  "
                 f"{elapsed / (step - start_step + 1) * 1000:.1f} ms/step{prof_extra}",
                 flush=True,
             )
@@ -2805,13 +3599,15 @@ def main() -> None:
         if plateau_schedule is not None and step >= cfg.lr_warmup_steps:
             plateau_schedule.observe(lv0)
 
-        if 0.0 < float(cfg.vq_ema_decay) < 1.0 and not cfg.ae_only:
+        if 0.0 < float(cfg.vq_ema_decay) < 1.0 and not cfg.ae_only and quant_kind == "rvq":
             _t_vqe = _ptic()
             update_vq_ema_codebooks(model, batch0, cfg)
             mx.eval(model.parameters())
             _ptoc("vq_ema", _t_vqe)
+        if args.mlx_clear_cache_every > 0 and step % int(args.mlx_clear_cache_every) == 0:
+            clear_mlx_cache()
 
-        if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0:
+        if cfg.eval_every > 0 and step > 0 and step % int(cfg.eval_every) == 0 and not feature_mode:
             try:
                 import numpy as np
             except ImportError:
@@ -2836,22 +3632,29 @@ def main() -> None:
                 if idx_ev is not None and len(idx_ev) > 0:
                     sizes = effective_codebook_sizes(cfg)
                     h_stages: list[float] = []
+                    h_bits_per_frame = 0.0
                     for si, ix in enumerate(idx_ev):
                         mx.eval(ix)
                         kk = sizes[si] if si < len(sizes) else sizes[-1]
-                        row = [int(x) for x in np.array(ix).ravel().tolist()]
-                        h_stages.append(entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(row, kk))
+                        arr_ix = np.array(ix)
+                        row = [int(x) for x in arr_ix.ravel().tolist()]
+                        h = entropy_coding_mod.empirical_cross_entropy_bits_per_symbol(row, kk)
+                        h_stages.append(h)
+                        width = int(arr_ix.shape[2]) if arr_ix.ndim >= 3 else 1
+                        h_bits_per_frame += h * float(width)
                     h_mean = sum(h_stages) / float(len(h_stages))
                     fps = cfg.sample_rate / float(encoder_time_stride(cfg))
-                    idx_bps = h_mean * fps * float(len(idx_ev))
+                    idx_bps = h_bits_per_frame * fps
+                    ent_label = "TurboQuant" if quant_kind == "turboquant" else "RVQ"
                     print(
-                        f"  [entropy] RVQ mean H={h_mean:.3f} b/sym  ~{idx_bps:.0f} b/s empirical index (vs nominal)",
+                        f"  [entropy] {ent_label} mean H={h_mean:.3f} b/sym  ~{idx_bps:.0f} b/s empirical index (vs nominal)",
                         flush=True,
                     )
 
         if (
             cfg.vq_reset_every > 0
             and not cfg.ae_only
+            and quant_kind == "rvq"
             and step > 0
             and step % cfg.vq_reset_every == 0
         ):
@@ -2905,7 +3708,7 @@ def main() -> None:
         # Spectrogram viz after the optimizer step.
         se = cfg.spectrogram_every
         viz_model = model
-        if se > 0 and step > 0:
+        if se > 0 and step > 0 and not feature_mode:
             if step % se == 0 or step == cfg.steps - 1:
                 if cfg.spectrogram_seconds > 0:
                     n_viz = max(
