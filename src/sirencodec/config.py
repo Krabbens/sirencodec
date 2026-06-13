@@ -140,11 +140,13 @@ class Config:
     post_lavasr_kernel: int = 15
     post_lavasr_gain: float = 0.03
     post_lavasr_highpass: bool = True
+    speech_control_depth: int = 0
     harmonic_source: bool = False
     harmonic_harmonics: int = 8
     harmonic_amp: float = 0.05
     harmonic_f0_min: float = 50.0
     harmonic_f0_max: float = 650.0
+    quantizer: str = "rvq"
     # Residual VQ (SoundStream / EnCodec style): each stage quantizes the remaining residual
     n_codebooks: int = 3
     codebook_size: int = 32
@@ -155,6 +157,7 @@ class Config:
     vq_commitment: float = 1.35  # β on commitment (higher → less codebook collapse at low bitrate)
     lambda_vq: float = 5.0  # scale sum of VQ losses vs waveform/STFT
     ae_only: bool = False  # if True, skip VQ (pure autoencoder)
+    decoder_backend: str = "waveform"
     # Loss (STFT often dominates RVQ at 256× downsample — ramp + lower default helps)
     lambda_time: float = 1.0
     lambda_stft: float = 0.5  # Main log-mag L1 (multi-scale); higher without GAN.
