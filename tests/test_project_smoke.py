@@ -573,6 +573,10 @@ def test_init_from_missing_checkpoint_exits():
         main(["--config", str(cfg_path), "--init-from", str(ROOT / "this_checkpoint_does_not_exist_12345.pt")])
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="CUDA-first training smoke is unstable in the macOS PyTorch CPU backend",
+)
 def test_init_from_warm_start_runs_one_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import numpy as np
     import soundfile as sf
