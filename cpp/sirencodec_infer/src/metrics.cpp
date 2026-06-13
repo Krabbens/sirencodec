@@ -82,8 +82,8 @@ DotNormSums dot_norms_neon(const float *reference, const float *estimate, std::s
       static_cast<double>(hsum_f32(vaddq_f32(est0, est1))),
   };
   for (; i < n; ++i) {
-    const double r = reference[i];
-    const double e = estimate[i];
+    const double r = static_cast<double>(reference[i]);
+    const double e = static_cast<double>(estimate[i]);
     sums.dot += r * e;
     sums.reference_norm += r * r;
     sums.estimate_norm += e * e;
@@ -140,8 +140,8 @@ double si_sdr_db(const std::vector<float> &reference, const std::vector<float> &
   std::vector<double> ref(n);
   std::vector<double> est(n);
   for (std::size_t i = 0; i < n; ++i) {
-    ref[i] = reference[i];
-    est[i] = estimate[i];
+    ref[i] = static_cast<double>(reference[i]);
+    est[i] = static_cast<double>(estimate[i]);
   }
   const auto ref_mean = mean(ref);
   const auto est_mean = mean(est);
@@ -222,8 +222,8 @@ double log_spectral_distance_db(const std::vector<float> &reference,
   std::vector<double> ref(padded, 0.0);
   std::vector<double> est(padded, 0.0);
   for (std::size_t i = 0; i < n; ++i) {
-    ref[i] = reference[i];
-    est[i] = estimate[i];
+    ref[i] = static_cast<double>(reference[i]);
+    est[i] = static_cast<double>(estimate[i]);
   }
 
   std::vector<double> window(n_fft);
