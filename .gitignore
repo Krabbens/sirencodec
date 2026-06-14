@@ -44,7 +44,6 @@ test_original.wav
 /mlx_spectrograms_*/
 /mlx_grid_search/
 /infer_mlx_out/
-/archive/
 
 # Root-level demo outputs (regenerable)
 /spectrogram_demo.png
@@ -83,3 +82,8 @@ LuxTTS/
 *.npz
 *.tflite
 *.tar.gz
+
+# Tracked historical material
+/archive/*
+!/archive/legacy/
+!/archive/legacy/**
