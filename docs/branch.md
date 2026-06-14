@@ -3,48 +3,97 @@ branch: master
 status: canonical
 base: 7m-best
 used_in_thesis: yes
-install: uv sync
-test: python -m pytest -q
+install: uv sync --extra dev
+test: uv run pytest -q
 ---
 
 # Branch manifest
 
 ## Role
 
-Canonical thesis implementation synchronized with the selected 7m-best codec.
+This branch is the canonical implementation of the codec variant selected for
+the master's thesis. Its model code is synchronized with `7m-best`, while the
+named experimental branch remains a stable reference used by older notes and
+result tables.
 
-New conclusions must be based on this branch's own configuration and checkpoints, not on values copied from another variant.
+## Model variant
 
-## Variant boundary
+The default configuration processes 16 kHz mono speech with eight stride-2
+encoder stages, resulting in a temporal stride of 256. The continuous latent
+dimension is 512. The nominal stream uses three residual vector quantizers
+with 32 entries each, which gives approximately 0.94 kb/s before container or
+transport overhead.
 
-The implementation, configurations and commit history on this branch define
-the experiment. The normalization commit changes repository organization,
-documentation and validation only; it does not replace the model with the
-canonical `master` implementation.
+The active training path is implemented in `src/sirencodec/cuda/`. It includes
+waveform and multi-resolution spectral reconstruction terms, RVQ stability
+metrics and optional semantic supervision. The MLX implementation is retained
+for Apple Silicon experiments and for the conditioned two-band prototype.
+Optional self-attention and decoder refinements are disabled by default so
+that existing checkpoints keep their original architecture.
+
+## Requirements
+
+- Python 3.10 or newer;
+- NVIDIA GPU and a compatible CUDA runtime for full training;
+- Apple Silicon and the `mlx` extra only for MLX experiments;
+- LibriSpeech prepared outside Git for corpus training;
+- CMake 3.24 or newer for the optional C++ runtime.
 
 ## Validated commands
+
+Portable repository checks:
 
 ```bash
 python scripts/validate_branch_layout.py
 python -m compileall -q src tools tests scripts
-python -m pytest -q
-uv run train --help
+pytest -q
 ```
 
-Commands that train on a corpus or run checkpoint inference require explicit
-paths to external datasets and model files. Those assets are intentionally not
-stored in Git.
+CUDA environment and synthetic training smoke test:
 
-## Repository policy
+```bash
+uv sync --extra dev
+uv run train --epochs 1 --no-librispeech --fast
+```
 
-Active package code belongs in `src/`, command-line utilities in `tools/`,
-automation in `scripts/`, tests in `tests/` and experiment settings in
-`configs/`. Historical root files are preserved under
-`archive/legacy/` and are not part of the supported entrypoint surface.
+Corpus training with an explicit configuration:
+
+```bash
+uv run train --config configs/abd.json --dataset train-clean-100 --epochs 5
+```
+
+CUDA inference:
+
+```bash
+uv run python tools/infer_cuda.py --help
+```
+
+MLX training and inference:
+
+```bash
+uv sync --extra mlx --extra dev
+uv run python tools/train_mlx.py --help
+uv run python tools/infer_mlx.py --help
+```
+
+C++ runtime:
+
+```bash
+cmake -S cpp/sirencodec_infer -B build/cpp -DCMAKE_BUILD_TYPE=Release
+cmake --build build/cpp --parallel
+build/cpp/sirencodec_tests --help
+```
+
+## External assets
+
+Datasets, checkpoints, reconstructed audio, LiteRT exports and benchmark
+outputs are not versioned. Commands that require them must receive explicit
+paths. The thesis sources and tables record the checkpoint and dataset used
+for reported results.
 
 ## Known limitations
 
-Portable CI does not reproduce full GPU training or evaluate private
-checkpoints. A passing CI run proves that the tracked source is internally
-consistent and that lightweight tests pass; it does not establish speech
-quality for this variant.
+Full CUDA training and checkpoint inference are not exercised in portable CI.
+The C++ integration command requires exported LiteRT models and an audio input,
+so CI verifies compilation and the command-line interface instead of running
+model inference.
