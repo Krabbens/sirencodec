@@ -1,49 +1,48 @@
 # SirenCodec
 
-Neural audio codec using pretrained Vocos vocoder + RVQ/FSQ compression.
+SirenCodec is a research repository for a low-bitrate neural speech codec
+developed as part of a master's thesis. The canonical implementation uses a
+CUDA-first PyTorch training path and keeps an MLX backend for selected Apple
+Silicon experiments.
 
-## Architecture
+This repository preserves multiple experimental branches. Their model
+assumptions and validated commands are documented in
+[`docs/branch.md`](docs/branch.md). Read that manifest before comparing
+results or resuming an older experiment.
 
-```
-Audio (24kHz) → MelSpectrogram (100-dim) → RVQ/FSQ → Vocos → Audio (24kHz)
-```
+## Repository layout
 
-- **Feature extractor**: 100-dim mel spectrogram at 24kHz
-- **Quantization**: RVQ (residual vector quantization) or FSQ (finite scalar quantization)
-- **Vocoder**: Pretrained Vocos (`charactr/vocos-mel-24khz`, 13.5M params, fine-tuned)
+- `src/sirencodec/` - package code shared by training and inference;
+- `configs/` - reproducible experiment configurations;
+- `tools/` - inference, conversion, export and benchmark commands;
+- `scripts/` - environment and automation helpers;
+- `tests/` - checks that do not require private checkpoints or datasets;
+- `cpp/` - optional C++ inference runtime;
+- `overleaf/` - thesis sources on branches that maintain the document;
+- `archive/legacy/` - preserved historical material that is not an active
+  entrypoint.
 
-## Bitrate Options
+## Setup
 
-| Config | Command | Bitrate |
-|--------|---------|---------|
-| 4 codebooks × 1024 @ 94fps | `--rvq --n-codebooks 4` | 3,750 bps |
-| 2 codebooks × 1024 @ 94fps | `--rvq --n-codebooks 2` | 1,875 bps |
-| **2 codebooks × 1024 @ 30fps** | `--rvq --n-codebooks 2 --mel-fps 30` | **600 bps** |
-
-## Usage
+Install the default CUDA environment:
 
 ```bash
-pip install vocos torch torchaudio
-
-# Train at 600 bps (2 codebooks, 30fps)
-python3 train_vocos_vq.py --steps 50000 --rvq --n-codebooks 2 --mel-fps 30
-
-# Train at 1,875 bps (2 codebooks, 94fps)
-python3 train_vocos_vq.py --steps 50000 --rvq --n-codebooks 2
-
-# Train with FSQ (experimental)
-python3 train_vocos_vq.py --steps 50000 --fsq-dims 16 --fsq-levels 5
+uv sync --extra dev
 ```
 
-## Dataset
+The canonical training entrypoint is:
 
-Expects `data/master_manifest.jsonl` with entries:
-```json
-{"path": "path/to/audio.flac"}
+```bash
+uv run train --help
 ```
 
-## Results
+Run repository checks:
 
-| Step | Bitrate | mel loss | SI-SDR | PESQ |
-|------|---------|----------|--------|------|
-| 10k | 3,750 bps (4×1024@94fps) | 0.34 | -28.5 dB | 2.15 |
+```bash
+uv run python scripts/validate_branch_layout.py
+uv run pytest -q
+```
+
+Generated datasets, checkpoints, audio samples, exported models and run
+directories are intentionally excluded from Git. The branch manifest records
+the external assets required to reproduce a specific experiment.

@@ -62,3 +62,8 @@ LuxTTS/
 *.npz
 *.tflite
 *.tar.gz
+
+# Tracked historical material
+/archive/*
+!/archive/legacy/
+!/archive/legacy/**
