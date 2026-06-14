@@ -3,12 +3,12 @@
 Training pipeline for CODEC-RESEARCHER.
 
 Usage:
-    python train_pipeline.py                    # Default: ARCH-A-v2b, 100k steps
-    python train_pipeline.py --arch arch-a-v2b  # Specific architecture
-    python train_pipeline.py --steps 200000     # More steps
-    python train_pipeline.py --resume           # Resume from latest checkpoint
-    python train_pipeline.py --no-eval          # Skip PESQ eval (faster)
-    python train_pipeline.py --eval-every 5000  # Eval frequency
+    python -m sirencodec.core.train_pipeline                    # Default: ARCH-A-v2b, 100k steps
+    python -m sirencodec.core.train_pipeline --arch arch-a-v2b  # Specific architecture
+    python -m sirencodec.core.train_pipeline --steps 200000     # More steps
+    python -m sirencodec.core.train_pipeline --resume           # Resume from latest checkpoint
+    python -m sirencodec.core.train_pipeline --no-eval          # Skip PESQ eval (faster)
+    python -m sirencodec.core.train_pipeline --eval-every 5000  # Eval frequency
 """
 import os, re, sys, json, math, time, argparse
 from contextlib import nullcontext

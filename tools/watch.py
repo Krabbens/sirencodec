@@ -3,11 +3,11 @@
 Real-time training monitor for CODEC-RESEARCHER.
 
 Usage:
-    python watch.py              # Watch current training
-    python watch.py --log log.tsv  # Specific log file
-    python watch.py --summary      # One-shot summary
-    python watch.py --plot         # ASCII plot of metrics
-    python watch.py --last 20      # Show last N entries
+    python tools/run.py watch              # Watch current training
+    python tools/run.py watch --log log.tsv  # Specific log file
+    python tools/run.py watch --summary      # One-shot summary
+    python tools/run.py watch --plot         # ASCII plot of metrics
+    python tools/run.py watch --last 20      # Show last N entries
 """
 import os, sys, csv, time, argparse
 from pathlib import Path
@@ -279,7 +279,7 @@ def main():
                 print(f"  Still waiting... ({i+1}s)", end="\r")
             if not rows:
                 print("\nNo training data found after 30s.")
-                print("Start training with: python train_pipeline.py")
+                print("Start training with: python -m sirencodec.core.train_pipeline")
                 return
         print_status(rows, args.last)
 
