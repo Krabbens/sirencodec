@@ -1,36 +1,48 @@
 # SirenCodec
 
-Neural audio codec (PyTorch): **Vocos + RVQ/FSQ** + **SEANet** research.
+SirenCodec is a research repository for a low-bitrate neural speech codec
+developed as part of a master's thesis. The canonical implementation uses a
+CUDA-first PyTorch training path and keeps an MLX backend for selected Apple
+Silicon experiments.
 
-## Quick start
+This repository preserves multiple experimental branches. Their model
+assumptions and validated commands are documented in
+[`docs/branch.md`](docs/branch.md). Read that manifest before comparing
+results or resuming an older experiment.
+
+## Repository layout
+
+- `src/sirencodec/` - package code shared by training and inference;
+- `configs/` - reproducible experiment configurations;
+- `tools/` - inference, conversion, export and benchmark commands;
+- `scripts/` - environment and automation helpers;
+- `tests/` - checks that do not require private checkpoints or datasets;
+- `cpp/` - optional C++ inference runtime;
+- `overleaf/` - thesis sources on branches that maintain the document;
+- `archive/legacy/` - preserved historical material that is not an active
+  entrypoint.
+
+## Setup
+
+Install the default CUDA environment:
 
 ```bash
-pip install torch torchaudio vocos   # optional: pesq, soundfile
-python3 run.py train_vocos_vq --help
-python3 run.py train_pipeline --help
-./scripts/run_training.sh         # SEANet arch-a-v2b + LibriSpeech
+uv sync --extra dev
 ```
 
-## Layout
+The canonical training entrypoint is:
 
-Target: **≤4 regular files** per source folder (`src/sirencodec`, `core`, `docs`, `scripts`, `tools`). Repo root: `.gitattributes` / `.gitignore` + LFS (5 files at root).
+```bash
+uv run train --help
+```
 
-| Path | Contents |
-|------|----------|
-| `run.py` | Single CLI: `train`, `train_pipeline`, `train_vocos_vq`, `sidecars`, `bench_*`, `watch`, … |
-| `src/sirencodec/` | `data_pipeline`, `extras`, `sidecars`, `core/` (4 items) |
-| `src/sirencodec/core/` | `train`, `train_pipeline`, `train_vocos_vq` (+ `__init__.py`) |
-| `scripts/` | `run_training.sh`, `run_thesis_sweep.sh`, `export_codec_wav.py`, `compare_nl_vs_pca.py` |
-| `tools/` | `watch`, `bench_fps`, `bench_lowfps`, `precompute_mels` |
-| `tests/` | Optional smoke scripts |
-| `docs/` | `GUIDE.md`, `RESEARCH.md`, `ROADMAP_2026.md`, `CONVENTIONS.txt` |
+Run repository checks:
 
-Optional: `pip install -e .`
+```bash
+uv run python scripts/validate_branch_layout.py
+uv run pytest -q
+```
 
-## Docs
-
-`docs/GUIDE.md` (overview + thesis commands), `docs/RESEARCH.md`.
-
-## Requirements
-
-Python **≥3.10** (`train_vocos_vq` uses modern typing).
+Generated datasets, checkpoints, audio samples, exported models and run
+directories are intentionally excluded from Git. The branch manifest records
+the external assets required to reproduce a specific experiment.
