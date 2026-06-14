@@ -562,7 +562,7 @@ def main() -> None:
         metavar="ARG",
         help="Extra train_mlx args, e.g. --fixed --fast --seed 1",
     )
-    ap.add_argument("--python", type=str, default=sys.executable, help="Python to run run.py.")
+    ap.add_argument("--python", type=str, default=sys.executable, help="Python to run tools/run.py.")
     ap.add_argument(
         "-j",
         "--jobs",
@@ -625,7 +625,7 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    run_py = REPO_ROOT / "run.py"
+    run_py = REPO_ROOT / "tools" / "run.py"
     if not run_py.is_file():
         print(f"[grid] missing {run_py}", file=sys.stderr)
         sys.exit(1)

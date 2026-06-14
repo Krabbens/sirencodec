@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train a small conditional DDPM on log-mels (proof-of-concept; extend toward codec decoder).
 
-  python run.py diffusion_mel_demo --steps 300
+  python tools/run.py diffusion_mel_demo --steps 300
 """
 from __future__ import annotations
 
