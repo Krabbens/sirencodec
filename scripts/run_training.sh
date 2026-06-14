@@ -31,7 +31,7 @@ else
 fi
 
 if [ ! -d "data/librispeech/LibriSpeech" ]; then
-    echo "ERROR: Data not found. Run: python3 run.py train download data"
+    echo "ERROR: Data not found. Run: python3 tools/run.py train download data"
     exit 1
 fi
 
@@ -40,13 +40,13 @@ if [ -z "$RESUME" ]; then
     rm -f log.tsv
 fi
 
-echo "Monitor: python3 run.py watch --live"
+echo "Monitor: python3 tools/run.py watch --live"
 echo ""
 
 # Stage 1 = encoder→decoder mel AE. Discriminator is optional here; MRSTFT disc is the main cost on MPS.
 # --no-adv-stage1: mel-only Stage 1 (fast). VQ+adversarial still run in Stage 2.
 # Stage 2: --adv-every 8 thins discriminator updates vs every step.
-python3 run.py train_pipeline \
+python3 tools/run.py train_pipeline \
     --steps "$STEPS" \
     --arch arch-a-v2b \
     --batch-size 8 \
@@ -63,4 +63,4 @@ python3 run.py train_pipeline \
     $EXTRA_ARGS
 
 echo ""
-python3 run.py watch --summary
+python3 tools/run.py watch --summary

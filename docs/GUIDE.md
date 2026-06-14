@@ -57,16 +57,16 @@ Install: `pip install vocos torch torchaudio pesq`
 
 ```bash
 # 600 bps
-python3 run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 2 --mel-fps 30
+python3 tools/run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 2 --mel-fps 30
 
 # 1875 bps
-python3 run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 2
+python3 tools/run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 2
 
 # 3750 bps
-python3 run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 4
+python3 tools/run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 4
 
 # FSQ (experimental)
-python3 run.py train_vocos_vq --steps 50000 --fsq-dims 16 --fsq-levels 5
+python3 tools/run.py train_vocos_vq --steps 50000 --fsq-dims 16 --fsq-levels 5
 ```
 
 ### Data
@@ -89,7 +89,7 @@ Manifest lines:
 
 ```
 ./
-├── run.py
+├── tools/run.py
 ├── README.md
 ├── docs/               # GUIDE, RESEARCH, ROADMAP, CONVENTIONS
 ├── src/sirencodec/     # data_pipeline, extras, sidecars, core/
@@ -197,7 +197,7 @@ Verdict: `BREAKTHROUGH` / `PROGRESS` / `NEUTRAL` / `DEAD_END` / `BASELINE`
 Native Vocos rate: **ResidualVQ** on 100-dim mels, no Zipformer bottleneck, `upsampling_factor=1`.
 
 ```bash
-python3 run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 1 --codebook-size 64 \
+python3 tools/run.py train_vocos_vq --steps 50000 --rvq --n-codebooks 1 --codebook-size 64 \
   --mel-fps 94 --bottleneck-dim 0 --batch-size 8 --data-dir data \
   --log-tsv log_sweep_94fps_1x64.tsv
 ```
@@ -215,7 +215,7 @@ Checkpoints carry `cfg`. Logs: `train_run_sweep_94fps_*.log`, `log_sweep_*.tsv`.
 After codec ckpt (`checkpoints_vocos_vq/codec_step*.pt` or `codec_final.pt` w/ `cfg`):
 
 ```bash
-python3 run.py sidecars mel_refiner \
+python3 tools/run.py sidecars mel_refiner \
   --codec-checkpoint checkpoints_vocos_vq/codec_final.pt \
   --steps 20000 --batch-size 16 --data-dir data \
   --out-dir checkpoints_mel_refiner
@@ -228,7 +228,7 @@ Optional: `--noise-std 0.02`. Out: `checkpoints_mel_refiner/mel_refiner.pt`.
 Teacher: Vocos. Student: `StudentVocoder` in `sidecars.py` (~0.3–2M; raise `--base` toward ~3M).
 
 ```bash
-python3 run.py sidecars distill --steps 50000 --batch-size 16 --data-dir data \
+python3 tools/run.py sidecars distill --steps 50000 --batch-size 16 --data-dir data \
   --base 384 --out-dir checkpoints_student_vocoder
 ```
 
@@ -241,4 +241,4 @@ python3 run.py sidecars distill --steps 50000 --batch-size 16 --data-dir data \
 | [src/sirencodec/sidecars.py](src/sirencodec/sidecars.py) | `mel_refiner` / `distill` training |
 | [scripts/run_thesis_sweep.sh](scripts/run_thesis_sweep.sh) | Batch Track A |
 
-`python3 run.py …` — see `README.md`.
+`python3 tools/run.py …` — see `README.md`.

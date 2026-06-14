@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single entrypoint: `python run.py <command> [args...]`."""
+"""Single entrypoint: `python tools/run.py <command> [args...]`."""
 from __future__ import annotations
 
 import runpy
@@ -31,7 +31,7 @@ TOOLS = {
 def main() -> None:
     if len(sys.argv) < 2:
         print(
-            "Usage: python run.py <command> [args...]\n"
+            "Usage: python tools/run.py <command> [args...]\n"
             "  train | train_pipeline | train_vocos_vq — core trainers\n"
             "  sidecars mel_refiner|distill ... — refiner / student vocoder\n"
             "  bench_fps | bench_lowfps | watch | precompute_mels | diffusion_mel_demo | train_mlx | infer_mlx — tools\n",
