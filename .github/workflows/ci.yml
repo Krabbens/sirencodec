@@ -16,10 +16,26 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Detect Python components
+        id: python
+        run: |
+          if test -f pyproject.toml && test -d src; then
+            echo "package=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "package=false" >> "$GITHUB_OUTPUT"
+          fi
+          if find tests -type f -name 'test_*.py' -print -quit 2>/dev/null | grep -q .; then
+            echo "tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tests=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install portable test environment
         run: |
           uv venv
-          uv pip install -e . --no-deps
+          if test "${{ steps.python.outputs.package }}" = "true"; then
+            uv pip install -e . --no-deps
+          fi
           uv pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
           uv pip install pytest numpy soundfile matplotlib
 
@@ -27,9 +43,15 @@ jobs:
         run: uv run python scripts/validate_branch_layout.py
 
       - name: Byte-compile sources
-        run: uv run python -m compileall -q src tools tests scripts
+        run: |
+          paths=()
+          for path in src tools tests scripts; do
+            test -d "$path" && paths+=("$path")
+          done
+          uv run python -m compileall -q "${paths[@]}"
 
       - name: Run tests
+        if: steps.python.outputs.tests == 'true'
         run: uv run pytest -q
 
   cpp:

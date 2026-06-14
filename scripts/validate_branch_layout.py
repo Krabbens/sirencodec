@@ -121,8 +121,10 @@ def validate_manifest(metadata: dict[str, str]) -> list[str]:
     if metadata.get("used_in_thesis") not in {"yes", "no"}:
         errors.append("manifest used_in_thesis must be yes or no")
 
-    expected_branch = os.environ.get("GITHUB_REF_NAME")
-    if expected_branch and not expected_branch.startswith(("pull/", "refs/")):
+    expected_branch = None
+    if os.environ.get("GITHUB_EVENT_NAME") == "push":
+        expected_branch = os.environ.get("GITHUB_REF_NAME")
+    if expected_branch:
         if metadata.get("branch") != expected_branch:
             errors.append(
                 f"manifest branch is {metadata.get('branch')!r}, "
