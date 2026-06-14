@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,16 +16,69 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Install test environment
+      - name: Detect Python components
+        id: python
+        run: |
+          if test -f pyproject.toml && test -d src; then
+            echo "package=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "package=false" >> "$GITHUB_OUTPUT"
+          fi
+          if find tests -type f -name 'test_*.py' -print -quit 2>/dev/null | grep -q .; then
+            echo "tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tests=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install portable test environment
         run: |
           uv venv
-          uv pip install -e . --no-deps
-          uv pip install pytest numpy
+          if test "${{ steps.python.outputs.package }}" = "true"; then
+            uv pip install -e . --no-deps
+          fi
+          uv pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+          uv pip install pytest numpy soundfile matplotlib
+
+      - name: Validate branch layout
+        run: uv run python scripts/validate_branch_layout.py
 
       - name: Byte-compile sources
         run: |
-          uv run python -m py_compile $(find src tools tests -name '*.py' -print)
+          paths=()
+          for path in src tools tests scripts; do
+            test -d "$path" && paths+=("$path")
+          done
+          uv run python -m compileall -q "${paths[@]}"
 
       - name: Run tests
+        if: steps.python.outputs.tests == 'true'
+        run: uv run pytest -q
+
+  cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect C++ runtime
+        id: cpp
         run: |
-          uv run pytest -q
+          if test -f cpp/sirencodec_infer/CMakeLists.txt; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure
+        if: steps.cpp.outputs.enabled == 'true'
+        run: >-
+          cmake -S cpp/sirencodec_infer -B build/cpp
+          -DCMAKE_BUILD_TYPE=Release
+          -DSIRENCODEC_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        if: steps.cpp.outputs.enabled == 'true'
+        run: cmake --build build/cpp --parallel
+
+      - name: Smoke-test CLI
+        if: steps.cpp.outputs.enabled == 'true'
+        run: build/cpp/sirencodec_tests --help
