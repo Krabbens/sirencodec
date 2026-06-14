@@ -5,9 +5,9 @@
   Compact bitstream: ``*_codes.bin`` — indices packed to ``ceil(log2(K))`` bits each (not uint16).
   Optional ``--save-npz-codes`` for debugging. ``--no-save-codes`` skips both.
 
-  uv run python run.py infer_mlx mlx_checkpoints/codec_step50000.npz -i sample.wav -o out_infer/
-  uv run python run.py infer_mlx ckpt.npz --random-dev --seed 42
-  uv run python run.py infer_mlx ckpt.npz --random-test-clean   # LibriSpeech test-clean (holdout vs train-clean-100)
+  uv run python tools/run.py infer_mlx mlx_checkpoints/codec_step50000.npz -i sample.wav -o out_infer/
+  uv run python tools/run.py infer_mlx ckpt.npz --random-dev --seed 42
+  uv run python tools/run.py infer_mlx ckpt.npz --random-test-clean   # LibriSpeech test-clean (holdout vs train-clean-100)
   # --random-dev: manifest val split (MLX train_mlx --librispeech still saw these in random batches)
   # --random-test-clean: speakers/utterances outside train-clean-100 (needs downloaded test-clean)
 """
