@@ -1062,6 +1062,12 @@ if __name__ == "__main__":
         batch = next(iter(loader))
         print(f"\nBatch: waveforms {batch[0].shape}, languages: {batch[1]}")
     else:
-        print("Usage: python data_pipeline.py download [data_dir]  # default: data/cv-corpus")
-        print("       python data_pipeline.py precompute [data_dir] [--force] [--max-items N]")
-        print("       python data_pipeline.py test")
+        print(
+            "Usage: python -m sirencodec.data_pipeline download "
+            "[data_dir]  # default: data/cv-corpus"
+        )
+        print(
+            "       python -m sirencodec.data_pipeline precompute "
+            "[data_dir] [--force] [--max-items N]"
+        )
+        print("       python -m sirencodec.data_pipeline test")
